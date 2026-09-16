@@ -64,6 +64,27 @@ bash: ./some_binary: cannot execute binary file: Exec format error
 
 ---
 
+### Bug 104 · 二进制执行报 `Permission denied`（W^X 限制）
+
+**症状**：
+```
+exec failed: Permission denied    # 启动 proot 或执行 rootfs 内命令失败，退出码 126
+```
+
+**原因**：
+Android 10 起，`targetSdkVersion ≥ 29` 的应用被禁止 `execve()` 自身数据目录（`/data/data/<pkg>/`）下的文件（W^X 策略：不允许"可写又可执行"）。rootfs 内的 guest 二进制（/bin/sh、apt、将来的 dart/java）由内核真实执行、路径就在 filesDir 下，必被拦截。
+
+**解决**：
+1. `android/app/build.gradle` 中 `targetSdk` 改为 **28**（Termux 同款方案，进入向后兼容 SELinux 域）；
+2. proot 本体优先放 jniLibs（`libproot.so`，原生库目录不受 W^X 限制）——`setup_android.sh` 自动完成；
+3. 改完必须**重新构建安装**，热重载不生效。
+
+**验证**：`./tools/check_env.sh` 第 3 项显示 `targetSdk = 28`；App 内 `echo hello` 正常输出。
+
+**出现版本**：Step 1 预防性记录（2026-09-16）
+
+---
+
 ## 二、Flutter SDK 相关
 
 ### Bug 201 · `flutter` 命令直接 `Killed` / 闪退
