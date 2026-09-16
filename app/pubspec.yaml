@@ -11,24 +11,8 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # 状态管理
+  # 状态管理（EnvState → UI 单向数据流）
   provider: ^6.1.1
-
-  # 文件与路径
-  path_provider: ^2.1.2
-  path: ^1.9.0
-
-  # 持久化
-  shared_preferences: ^2.2.2
-
-  # 压缩解压（rootfs tarball）
-  archive: ^3.4.10
-
-  # HTTP 下载（后续工具链下载用）
-  dio: ^5.4.0
-
-  # 工具类
-  collection: ^1.18.0
 
 dev_dependencies:
   flutter_test:
@@ -38,6 +22,7 @@ dev_dependencies:
 flutter:
   uses-material-design: true
 
+  # 二进制资产不进 git，先运行 tools/fetch_assets.sh（见 SETUP_ANDROID.md）
   assets:
     - assets/tools/
     - assets/rootfs/

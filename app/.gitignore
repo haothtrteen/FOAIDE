@@ -30,6 +30,8 @@ android/key.properties
 assets/tools/proot*
 assets/rootfs/*.tar.*
 assets/rootfs/*.tgz
+# jniLibs 中的 proot（由 setup_android.sh 从 assets 生成，不重复入库）
+android/app/src/main/jniLibs/arm64-v8a/libproot.so
 !assets/tools/.gitkeep
 !assets/rootfs/.gitkeep
 
