@@ -58,15 +58,44 @@ fetch_proot() {
   echo "✅ proot-arm64 + proot-loader 已就位"
 }
 
+# 真机友好重打包（Bug 209）：
+#   Android 应用沙箱不允许 mknod()（/dev 节点）与部分机型的 link()（硬链接），
+#   tar 解压会大量报错甚至整体回滚。打包时：
+#   1. --hard-dereference：硬链接条目实体化为独立文件副本
+#   2. --exclude='./dev/*'：丢弃设备节点（proot -R 运行时绑定宿主 /dev，
+#      rootfs 内 dev 只需保留空目录）
+#   幂等：仅当检测到硬链接或 dev 条目时才重打。
+repack_for_android() {
+  local T="$1"
+  local bad=0
+  if tar -tvzf "$T" 2>/dev/null | grep -q 'link to'; then bad=1; fi
+  if tar -tzf  "$T" 2>/dev/null | grep -qE '^\./dev/[^/]+'; then bad=1; fi
+  if [[ "$bad" == 0 ]]; then
+    echo "✅ tarball 已是 Android 沙箱友好格式（无硬链接/无 dev 节点）"
+    return
+  fi
+  echo "→ 重打包为 Android 沙箱友好格式（硬链接实体化 + 剔除 dev 节点）..."
+  local D
+  D=$(mktemp -d)
+  tar -xzf "$T" -C "$D" 2>/dev/null
+  ( cd "$D" && tar --hard-dereference --exclude='./dev/*' \
+      --owner=0 --group=0 -czf "$T.new" . )
+  mv "$T.new" "$T"
+  rm -rf "$D"
+  echo "✅ 重打包完成（$(du -h "$T" | cut -f1)）"
+}
+
 fetch_rootfs() {
   local R="$ROOTFS_DIR/debian-minbase-arm64.tar.gz"
   if [[ -f "$R" ]]; then
-    echo "ℹ️  rootfs tarball 已存在（$(du -h "$R" | cut -f1)），跳过"
+    echo "ℹ️  rootfs tarball 已存在（$(du -h "$R" | cut -f1)），校验格式..."
+    repack_for_android "$R"
     return
   fi
   if [[ -n "${ROOTFS_URL:-}" ]]; then
     echo "↓ 下载 rootfs: $ROOTFS_URL"
     curl -fsSL --retry 3 -o "$R.tmp" "$ROOTFS_URL" && mv "$R.tmp" "$R"
+    repack_for_android "$R"
     echo "✅ rootfs 已就位（$(du -h "$R" | cut -f1)）"
   else
     cat <<'EOF'
@@ -80,7 +109,9 @@ fetch_rootfs() {
       /usr/bin/env DEBOOTSTRAP_DIR=/debootstrap /bin/sh -c '/debootstrap/debootstrap --second-stage'
   rm -rf rootfs/debootstrap rootfs/usr/share/debootstrap rootfs/var/lib/apt/lists/* \
          rootfs/usr/share/doc rootfs/usr/share/man rootfs/usr/share/locale
-  ( cd rootfs && tar -czf ../debian-minbase-arm64.tar.gz . )
+  # 打包时直接按 Android 友好格式（见 repack_for_android / Bug 209）：
+  ( cd rootfs && tar --hard-dereference --exclude='./dev/*' --owner=0 --group=0 \
+      -czf ../debian-minbase-arm64.tar.gz . )
 详见 SETUP_ANDROID.md「rootfs 的构建」一节。
 EOF
     exit 1

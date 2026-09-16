@@ -203,8 +203,19 @@ class MainActivity : FlutterActivity() {
             val proc = ProcessBuilder("tar", "-xzf", tmp.absolutePath, "-C", staging.absolutePath).start()
             val err = proc.errorStream.bufferedReader().readText()
             if (proc.waitFor() != 0) {
-                staging.deleteRecursively()
-                return mapOf("ok" to false, "error" to "tar 解压失败: ${err.take(500)}")
+                // Android 沙箱不允许 mknod()/部分机型 link()，toybox tar 可能对
+                // GNU 扩展头吐 warning——退出码非 0 不代表失败。以关键文件为准：
+                // bin/sh（经 usr-merge symlink 解析）+ dpkg 存在即视为安装成功。
+                // （rootfs tarball 生成侧已做 Android 友好重打包，见 Bug 209，
+                //  这里是兜底防御。）
+                val shOk = File(staging, "bin/sh").exists() || File(File(staging, "debian"), "bin/sh").exists()
+                val dpkgOk = File(staging, "usr/bin/dpkg").exists() || File(File(staging, "debian"), "usr/bin/dpkg").exists()
+                if (!shOk || !dpkgOk) {
+                    staging.deleteRecursively()
+                    return mapOf("ok" to false, "error" to "tar 解压失败: ${err.take(500)}")
+                }
+                // 关键文件在，继续（stderr 仅记录）
+                android.util.Log.w("FoaInstaller", "tar non-zero exit but key files present: ${err.take(300)}")
             }
         } catch (e: Exception) {
             return mapOf("ok" to false, "error" to "tar 不可用或执行失败: ${e.message}")
