@@ -449,6 +449,14 @@ Dart 系工具 `--version` 会自报编译目标（`simarm64` = 生成 arm64 代
 **解决**：修 import；`test/widget_test.dart` 模板残留的 `MyApp` 引用换成 `FoaApp` 冒烟测试。
 **流程改进**：**提交前必跑 `flutter analyze`（7 秒），构建前必跑 `./tools/check_env.sh`**。已列入 README 核心原则。
 
+### Bug 208 · 原生侧读 Flutter 资产漏了 flutter_assets/ 前缀（首个真机验证抓到的 bug）
+
+**症状**：真机点「初始化环境」报 `读取 rootfs 资产失败（assets/rootfs/debian-minbase-arm64.tar.gz）：assets/rootfs/debian-minbase-arm64.tar.gz`；但 `unzip -l apk` 里资产明明存在（77.6MB 完整打包）。
+**原因**：Flutter 打包的所有资产位于 APK 的 `assets/flutter_assets/` 子目录下，而 Android 原生 `AssetManager.open(path)` 的 path 相对 APK 的 `assets/` 根解析。代码里写 `assets.open("assets/rootfs/xxx")`，实际查找的是 `assets/assets/rootfs/xxx` → `FileNotFoundException`，且 **`e.message` 恰好就是传入的路径**（不带 "Unable to load asset" 字样），极易误判为"资产没打包"。
+**解决**：原生侧所有资产常量补 `flutter_assets/` 前缀：`"flutter_assets/assets/rootfs/debian-minbase-arm64.tar.gz"`。受影响的还有 proot 本体与 ptrace loader 两个资产（`flutter_assets/assets/tools/...`）——loader 缺失不会在安装时报错（被 jniLibs 的 libproot.so 兜底掩盖），要到 proot 执行时才 fatal，属"延迟爆炸"型，一并修复。
+**验证**：真机安装后点「初始化环境」能走完解压流程。
+**教训**：Dart 侧 `rootBundle.load('assets/...')` 与原生侧 `assets.open('flutter_assets/assets/...')` 的路径基准不同；原生读 Flutter 资产必须带前缀。devbox 集成测试只覆盖了 shell 链路，MethodChannel → AssetManager 这段只有真机能测到——这正是"每 Step 必真机验证"流程价值的直接证明。
+
 ---
 
 ## 九、提交 Bug 记录模板
