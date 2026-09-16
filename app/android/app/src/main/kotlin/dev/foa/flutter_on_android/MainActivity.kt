@@ -30,9 +30,13 @@ class MainActivity : FlutterActivity() {
     companion object {
         const val CHANNEL = "dev.foa/proot"
         const val ROOTFS_REL = "rootfs/debian"
-        const val ASSET_ROOTFS = "assets/rootfs/debian-minbase-arm64.tar.gz"
-        const val ASSET_PROOT = "assets/tools/proot-arm64"
-        const val ASSET_LOADER = "assets/tools/proot-loader" // Termux proot 的 ptrace loader
+        // 注意：原生 AssetManager 的路径相对 APK 的 assets/ 根，
+        // 而 Flutter 打包的资产全部位于 flutter_assets/ 子目录下，
+        // 因此必须带 flutter_assets/ 前缀（Bug 208：曾漏前缀导致真机
+        // FileNotFoundException，assets 里明明有文件却报"资产缺失"）
+        const val ASSET_ROOTFS = "flutter_assets/assets/rootfs/debian-minbase-arm64.tar.gz"
+        const val ASSET_PROOT = "flutter_assets/assets/tools/proot-arm64"
+        const val ASSET_LOADER = "flutter_assets/assets/tools/proot-loader" // Termux proot 的 ptrace loader
         const val LIB_PROOT = "libproot.so" // jniLibs 分发名
     }
 
