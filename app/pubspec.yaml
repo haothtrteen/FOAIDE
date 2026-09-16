@@ -1,7 +1,7 @@
 name: flutter_on_android
 description: A Flutter IDE that runs natively on Android devices, with local Flutter SDK and on-device APK building.
 publish_to: 'none'
-version: 0.1.0-alpha.9+9
+version: 0.1.0-alpha.10+10
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -17,6 +17,7 @@ dependencies:
   # Step 2 编辑器：语法高亮 + 代码输入（CodeField 基于 TextField，IME 友好）
   code_text_field: ^1.1.0
   highlight: ^0.7.0
+  flutter_highlight: ^0.7.0
 
 dev_dependencies:
   flutter_test:
