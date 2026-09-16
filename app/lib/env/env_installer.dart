@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
 
-import 'core/logger.dart';
+import '../core/logger.dart';
 import 'models.dart';
 import 'proot_bridge.dart';
 

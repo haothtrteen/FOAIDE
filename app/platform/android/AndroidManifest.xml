@@ -6,8 +6,10 @@
     <application
         android:name="${applicationName}"
         android:label="FlutterOnAndroid"
-        android:icon="@mipmap/ic_launcher"
-        android:extractNativeLibs="true">
+        android:icon="@mipmap/ic_launcher">
+        <!-- proot 走 jniLibs 路径需要 so 落地为真实文件：AGP 9 起由
+             build.gradle.kts 的 packaging.jniLibs.useLegacyPackaging = true 控制
+             （等价于旧 Manifest 属性 extractNativeLibs="true"） -->
 
         <activity
             android:name=".MainActivity"

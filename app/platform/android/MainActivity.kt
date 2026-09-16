@@ -5,6 +5,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -131,9 +132,11 @@ class MainActivity : FlutterActivity() {
             findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
             val proc = pb.start()
             // 双线程读流，防止管道缓冲区满导致死锁
+            // 注意：submit 的 lambda 在 Callable/Runnable 重载间有歧义（Kotlin 2.4 报
+            // Future<*>! 类型不匹配），必须显式 Callable<String>
             val pool = Executors.newFixedThreadPool(2)
-            val stdoutF: Future<String> = pool.submit { proc.inputStream.bufferedReader().readText() }
-            val stderrF: Future<String> = pool.submit { proc.errorStream.bufferedReader().readText() }
+            val stdoutF: Future<String> = pool.submit(Callable { proc.inputStream.bufferedReader().readText() })
+            val stderrF: Future<String> = pool.submit(Callable { proc.errorStream.bufferedReader().readText() })
             val finished = proc.waitFor(timeoutSec, TimeUnit.SECONDS)
             val exitCode = if (finished) proc.exitValue() else { proc.destroyForcibly(); -999 }
             val stdout = try { stdoutF.get(5, TimeUnit.SECONDS) } catch (_: Exception) { "" }

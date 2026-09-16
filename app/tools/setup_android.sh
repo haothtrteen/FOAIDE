@@ -27,22 +27,51 @@ cp "$SRC/AndroidManifest.xml"    "$DST/AndroidManifest.xml"
 # 清理可能存在的其他包名路径的 MainActivity（历史遗留）
 find android/app/src/main/kotlin -name 'MainActivity.kt' ! -path '*dev/foa/flutter_on_android*' -print -delete 2>/dev/null || true
 
-echo "→ [3/4] build.gradle: targetSdk → 28..."
-python3 - <<'PYEOF' || { echo "⚠️ 自动补丁失败，请手动把 android/app/build.gradle 中 targetSdk 改为 28"; }
+echo "→ [3/4] build.gradle(.kts): targetSdk → 28..."
+python3 - <<'PYEOF' || { echo "⚠️ 自动补丁失败，请手动把 android/app/build.gradle(.kts) 中 targetSdk 改为 28"; }
 import re, pathlib
-p = pathlib.Path("android/app/build.gradle")
-if not p.exists():
-    print("   （未找到 build.gradle，跳过）"); raise SystemExit(0)
+# Flutter 3.47 起模板默认生成 build.gradle.kts（Kotlin DSL）；旧版为 build.gradle
+candidates = [pathlib.Path("android/app/build.gradle.kts"), pathlib.Path("android/app/build.gradle")]
+p = next((c for c in candidates if c.exists()), None)
+if p is None:
+    print("   （未找到 build.gradle / build.gradle.kts，跳过）"); raise SystemExit(0)
 s = p.read_text()
 if re.search(r"targetSdk(Version)?\s*[= ]\s*28\b", s):
     print("   targetSdk 已是 28")
 else:
+    # Groovy DSL: targetSdkVersion flutter.targetSdkVersion / targetSdk = flutter.targetSdkVersion
+    # Kotlin DSL:  targetSdk = flutter.targetSdkVersion
     s2 = re.sub(r"targetSdk\s*=\s*flutter\.targetSdkVersion", "targetSdk = 28", s)
     s2 = re.sub(r"targetSdkVersion\s+flutter\.targetSdkVersion", "targetSdkVersion 28", s2)
     if s2 != s:
-        p.write_text(s2); print("   ✅ 已将 targetSdk 改为 28")
+        p.write_text(s2); print(f"   ✅ 已将 {p.name} 中 targetSdk 改为 28")
     else:
         print("   ⚠️ 未匹配到 targetSdk 行，请手动设置"); raise SystemExit(1)
+
+# targetSdk 28 会触发 lintVitalRelease 的 ExpiredTargetSdkVersion fatal 错误
+# （Play 要求 API 33+；本项目不走 Play 分发，属刻意豁免）；
+# 同时注入 useLegacyPackaging（等价旧 extractNativeLibs="true"，AGP 9 起必须走 DSL，
+# 让 libproot.so 落地为真实文件）
+s = p.read_text()
+if "ExpiredTargetSdkVersion" not in s:
+    if "android {" in s:
+        s2 = s.replace(
+            "android {",
+            "android {\n"
+            "    lint {\n"
+            "        // targetSdk 28 为刻意选择（W^X 策略），非 Play 分发，豁免该 fatal lint\n"
+            "        disable += \"ExpiredTargetSdkVersion\"\n"
+            "    }\n"
+            "    packaging {\n"
+            "        jniLibs {\n"
+            "            useLegacyPackaging = true\n"
+            "        }\n"
+            "    }\n",
+            1,
+        )
+        p.write_text(s2); print("   ✅ 已注入 lint 豁免 + useLegacyPackaging")
+    else:
+        print("   ⚠️ 未找到 android { 块，请手动配置 lint 豁免与 packaging")
 PYEOF
 
 echo "→ [4/4] jniLibs: 部署 libproot.so..."

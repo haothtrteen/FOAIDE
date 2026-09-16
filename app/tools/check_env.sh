@@ -61,15 +61,19 @@ else
 fi
 
 echo "== 3. targetSdk（W^X 关键项） =="
-BG="android/app/build.gradle"
-if [[ -f "$BG" ]]; then
+# Flutter 3.47 起模板生成 build.gradle.kts；旧版为 build.gradle
+BG=""
+for f in android/app/build.gradle.kts android/app/build.gradle; do
+  [[ -f "$f" ]] && BG="$f" && break
+done
+if [[ -n "$BG" ]]; then
   if grep -qE 'targetSdk(Version)?\s*[= ]\s*28\b' "$BG"; then
-    ok "targetSdk = 28（允许执行数据目录二进制）"
+    ok "targetSdk = 28（$BG，允许执行数据目录二进制）"
   else
     bad "targetSdk 不是 28 —— Android 10+ 将禁止 proot 执行 rootfs 内二进制！"
   fi
 else
-  warn "未找到 android/app/build.gradle（还没运行 setup_android.sh？）"
+  warn "未找到 android/app/build.gradle(.kts)（还没运行 setup_android.sh？）"
 fi
 
 echo "== 4. 工具链与设备 =="
