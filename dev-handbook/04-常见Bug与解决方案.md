@@ -457,6 +457,16 @@ Dart 系工具 `--version` 会自报编译目标（`simarm64` = 生成 arm64 代
 **验证**：真机安装后点「初始化环境」能走完解压流程。
 **教训**：Dart 侧 `rootBundle.load('assets/...')` 与原生侧 `assets.open('flutter_assets/assets/...')` 的路径基准不同；原生读 Flutter 资产必须带前缀。devbox 集成测试只覆盖了 shell 链路，MethodChannel → AssetManager 这段只有真机能测到——这正是"每 Step 必真机验证"流程价值的直接证明。
 
+### Bug 209 · 真机解压 rootfs：mknod/link 被 Android 沙箱拒绝（v0.1.0-alpha.2 抓到）
+
+**症状**：真机点「初始化环境」，tar 解压阶段红色报错两类：`tar: can't link './usr/bin/perlthanks' -> './usr/bin/perlbug': Permission denied`（3 条硬链接）与 `tar: can't create './dev/full|console|ptmx|zero|tty': Operation not permitted`（8 条设备节点），退出码非 0 后整体回滚。
+**原因**：Android 应用沙箱（untrusted_app SELinux 域）不允许 `mknod()` 创建设备节点——任何机型都如此；`link()` 硬链接在部分机型内核（protected_hardlinks 强化策略）被拒。服务器上以 root 解压永远不会暴露（devbox 测试盲区）。
+**解决（生成侧治本 + 运行时兜底）**：
+1. **rootfs tarball 生成时重打包为"Android 沙箱友好格式"**（已固化进 `fetch_assets.sh` 的 `repack_for_android`，幂等）：`tar --hard-dereference --exclude='./dev/*' --owner=0 --group=0`——硬链接条目实体化为独立文件副本（体积 +1.3MB）；dev 设备节点全部丢弃（proot -R 运行时绑定宿主 /dev，rootfs 内 dev 只需空目录）。513 个 symlink 保留（Android 沙箱允许 symlink，Termux 同款依赖）。
+2. **Kotlin 安装器容错**：tar 退出码非 0 时不再立即判死，改为校验关键文件（`bin/sh` 经 usr-merge symlink 解析 + `usr/bin/dpkg`）存在即视为成功，抵御 toybox tar 对 GNU 扩展头的未知 warning。
+**验证**：真机重新初始化，应显示"安装完成：N 个文件，耗时 X 秒"。
+**教训**：**凡"服务器验证通过、真机才能暴露"的问题，都应把差异点（权限模型）前移到资产生成阶段消除**，而不是指望运行时环境宽容。rootfs 这类静态资产在打包阶段就能把所有需要特权系统调用的条目消灭掉。
+
 ---
 
 ## 九、提交 Bug 记录模板
