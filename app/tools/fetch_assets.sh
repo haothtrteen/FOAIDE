@@ -1,73 +1,99 @@
 #!/usr/bin/env bash
 # ============================================================
-# fetch_assets.sh — 下载运行时所需的二进制资产到 assets/
+# fetch_assets.sh — 下载/准备运行时所需的二进制资产到 assets/
 #
 # 用法:
-#   ./tools/fetch_assets.sh            # 下载全部（proot + rootfs）
-#   ./tools/fetch_assets.sh proot      # 只下载 proot
-#   ./tools/fetch_assets.sh rootfs     # 只下载 rootfs
+#   ./tools/fetch_assets.sh            # proot + rootfs 全部
+#   ./tools/fetch_assets.sh proot      # 只准备 proot + loader
+#   ./tools/fetch_assets.sh rootfs     # 只准备 rootfs
 #
-# 可用环境变量覆盖默认源（默认源失效或需走镜像时）:
-#   PROOT_URL=...  ROOTFS_URL=...
+# 说明:
+#   - proot 从 Termux 官方 apt 仓库拉 .deb 并解出两个文件:
+#       proot-arm64  (proot 本体，bionic 构建，设备上运行)
+#       proot-loader (ptrace loader；App 启动时以 PROOT_LOADER 指向它)
+#   - rootfs 若已存在（如直接从工作区拿到打包好的）则跳过；
+#     否则按文档自建（debootstrap minbase，见 SETUP_ANDROID.md）
 #
 # 许可证注意:
-#   - proot 是 GPL-2.0，分发时必须在 THIRD-PARTY-NOTICES
-#     附源码获取链接（见 README）
-#   - rootfs 为 Debian 自由软件集合，体积大，一律不进 git
+#   - proot 是 GPL-2.0，分发时必须在 THIRD-PARTY-NOTICES 附源码链接
+#   - rootfs 为 Debian 自由软件集合（DFSG），体积大，一律不进 git
 # ============================================================
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOOLS_DIR="$APP_DIR/assets/tools"
 ROOTFS_DIR="$APP_DIR/assets/rootfs"
+TMP="${TMPDIR:-/tmp}/foa-fetch-$$"
 
-# ---- 默认下载源（可被环境变量覆盖）------------------------
-# proot: Termux 维护的 proot 分支发布页（含 Android 可用的静态构建）
-# 具体版本文件名请在发布页确认后填入:
-#   https://github.com/termux/proot/releases
-PROOT_URL="${PROOT_URL:-}"
-
-# rootfs: Debian arm64 minbase
-# 推荐用 Docker 导出（保证纯度）:
-#   docker pull --platform=linux/arm64 debian:bookworm-slim
-#   docker run --platform=linux/arm64 debian:bookworm-slim tar cf - . | gzip > debian-minbase-arm64.tar.gz
-# 或使用 proot-distro 支持的 Debian 发行版 tarball
-ROOTFS_URL="${ROOTFS_URL:-}"
+# Termux 官方 apt 仓库（版本号升级时改这里）
+PROOT_DEB_URL="${PROOT_DEB_URL:-https://packages-cf.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107.92_aarch64.deb}"
 
 mkdir -p "$TOOLS_DIR" "$ROOTFS_DIR"
 
-fetch() {
-  local url="$1" dest="$2"
-  if [[ -z "$url" ]]; then
-    echo "❌ 未配置下载地址。请设置环境变量或编辑本脚本:"
-    echo "   export PROOT_URL=...  /  export ROOTFS_URL=..."
+fetch_proot() {
+  if [[ -f "$TOOLS_DIR/proot-arm64" && -f "$TOOLS_DIR/proot-loader" ]]; then
+    echo "ℹ️  proot-arm64 / proot-loader 已存在，跳过（删除后重跑可强制更新）"
+    return
+  fi
+  echo "↓ 下载 Termux proot: $PROOT_DEB_URL"
+  mkdir -p "$TMP"
+  curl -fsSL --retry 3 -o "$TMP/proot.deb" "$PROOT_DEB_URL" \
+    || { echo "❌ 下载失败（网络受限？可用 PROOT_DEB_URL 指定镜像）"; exit 1; }
+
+  # 解 deb：优先 dpkg -x，退回 ar + tar
+  echo "→ 解包 .deb ..."
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg -x "$TMP/proot.deb" "$TMP/pkg"
+  elif command -v ar >/dev/null 2>&1; then
+    mkdir -p "$TMP/pkg"
+    ( cd "$TMP/pkg" && ar p "$TMP/proot.deb" data.tar.xz | tar -xJf - )
+  else
+    echo "❌ 需要 dpkg 或 ar(binutils)+xz 才能解 .deb；WSL/macOS/Linux 均自带其一"; exit 1
+  fi
+
+  B="$TMP/pkg/data/data/com.termux/files/usr"
+  cp "$B/bin/proot"              "$TOOLS_DIR/proot-arm64"
+  cp "$B/libexec/proot/loader"   "$TOOLS_DIR/proot-loader"
+  chmod +x "$TOOLS_DIR/proot-arm64" "$TOOLS_DIR/proot-loader"
+  echo "✅ proot-arm64 + proot-loader 已就位"
+}
+
+fetch_rootfs() {
+  local R="$ROOTFS_DIR/debian-minbase-arm64.tar.gz"
+  if [[ -f "$R" ]]; then
+    echo "ℹ️  rootfs tarball 已存在（$(du -h "$R" | cut -f1)），跳过"
+    return
+  fi
+  if [[ -n "${ROOTFS_URL:-}" ]]; then
+    echo "↓ 下载 rootfs: $ROOTFS_URL"
+    curl -fsSL --retry 3 -o "$R.tmp" "$ROOTFS_URL" && mv "$R.tmp" "$R"
+    echo "✅ rootfs 已就位（$(du -h "$R" | cut -f1)）"
+  else
+    cat <<'EOF'
+⚠️  rootfs 未配置下载源（ROOTFS_URL）。
+自建方式（推荐，与服务器侧 devbox 流程一致）：
+  # x86_64 Linux 上：
+  apt-get install -y debootstrap qemu-user-static proot
+  debootstrap --foreign --arch=arm64 --variant=minbase bookworm rootfs http://mirrors.tuna.tsinghua.edu.cn/debian/
+  cp -r /usr/share/debootstrap/. rootfs/usr/share/debootstrap/     # stage2 需要脚本
+  proot -q /usr/bin/qemu-aarch64-static -R "$PWD/rootfs" \
+      /usr/bin/env DEBOOTSTRAP_DIR=/debootstrap /bin/sh -c '/debootstrap/debootstrap --second-stage'
+  rm -rf rootfs/debootstrap rootfs/usr/share/debootstrap rootfs/var/lib/apt/lists/* \
+         rootfs/usr/share/doc rootfs/usr/share/man rootfs/usr/share/locale
+  ( cd rootfs && tar -czf ../debian-minbase-arm64.tar.gz . )
+详见 SETUP_ANDROID.md「rootfs 的构建」一节。
+EOF
     exit 1
   fi
-  echo "↓ 下载: $url"
-  if command -v wget >/dev/null 2>&1; then
-    wget -c -O "$dest.tmp" "$url"
-  else
-    curl -L -C - -o "$dest.tmp" "$url"
-  fi
-  mv "$dest.tmp" "$dest"
-  echo "✅ 已保存: $dest ($(du -h "$dest" | cut -f1))"
 }
 
 case "${1:-all}" in
-  proot)
-    fetch "$PROOT_URL" "$TOOLS_DIR/proot-arm64"
-    chmod +x "$TOOLS_DIR/proot-arm64"
-    ;;
-  rootfs)
-    fetch "$ROOTFS_URL" "$ROOTFS_DIR/debian-minbase-arm64.tar.gz"
-    ;;
-  all|*)
-    fetch "$PROOT_URL" "$TOOLS_DIR/proot-arm64"
-    chmod +x "$TOOLS_DIR/proot-arm64"
-    fetch "$ROOTFS_URL" "$ROOTFS_DIR/debian-minbase-arm64.tar.gz"
-    ;;
+  proot)  fetch_proot ;;
+  rootfs) fetch_rootfs ;;
+  all|*)  fetch_proot; fetch_rootfs ;;
 esac
 
 echo ""
-echo "完成。目录内容:"
-ls -lh "$TOOLS_DIR" "$ROOTFS_DIR"
+echo "目录内容:"
+ls -lh "$TOOLS_DIR" "$ROOTFS_DIR" | grep -v '^total\|^$'
+rm -rf "$TMP"

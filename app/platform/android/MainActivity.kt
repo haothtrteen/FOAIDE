@@ -31,6 +31,7 @@ class MainActivity : FlutterActivity() {
         const val ROOTFS_REL = "rootfs/debian"
         const val ASSET_ROOTFS = "assets/rootfs/debian-minbase-arm64.tar.gz"
         const val ASSET_PROOT = "assets/tools/proot-arm64"
+        const val ASSET_LOADER = "assets/tools/proot-loader" // Termux proot 的 ptrace loader
         const val LIB_PROOT = "libproot.so" // jniLibs 分发名
     }
 
@@ -90,6 +91,16 @@ class MainActivity : FlutterActivity() {
         return null
     }
 
+    /**
+     * proot 的 ptrace loader（Termux 构建版必需，其默认路径硬编码为 com.termux）。
+     * 实测 proot 认 PROOT_LOADER 环境变量（指向不存在的 loader 会直接 fatal error），
+     * 因此无需重编译 proot——启动时把该变量指向 filesDir/tools/loader 即可。
+     */
+    private fun findLoader(): File? {
+        val f = File(filesDir, "tools/loader")
+        return if (f.exists()) f else null
+    }
+
     // ---------------- 命令执行 ----------------
 
     private fun exec(command: String, timeoutSec: Long): Map<String, Any> {
@@ -114,7 +125,11 @@ class MainActivity : FlutterActivity() {
         )
 
         return try {
-            val proc = ProcessBuilder(cmd).start()
+            val pb = ProcessBuilder(cmd)
+            // Termux 构建的 proot 默认 loader 路径指向 com.termux 包，
+            // 用 PROOT_LOADER 重定向到本应用私有目录（实测有效）。
+            findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
+            val proc = pb.start()
             // 双线程读流，防止管道缓冲区满导致死锁
             val pool = Executors.newFixedThreadPool(2)
             val stdoutF: Future<String> = pool.submit { proc.inputStream.bufferedReader().readText() }
@@ -203,7 +218,7 @@ class MainActivity : FlutterActivity() {
         resolved.renameTo(rootfs)
         if (resolved != staging) staging.deleteRecursively()
 
-        // 4) proot 兜底拷贝
+        // 4) proot + loader 兜底拷贝（jniLibs 路径可用时不需要 proot 本体）
         var prootCopied = false
         try {
             val tools = File(filesDir, "tools").apply { mkdirs() }
@@ -215,8 +230,19 @@ class MainActivity : FlutterActivity() {
                 dest.setExecutable(true, false)
                 prootCopied = true
             }
-        } catch (_: Exception) {
-            // jniLibs 路径可用时不需要
+            // loader 无论 proot 走哪条路径都需要（PROOT_LOADER 指向它）
+            val loader = File(tools, "loader")
+            if (!loader.exists()) {
+                assets.open(ASSET_LOADER).use { input ->
+                    loader.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
+                }
+                loader.setExecutable(true, false)
+            }
+        } catch (e: Exception) {
+            // loader 缺失时 proot 会 fatal error，不静默吞掉：仅在本体也缺失时提示
+            if (findProot() == null) {
+                return mapOf("ok" to false, "error" to "proot/loader 资产缺失：${e.message}")
+            }
         }
 
         return mapOf(

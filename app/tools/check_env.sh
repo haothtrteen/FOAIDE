@@ -31,16 +31,26 @@ R="assets/rootfs/debian-minbase-arm64.tar.gz"
 if [[ -f "$R" ]]; then
   if tar -tzf "$R" >/dev/null 2>&1; then
     ok "rootfs tarball 存在且可读取（$(du -h "$R" | cut -f1)）"
-    if tar -tzf "$R" 2>/dev/null | grep -qE '^\./?(debian/)?bin/sh$'; then
-      ok "tarball 内含 bin/sh（结构正确）"
+    # 兼容 usrmerge：bin/sh 可能是符号链接，真身在 usr/bin/sh
+    # 注意：pipefail 下不要用 grep -q（SIGPIPE 会误报失败），用 grep -c 全量读取
+    n=$(tar -tzf "$R" 2>/dev/null | grep -cE '^\./(bin/sh|usr/bin/sh)$')
+    if [[ "$n" -gt 0 ]]; then
+      ok "tarball 内含 shell（usrmerge 结构正确）"
     else
-      warn "tarball 中未直接看到 bin/sh，安装器会做层级兼容，但建议核对结构"
+      warn "tarball 中未找到 bin/sh 或 usr/bin/sh，请核对结构"
     fi
   else
     bad "rootfs tarball 损坏或非 gzip 格式"
   fi
 else
-  bad "缺少 $R —— 运行 ./tools/fetch_assets.sh rootfs"
+  bad "缺少 $R —— 运行 ./tools/fetch_assets.sh rootfs（或从工作区直接下载）"
+fi
+
+P2="assets/tools/proot-loader"
+if [[ -f "$P2" ]]; then
+  ok "proot-loader 存在（Termux proot 的 ptrace loader，PROOT_LOADER 用）"
+else
+  bad "缺少 $P2 —— 与 proot 一起分发，运行 ./tools/fetch_assets.sh proot"
 fi
 
 echo "== 2. jniLibs（proot 双保险路径） =="
