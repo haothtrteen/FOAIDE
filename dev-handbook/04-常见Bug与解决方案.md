@@ -348,7 +348,58 @@ No space left on device
 
 ---
 
-## 七、提交 Bug 记录模板
+## 七、架构类问题排查工具箱（2026-09-16 SDK 调研实战总结）
+
+> 适用场景：任何"这个二进制 / SDK / artifact 有没有 arm64 版"、"这个工具能在手机上跑吗"、"为什么服务器能构建手机不能"类问题。
+> 产出方法论的环境：Flutter 3.47.4 / engine 06a2e2a1，x86_64 服务器实测。
+
+### 工具 1 · 查远程 artifact 是否存在（Range GET 探测）
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -r 0-0 "<url>"
+# 206 = 存在；404 = 不存在；403 = 权限/签名问题
+```
+
+**坑**：不要用 `curl -I`（HEAD 请求）。实测 HEAD 对 Google 对象存储全部误报 404，Range GET（`-r 0-0` 只取 1 字节）才返回真实状态——部分对象存储 / 镜像对 HEAD 处理不一致。
+
+### 工具 2 · 查官方分发矩阵（flutter_tools 源码，最权威）
+
+镜像 404 ≠ 官方没有。下结论前先读源码里的硬编码下载清单：
+
+- `packages/flutter_tools/lib/src/flutter_cache.dart`：搜 `_linuxBinaryDirs` / `_androidBinaryDirs` / `_dartSdks`——每个 `[本地目录, 下载路径]` 二元组就是官方真实分发范围（本次靠它实锤"Android gen_snapshot 只有 x64 宿主版"）；
+- `packages/flutter_tools/lib/src/artifacts.dart`：gen_snapshot 的宿主回退逻辑（如 `darwin_arm64` 强制回退 `darwin_x64`，上游 TODO: flutter/flutter#152281）。
+
+### 工具 3 · 验证单个二进制的"宿主 × 目标"双维度
+
+```bash
+file gen_snapshot          # → ELF 64-bit ... x86-64     ← 宿主架构（这个文件在哪种 CPU 上运行）
+gen_snapshot --version     # → Dart SDK version ... on "linux_simarm64"  ← 目标架构（它生成哪种代码）
+```
+
+Dart 系工具 `--version` 会自报编译目标（`simarm64` = 生成 arm64 代码）。一个 x86-64 ELF 报 `linux_simarm64`，就是"x64 宿主、arm64 目标"交叉编译的铁证。
+
+### 工具 4 · engine artifact URL 构造
+
+```
+{FLUTTER_STORAGE_BASE_URL}/flutter_infra_release/flutter/{engineRevision}/{包名}.zip
+```
+
+- `engineRevision` 取自 `flutter/bin/cache/flutter.version.json`；
+- 路径规律：宿主敏感的包含宿主目录（`android-arm64-release/linux-x64.zip` = x64 宿主构建 arm64 目标）；宿主无关的直接以目标名开头（`android-arm64/artifacts.zip` = libflutter.so debug 版；`dart-sdk-linux-arm64.zip` = arm64 宿主 Dart SDK）。
+
+### 工具 5 · 双源对照定位问题
+
+同一个 URL 同时打 `storage.googleapis.com`（官方）与 `storage.flutter-io.cn`（国内镜像）：
+
+| 官方 | 镜像 | 结论 |
+|---|---|---|
+| 206 | 206 | 正常可用 |
+| 206 | 404 | 镜像未同步，换源或等待 |
+| 404 | 404 | 官方没有，走社区构建 / qemu 翻译路线 |
+
+---
+
+## 八、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
 
