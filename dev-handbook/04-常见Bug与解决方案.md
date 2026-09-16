@@ -490,6 +490,33 @@ CANNOT LINK EXECUTABLE "/data/app/~~.../dev.foa.flutter_on_android-.../lib/arm64
 
 **教训**：用第三方发行版（Termux）的二进制，`readelf -d` 查依赖是必做步骤——NDK 构建的"标准" bionic 程序只依赖 libc/libm/libdl/liblog，而 Termux 的包在自己前缀目录下链接了专有库，换宿主必缺。同类的还有 `libbsd`、`libiconv`（proot 5.2+ 可能新增）。
 
+### Bug 211 · proot 临时目录硬编码 Termux 路径：can't create glue rootfs（v0.1.0-alpha.4 抓到）
+
+**症状**：
+```
+$ echo hello
+hello
+proot warning: can't canonicalize /data/data/com.termux/files/usr/tmp/: Permission denied
+proot warning: Unable to create temp directory for f2fs bug probe: Permission denied
+proot error: can't create temporary directory: Permission denied
+proot info: Please set PROOT_TMP_DIR env. variable to an alternate location (with write permission).
+proot error: can't create glue rootfs
+```
+`echo` 这类不依赖容器的命令能跑（Bug 210 已修复，proot 本体正常加载），但 proot 无法创建 glue rootfs（bind 挂载粘合层），进入容器内的一切命令（`uname`、`apt`）仍然失败。
+
+**原因**：
+Termux 构建 proot 时把 `P_tmpdir` 硬编码为 `/data/data/com.termux/files/usr/tmp/`。proot 启动时要做两件事都依赖该目录：
+1. **f2fs bug probe**：探测宿主文件系统是否 f2fs（Android 常见），需在 tmp 建临时文件
+2. **glue rootfs**：`-R` 的 bind 挂载需要 tmp 作为粘合层工作目录
+而 `/data/data/com.termux/` 是 Termux 应用的私有目录，本应用（SELinux untrusted_app 域）无权写入 → Permission denied → 直接 fatal。
+
+**解决**：
+`exec()` 的 ProcessBuilder 注入 `PROOT_TMP_DIR=${filesDir}/tmp`（先 `mkdirs()` 确保存在）——这是 proot 官方支持的环境变量，错误日志本身也提示了。与 Bug 210 的 `PROOT_LOADER` 同模式：**Termux 构建的二进制所有硬编码路径都可以用环境变量重定向**。
+
+**验证**：真机终端 `uname -a` 应输出 `Linux ... aarch64 ... GNU/Linux`（能进容器 = glue rootfs 创建成功）。
+
+**教训**：`P_tmpdir` 是 Termux proot 的第二个硬编码路径（第一个是 loader）。排查 Termux 二进制时把"编译期路径常量"全部列为嫌疑：`strings <binary> | grep com.termux` 一条命令就能列全。
+
 ---
 
 ## 九、提交 Bug 记录模板
