@@ -435,7 +435,7 @@ class FileTreeState extends State<FileTree> {
       onTap: () => _onTap(e),
       onLongPress: () => _showMenu(e),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
         child: Row(
           children: [
             Icon(
@@ -456,6 +456,17 @@ class FileTreeState extends State<FileTree> {
                 _fmtSize(e.size),
                 style: const TextStyle(fontSize: 11, color: Colors.grey),
               ),
+            // "..." 入口：明确指示可在此重命名/删除（不再依赖长按发现）
+            IconButton(
+              tooltip: '更多操作（重命名 / 删除）',
+              visualDensity: VisualDensity.compact,
+              padding: EdgeInsets.zero,
+              constraints:
+                  const BoxConstraints(minWidth: 32, minHeight: 32),
+              icon: const Icon(Icons.more_vert,
+                  size: 16, color: Colors.grey),
+              onPressed: () => _showMenu(e),
+            ),
           ],
         ),
       ),

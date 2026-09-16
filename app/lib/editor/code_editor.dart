@@ -237,6 +237,9 @@ class _CodeEditorState extends State<CodeEditor> {
                     controller: _controller,
                     focusNode: _focus,
                     expands: true,
+                    // 显式声明普通多行文本输入（非密码/数字变体），
+                    // 避免厂商 ROM 的安全键盘误判（系统级设置仍需用户关闭）
+                    keyboardType: TextInputType.multiline,
                     decoration: const BoxDecoration(),
                     cursorColor: const Color(0xFF3DDC84),
                     textStyle: const TextStyle(

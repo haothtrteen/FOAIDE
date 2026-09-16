@@ -186,6 +186,9 @@ class _EditorPageState extends State<EditorPage> {
         path: path,
         initialContent: _content,
         onContentChanged: (t) {
+          // 关键：把最新文本写回 EditorPage._content，保存时才有新内容
+          // （Bug 215：此前只标记 dirty，保存写的是打开时的旧内容）
+          _content = t;
           if (!_dirty) setState(() => _dirty = true);
         },
       ),
