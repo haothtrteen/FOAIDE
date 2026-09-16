@@ -37,6 +37,10 @@ class MainActivity : FlutterActivity() {
         const val ASSET_ROOTFS = "flutter_assets/assets/rootfs/debian-minbase-arm64.tar.gz"
         const val ASSET_PROOT = "flutter_assets/assets/tools/proot-arm64"
         const val ASSET_LOADER = "flutter_assets/assets/tools/proot-loader" // Termux proot 的 ptrace loader
+        // Bug 210：proot（Termux bionic 构建）readelf -d 显示 NEEDED
+        // libtalloc.so.2 / libandroid-shmem.so，系统目录均不存在 → 随 assets 分发
+        const val ASSET_LIBTALLOC = "flutter_assets/assets/tools/libtalloc.so.2"
+        const val ASSET_LIBSHMEM = "flutter_assets/assets/tools/libandroid-shmem.so"
         const val LIB_PROOT = "libproot.so" // jniLibs 分发名
     }
 
@@ -108,8 +112,45 @@ class MainActivity : FlutterActivity() {
 
     // ---------------- 命令执行 ----------------
 
+    /**
+     * 幂等同步 proot 运行时依赖到 filesDir/tools/：
+     * proot 本体（兜底）+ ptrace loader + libtalloc.so.2 + libandroid-shmem.so。
+     *
+     * 必须在每次 exec() 前调用，不能只在 installRootfs() 里做——后者对
+     * 已安装 rootfs 的用户会提前返回（Bug 210 场景：旧版本升级用户 rootfs
+     * 在位但动态库缺失，终端报 CANNOT LINK EXECUTABLE）。
+     * 文件已存在时零拷贝，仅 4 次 File.exists() 开销。
+     *
+     * @return 本次实际落盘的文件名列表（供安装日志统计）
+     */
+    private fun ensureProotRuntime(): List<String> {
+        val tools = File(filesDir, "tools").apply { mkdirs() }
+        val synced = mutableListOf<String>()
+        fun sync(asset: String, name: String, executable: Boolean) {
+            val dest = File(tools, name)
+            if (dest.exists()) return
+            try {
+                assets.open(asset).use { input ->
+                    dest.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
+                }
+                // 动态库只需可读；二进制需可执行（W^X：filesDir 在 targetSdk 28 下可执行）
+                if (executable) dest.setExecutable(true, false) else dest.setReadable(true, false)
+                synced.add(name)
+            } catch (_: Exception) {
+                // 资产缺失不在此时报错，由 exec()/installRootfs() 的兜底提示统一处理
+            }
+        }
+        sync(ASSET_PROOT, "proot", executable = true)
+        sync(ASSET_LOADER, "loader", executable = true)
+        sync(ASSET_LIBTALLOC, "libtalloc.so.2", executable = false)
+        sync(ASSET_LIBSHMEM, "libandroid-shmem.so", executable = false)
+        return synced
+    }
+
     private fun exec(command: String, timeoutSec: Long): Map<String, Any> {
         val start = System.currentTimeMillis()
+        // 先补齐依赖再定位 proot：findProot() 的 assets 兜底路径依赖本次同步
+        ensureProotRuntime()
         val proot = findProot()
             ?: return fail(-404, "proot 二进制未找到。\n请先运行 ./tools/fetch_assets.sh，并参考 SETUP_ANDROID.md 把它放进 jniLibs 或 assets。")
         val rootfs = File(filesDir, ROOTFS_REL)
@@ -134,6 +175,10 @@ class MainActivity : FlutterActivity() {
             // Termux 构建的 proot 默认 loader 路径指向 com.termux 包，
             // 用 PROOT_LOADER 重定向到本应用私有目录（实测有效）。
             findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
+            // Bug 210：proot 的 DT_NEEDED 含 libtalloc.so.2 / libandroid-shmem.so，
+            // Android 系统目录没有这两个库 → 注入 LD_LIBRARY_PATH 让 linker
+            // 到 filesDir/tools 找（对主二进制的依赖查找同样生效）。
+            pb.environment()["LD_LIBRARY_PATH"] = File(filesDir, "tools").absolutePath
             val proc = pb.start()
             // 双线程读流，防止管道缓冲区满导致死锁
             // 注意：submit 的 lambda 在 Callable/Runnable 重载间有歧义（Kotlin 2.4 报
@@ -236,31 +281,11 @@ class MainActivity : FlutterActivity() {
         resolved.renameTo(rootfs)
         if (resolved != staging) staging.deleteRecursively()
 
-        // 4) proot + loader 兜底拷贝（jniLibs 路径可用时不需要 proot 本体）
-        var prootCopied = false
-        try {
-            val tools = File(filesDir, "tools").apply { mkdirs() }
-            val dest = File(tools, "proot")
-            if (!dest.exists()) {
-                assets.open(ASSET_PROOT).use { input ->
-                    dest.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
-                }
-                dest.setExecutable(true, false)
-                prootCopied = true
-            }
-            // loader 无论 proot 走哪条路径都需要（PROOT_LOADER 指向它）
-            val loader = File(tools, "loader")
-            if (!loader.exists()) {
-                assets.open(ASSET_LOADER).use { input ->
-                    loader.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
-                }
-                loader.setExecutable(true, false)
-            }
-        } catch (e: Exception) {
-            // loader 缺失时 proot 会 fatal error，不静默吞掉：仅在本体也缺失时提示
-            if (findProot() == null) {
-                return mapOf("ok" to false, "error" to "proot/loader 资产缺失：${e.message}")
-            }
+        // 4) proot 运行时依赖兜底拷贝（本体 + loader + 动态库；exec 前亦会幂等补齐）
+        val synced = ensureProotRuntime()
+        val prootCopied = "proot" in synced
+        if (findProot() == null) {
+            return mapOf("ok" to false, "error" to "proot 资产缺失：请运行 ./tools/fetch_assets.sh proot 后重新构建")
         }
 
         return mapOf(

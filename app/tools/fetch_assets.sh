@@ -27,35 +27,64 @@ TMP="${TMPDIR:-/tmp}/foa-fetch-$$"
 
 # Termux 官方 apt 仓库（版本号升级时改这里）
 PROOT_DEB_URL="${PROOT_DEB_URL:-https://packages-cf.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107.92_aarch64.deb}"
+# Termux proot 的动态库依赖（Bug 210：readelf -d proot → NEEDED libtalloc.so.2
+# / libandroid-shmem.so / libc.so；前两个 Termux 专有，系统目录没有）
+LIBTALLOC_DEB_URL="${LIBTALLOC_DEB_URL:-https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc/libtalloc_2.4.3_aarch64.deb}"
+LIBSHMEM_DEB_URL="${LIBSHMEM_DEB_URL:-https://packages.termux.dev/apt/termux-main/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb}"
 
 mkdir -p "$TOOLS_DIR" "$ROOTFS_DIR"
 
-fetch_proot() {
-  if [[ -f "$TOOLS_DIR/proot-arm64" && -f "$TOOLS_DIR/proot-loader" ]]; then
-    echo "ℹ️  proot-arm64 / proot-loader 已存在，跳过（删除后重跑可强制更新）"
-    return
-  fi
-  echo "↓ 下载 Termux proot: $PROOT_DEB_URL"
-  mkdir -p "$TMP"
-  curl -fsSL --retry 3 -o "$TMP/proot.deb" "$PROOT_DEB_URL" \
-    || { echo "❌ 下载失败（网络受限？可用 PROOT_DEB_URL 指定镜像）"; exit 1; }
-
-  # 解 deb：优先 dpkg -x，退回 ar + tar
-  echo "→ 解包 .deb ..."
+# 解 deb 到 $2（复用 proot 的解包逻辑）
+extract_deb() {
+  local deb="$1" out="$2"
   if command -v dpkg >/dev/null 2>&1; then
-    dpkg -x "$TMP/proot.deb" "$TMP/pkg"
+    dpkg -x "$deb" "$out"
   elif command -v ar >/dev/null 2>&1; then
-    mkdir -p "$TMP/pkg"
-    ( cd "$TMP/pkg" && ar p "$TMP/proot.deb" data.tar.xz | tar -xJf - )
+    mkdir -p "$out"
+    ( cd "$out" && ar p "$deb" data.tar.xz | tar -xJf - )
   else
     echo "❌ 需要 dpkg 或 ar(binutils)+xz 才能解 .deb；WSL/macOS/Linux 均自带其一"; exit 1
   fi
+}
 
-  B="$TMP/pkg/data/data/com.termux/files/usr"
-  cp "$B/bin/proot"              "$TOOLS_DIR/proot-arm64"
-  cp "$B/libexec/proot/loader"   "$TOOLS_DIR/proot-loader"
-  chmod +x "$TOOLS_DIR/proot-arm64" "$TOOLS_DIR/proot-loader"
-  echo "✅ proot-arm64 + proot-loader 已就位"
+fetch_proot() {
+  local need_deps=0
+  if [[ -f "$TOOLS_DIR/proot-arm64" && -f "$TOOLS_DIR/proot-loader" ]]; then
+    echo "ℹ️  proot-arm64 / proot-loader 已存在，跳过（删除后重跑可强制更新）"
+  else
+    echo "↓ 下载 Termux proot: $PROOT_DEB_URL"
+    mkdir -p "$TMP"
+    curl -fsSL --retry 3 -o "$TMP/proot.deb" "$PROOT_DEB_URL" \
+      || { echo "❌ 下载失败（网络受限？可用 PROOT_DEB_URL 指定镜像）"; exit 1; }
+    echo "→ 解包 .deb ..."
+    extract_deb "$TMP/proot.deb" "$TMP/pkg"
+    B="$TMP/pkg/data/data/com.termux/files/usr"
+    cp "$B/bin/proot"              "$TOOLS_DIR/proot-arm64"
+    cp "$B/libexec/proot/loader"   "$TOOLS_DIR/proot-loader"
+    chmod +x "$TOOLS_DIR/proot-arm64" "$TOOLS_DIR/proot-loader"
+    echo "✅ proot-arm64 + proot-loader 已就位"
+  fi
+  # proot 的运行时动态库依赖（缺任何一个 linker 都会 CANNOT LINK EXECUTABLE）
+  if [[ ! -f "$TOOLS_DIR/libtalloc.so.2" || ! -f "$TOOLS_DIR/libandroid-shmem.so" ]]; then
+    mkdir -p "$TMP"
+    if [[ ! -f "$TOOLS_DIR/libtalloc.so.2" ]]; then
+      echo "↓ 下载 Termux libtalloc: $LIBTALLOC_DEB_URL"
+      curl -fsSL --retry 3 -o "$TMP/talloc.deb" "$LIBTALLOC_DEB_URL"
+      extract_deb "$TMP/talloc.deb" "$TMP/talloc"
+      # .so.2.4.3 实体文件直接以 DT_NEEDED 名字分发（linker 按名字找，内容一致）
+      cp "$TMP/talloc/data/data/com.termux/files/usr/lib/libtalloc.so.2.4.3" \
+         "$TOOLS_DIR/libtalloc.so.2"
+    fi
+    if [[ ! -f "$TOOLS_DIR/libandroid-shmem.so" ]]; then
+      echo "↓ 下载 Termux libandroid-shmem: $LIBSHMEM_DEB_URL"
+      curl -fsSL --retry 3 -o "$TMP/shmem.deb" "$LIBSHMEM_DEB_URL"
+      extract_deb "$TMP/shmem.deb" "$TMP/shmem"
+      cp "$TMP/shmem/data/data/com.termux/files/usr/lib/libandroid-shmem.so" \
+         "$TOOLS_DIR/libandroid-shmem.so"
+    fi
+    chmod +x "$TOOLS_DIR/libtalloc.so.2" "$TOOLS_DIR/libandroid-shmem.so"
+    echo "✅ proot 动态库依赖已就位（libtalloc.so.2 / libandroid-shmem.so）"
+  fi
 }
 
 # 真机友好重打包（Bug 209）：
