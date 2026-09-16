@@ -467,6 +467,29 @@ Dart 系工具 `--version` 会自报编译目标（`simarm64` = 生成 arm64 代
 **验证**：真机重新初始化，应显示"安装完成：N 个文件，耗时 X 秒"。
 **教训**：**凡"服务器验证通过、真机才能暴露"的问题，都应把差异点（权限模型）前移到资产生成阶段消除**，而不是指望运行时环境宽容。rootfs 这类静态资产在打包阶段就能把所有需要特权系统调用的条目消灭掉。
 
+### Bug 210 · proot 动态库缺失：libtalloc.so.2 / libandroid-shmem.so（v0.1.0-alpha.3 抓到）
+
+**症状**：
+```
+CANNOT LINK EXECUTABLE "/data/app/~~.../dev.foa.flutter_on_android-.../lib/arm64/libproot.so": library "libtalloc.so.2" not found
+```
+终端执行任何命令（含 `echo hello`）均报此错，退出码 1。rootfs 已正常安装（说明上一 Bug 修复生效），卡在 proot 本体无法启动。
+
+**原因**：
+`readelf -d proot` 显示 Termux 构建的 proot 有三个 `DT_NEEDED`：`libc.so`（系统有）+ `libtalloc.so.2`（Samba 项目的内存池分配库）+ `libandroid-shmem.so`（Termux 的 Android System V 共享内存适配层）。后两个是 Termux 专有库，装在 `/data/data/com.termux/files/usr/lib/`，**其他应用的系统目录（/system/lib64、/vendor/lib64）里根本没有**——bionic linker 按默认路径找不到，直接拒绝启动。
+
+**解决**：
+1. **资产获取阶段**（`fetch_assets.sh`）：从 Termux apt 仓库拉两个 `.deb` 并解包：
+   - `libtalloc_2.4.3_aarch64.deb` → 提取 `libtalloc.so.2.4.3` 重命名为 `libtalloc.so.2`（linker 按 DT_NEEDED 名字查找，文件名必须一致）
+   - `libandroid-shmem_0.7_aarch64.deb` → 提取 `libandroid-shmem.so` 原名分发
+   - 两者放进 `assets/tools/` 随 APK 分发（46KB，体积可忽略）
+2. **运行时部署**（`MainActivity.ensureProotRuntime()`，幂等）：从 assets 拷贝到 `filesDir/tools/`。**关键：同步逻辑必须在每次 exec() 前跑，不能只在 installRootfs() 里做**——installRootfs 对已装用户提前返回 alreadyInstalled，升级用户的库永远补不上。
+3. **执行环境**（`exec()` 的 ProcessBuilder）：注入 `LD_LIBRARY_PATH=${filesDir}/tools`，linker 对 execve 主二进制的依赖查找同样读该变量 → 找到两个库。
+
+**验证**：真机终端 `echo hello` 输出 `hello`；`uname -a` 显示 `... aarch64 ... GNU/Linux`。
+
+**教训**：用第三方发行版（Termux）的二进制，`readelf -d` 查依赖是必做步骤——NDK 构建的"标准" bionic 程序只依赖 libc/libm/libdl/liblog，而 Termux 的包在自己前缀目录下链接了专有库，换宿主必缺。同类的还有 `libbsd`、`libiconv`（proot 5.2+ 可能新增）。
+
 ---
 
 ## 九、提交 Bug 记录模板
