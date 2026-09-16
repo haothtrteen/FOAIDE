@@ -1,8 +1,9 @@
-gradle-wrapper.jar
+# 注意：与 Flutter 3.47 默认模板不同，本项目【保留】gradlew 与 gradle-wrapper.jar。
+# 原则（SETUP_ANDROID.md）：android/ 壳一次生成完整入库，换机克隆即可构建，
+# 不依赖重新运行 setup_android.sh。gradle-wrapper.jar 为 Gradle 官方分发文件
+# （Apache-2.0，随 wrapper 机制本身分发），入库无许可证问题。
 /.gradle
 /captures/
-/gradlew
-/gradlew.bat
 /local.properties
 GeneratedPluginRegistrant.java
 .cxx/
