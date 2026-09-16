@@ -129,8 +129,12 @@ class _EditorPageState extends State<EditorPage> {
                 ),
             ],
           ),
-          // 竖屏：文件浏览器收纳为侧边栏 Drawer（AppBar 自动显示汉堡键）
-          drawer: landscape ? null : Drawer(child: _buildTreePanel()),
+          // 竖屏：文件浏览器收纳为侧边栏 Drawer（AppBar 自动显示汉堡键）。
+          // 注意：Drawer 是全高浮层（从屏幕顶端开始），内容必须 SafeArea
+          // 避让状态栏，否则顶部导航条与状态栏重叠（真机 Bug 213）。
+          drawer: landscape
+              ? null
+              : Drawer(child: SafeArea(child: _buildTreePanel())),
           body: landscape
               ? Row(
                   children: [
