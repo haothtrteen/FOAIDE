@@ -399,7 +399,59 @@ Dart 系工具 `--version` 会自报编译目标（`simarm64` = 生成 arm64 代
 
 ---
 
-## 八、提交 Bug 记录模板
+## 八、服务器首次构建 arm64 APK 实战记录（2026-09-16，Flutter 3.47.4 / AGP 9.1 / Gradle 9.3.1 / Kotlin 2.4）
+
+> 一次构建踩了 7 个坑，全部解决后产出 84.8MB arm64-v8a APK。按出场顺序记录，
+> 换机重建或手机端构建时大概率会再遇到其中一半（已标注"手机端也会遇到"）。
+
+### Bug 201 · Maven 大文件下载无限挂起（代理环境，手机端也会遇到）
+
+**症状**：构建卡在 tree-shaking 日志后 15+ 分钟无输出，CPU 负载 0；jstack 显示 Execution worker 阻塞在 Apache HttpClient 的 SSL read；daemon 与客户端失联后表现为永久挂起。
+**原因**：沙箱/代理环境对 `dl.google.com`、`maven.google.com` 的小请求正常，但 aapt2(~60MB)/r8 等大文件传输会无限期挂起（Gradle 无请求级超时）。**注意 `curl -I`(HEAD) 对这些源误报 404，`curl -r 0-0` 才是真相**（见工具 1）。
+**解决**：`GRADLE_USER_HOME/init.gradle` 用 aliyun 镜像重写全部仓库（google/central/pluginportal → `maven.aliyun.com`，实测 69ms）；同时 `FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn` 重定向引擎 maven 产物（download.flutter.io）。init.gradle 要点：`allprojects { afterEvaluate { ... } }` 里先 remove 原仓库再 append 镜像（Groovy `instanceof` 不能用变量，用 `getClass().getName()` 比较）。
+**验证**：modules-2 缓存出现 `com.android.tools.build/aapt2`，构建推进到编译阶段。
+
+### Bug 202 · Gradle daemon 被 OOM 击杀（手机端必遇，头号大坑）
+
+**症状**：`Gradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)`；或构建静默卡死后 daemon 日志出现 `Daemon vm is shutting down`。
+**原因**：Flutter 3.47 模板在 `android/gradle.properties` 默认 `org.gradle.jvmargs=-Xmx8G -XX:MaxMetaspaceSize=4G`——面向高配桌面机。内存受限环境（服务器沙箱 5.8GB / 手机 8-16GB 还要分一半给系统）下 cgroup OOM killer 直接杀 daemon。**优先级**：`GRADLE_USER_HOME/gradle.properties` 的 jvmargs **高于**项目内的（本次 daemon 实际按 3G 启动但仍不够：3G 堆+1G 元空间+Kotlin daemon 1G+dart 工具 > 5.8G 总量）。
+**解决**：daemon `1.5G 堆 + 512m 元空间`，`kotlin.daemon.jvmargs=-Xmx1024m`；改完必须 `pkill -f org.gradle.launcher.daemon` 让新参数生效（daemon 复用旧 opts）。手机端按设备 RAM 动态下调（见 02 号 init.gradle 注入）。
+**验证**：`free -h` 峰值占用 < 总量；构建不再消失。诊断手段：`dmesg | grep -i 'killed process'` 看 cgroup OOM 记录。
+
+### Bug 203 · Flutter 3.47 模板生成 build.gradle.kts 而非 build.gradle
+
+**症状**：`setup_android.sh` 报"未找到 build.gradle，跳过"，targetSdk 补丁没生效。
+**原因**：Flutter 3.47 起 `flutter create` 生成 Kotlin DSL（`build.gradle.kts`），旧脚本只认 Groovy DSL 文件名。
+**解决**：脚本改为按 `[build.gradle.kts, build.gradle]` 顺序探测（已修复入库）；两 DSL 的 targetSdk 行写法不同（`targetSdk = flutter.targetSdkVersion` vs `targetSdkVersion flutter.targetSdkVersion`），正则都要覆盖。
+
+### Bug 204 · lintVitalRelease 报 ExpiredTargetSdkVersion fatal
+
+**症状**：`Lint found fatal errors while assembling a release target`，指向 `Error: Google Play requires that apps target API level 33 or higher. [ExpiredTargetSdkVersion]`。
+**原因**：targetSdk 28 是本项目刻意策略（W^X，见 SETUP_ANDROID.md），但 AGP 的 release 构建 lint 不知道。
+**解决**：`android { lint { disable += "ExpiredTargetSdkVersion" } }`（setup_android.sh 已自动注入）。非 Play 分发，豁免合理。
+
+### Bug 205 · AGP 9 拒绝 Manifest 里的 extractNativeLibs
+
+**症状**：`packageRelease` 失败：`android:extractNativeLibs is set to "true" ... instead set android.packagingOptions.jniLibs.useLegacyPackaging to true`。
+**原因**：AGP 9.1 起强制该配置走 Gradle DSL，禁用 Manifest 属性。
+**解决**：Manifest 删属性，`android { packaging { jniLibs { useLegacyPackaging = true } } }`（语义相同：so 解压成磁盘真实文件，proot 才能从 nativeLibraryDir 执行）。模板与 setup 脚本已同步。
+
+### Bug 206 · Kotlin 2.4：ExecutorService.submit 的 lambda 类型歧义
+
+**症状**：`Initializer type mismatch: expected 'Future<String>', actual 'Future<*>!'`。
+**原因**：`pool.submit { ... }` 的 lambda 在 `Callable`/`Runnable` 重载间无法推断（新版 Kotlin 推断更严格）。
+**解决**：显式 `pool.submit(Callable { ... })`，import `java.util.concurrent.Callable`。**同步修复了模板 `platform/android/MainActivity.kt`**——只修生成目录会让 bug 在下次重生成时复活。
+
+### Bug 207 · 相对 import 路径错误逃过提交（流程教训）
+
+**症状**：`flutter analyze` 报 `The getter 'AppLogger' isn't defined`，但 import 语句明明存在。
+**原因**：`lib/env/env_installer.dart` 写了 `import 'core/logger.dart'`（相对当前目录解析为 `lib/env/core/`），正确应为 `'../core/logger.dart'`。Step 1 提交时只跑了 devbox 集成测试（shell 侧），没跑 Dart 编译，错误直到首次 `flutter build` 才暴露。
+**解决**：修 import；`test/widget_test.dart` 模板残留的 `MyApp` 引用换成 `FoaApp` 冒烟测试。
+**流程改进**：**提交前必跑 `flutter analyze`（7 秒），构建前必跑 `./tools/check_env.sh`**。已列入 README 核心原则。
+
+---
+
+## 九、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
 
