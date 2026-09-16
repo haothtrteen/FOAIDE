@@ -7,7 +7,9 @@ import 'fs_bridge.dart';
 
 /// Step 2 · 文件树 + 代码编辑器。
 ///
-/// 布局：横屏左右分栏（树 280px + 编辑器）；竖屏底部导航切换。
+/// 布局：文件浏览器以侧边栏形式嵌入编辑器——
+/// 横屏常驻左栏（280px），竖屏收纳为 Drawer（AppBar 汉堡键展开），
+/// 编辑区始终为主区域。
 /// 编辑器单文件模式：切换文件前若有未保存修改会弹确认。
 class EditorPage extends StatefulWidget {
   final FsBridge bridge;
@@ -23,7 +25,6 @@ class _EditorPageState extends State<EditorPage> {
   String? _currentPath; // 当前打开文件（容器内路径）
   String _content = '';
   bool _dirty = false;
-  int _tab = 0; // 竖屏 tab：0=文件树 1=编辑器
 
   // ---------------- 文件操作 ----------------
 
@@ -41,8 +42,12 @@ class _EditorPageState extends State<EditorPage> {
       _currentPath = path;
       _content = r.content;
       _dirty = false;
-      _tab = 1; // 竖屏下自动切到编辑器
     });
+    // 若从 Drawer（竖屏侧边栏）打开文件，收起抽屉让编辑器全屏可见
+    final scaffold = Scaffold.maybeOf(context);
+    if (scaffold != null && scaffold.isDrawerOpen) {
+      Navigator.of(context).pop();
+    }
   }
 
   Future<bool> _confirmSaveIfDirty() async {
@@ -323,63 +328,40 @@ class _EditorPageState extends State<EditorPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          _currentPath == null ? '项目文件' : _currentPath!,
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          if (_currentPath != null)
-            IconButton(
-              tooltip: _dirty ? '保存（有未保存修改）' : '保存',
-              onPressed: _save,
-              icon: Icon(
-                Icons.save_outlined,
-                color: _dirty ? const Color(0xFF3DDC84) : null,
-              ),
+    return OrientationBuilder(
+      builder: (context, orientation) {
+        final landscape = orientation == Orientation.landscape;
+        return Scaffold(
+          appBar: AppBar(
+            title: Text(
+              _currentPath == null ? '项目文件' : _currentPath!,
+              overflow: TextOverflow.ellipsis,
             ),
-        ],
-      ),
-      body: OrientationBuilder(
-        builder: (context, orientation) {
-          final landscape = orientation == Orientation.landscape;
-          if (landscape) {
-            return Row(
-              children: [
-                SizedBox(width: 280, child: _buildTreePanel()),
-                const VerticalDivider(width: 1),
-                Expanded(child: _buildEditorPanel()),
-              ],
-            );
-          }
-          return Column(
-            children: [
-              Expanded(
-                child: IndexedStack(
-                  index: _tab,
-                  children: [_buildTreePanel(), _buildEditorPanel()],
+            actions: [
+              if (_currentPath != null)
+                IconButton(
+                  tooltip: _dirty ? '保存（有未保存修改）' : '保存',
+                  onPressed: _save,
+                  icon: Icon(
+                    Icons.save_outlined,
+                    color: _dirty ? const Color(0xFF3DDC84) : null,
+                  ),
                 ),
-              ),
-              NavigationBar(
-                selectedIndex: _tab,
-                onDestinationSelected: (i) => setState(() => _tab = i),
-                destinations: const [
-                  NavigationDestination(
-                    icon: Icon(Icons.folder_outlined),
-                    selectedIcon: Icon(Icons.folder),
-                    label: '文件',
-                  ),
-                  NavigationDestination(
-                    icon: Icon(Icons.code),
-                    label: '编辑',
-                  ),
-                ],
-              ),
             ],
-          );
-        },
-      ),
+          ),
+          // 竖屏：文件浏览器收纳为侧边栏 Drawer（AppBar 自动显示汉堡键）
+          drawer: landscape ? null : Drawer(child: _buildTreePanel()),
+          body: landscape
+              ? Row(
+                  children: [
+                    SizedBox(width: 280, child: _buildTreePanel()),
+                    const VerticalDivider(width: 1),
+                    Expanded(child: _buildEditorPanel()),
+                  ],
+                )
+              : _buildEditorPanel(),
+        );
+      },
     );
   }
 
@@ -410,12 +392,12 @@ class _EditorPageState extends State<EditorPage> {
             Icon(Icons.code, size: 56, color: Colors.grey.shade700),
             const SizedBox(height: 12),
             Text(
-              '从左侧选择文件开始编辑',
+              '从侧边栏选择文件开始编辑',
               style: TextStyle(color: Colors.grey.shade500),
             ),
             if (MediaQuery.of(context).orientation == Orientation.portrait)
               Text(
-                '（文件页 → 编辑页）',
+                '（点左上角 ☰ 打开文件浏览）',
                 style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
               ),
           ],

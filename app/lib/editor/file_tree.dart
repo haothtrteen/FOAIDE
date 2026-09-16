@@ -176,9 +176,21 @@ class FileTreeState extends State<FileTree> {
     return ListView(
       children: [
         _buildHeader(),
-        for (final node in _roots) _buildNode(node, 0),
+        for (final node in _roots) ..._buildSubtree(node, 0),
       ],
     );
+  }
+
+  /// 递归渲染节点 + 展开的子节点（Bug：曾只渲染节点本身，
+  /// node.children 从未输出，导致点击文件夹无内容显示）。
+  List<Widget> _buildSubtree(_Node node, int depth) {
+    final widgets = <Widget>[_buildNode(node, depth)];
+    if (node.entry.isDir && node.expanded && node.children != null) {
+      for (final child in node.children!) {
+        widgets.addAll(_buildSubtree(child, depth + 1));
+      }
+    }
+    return widgets;
   }
 
   Widget _buildHeader() {
