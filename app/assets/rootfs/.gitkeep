@@ -1,0 +1,1 @@
+# 此目录存放 rootfs tarball（不进 git），运行 tools/fetch_assets.sh 下载

@@ -1,0 +1,51 @@
+# ============================================================
+# Flutter / Dart
+# ============================================================
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+*.dart_tool
+flutter_*.png
+
+# ============================================================
+# Android / Gradle
+# ============================================================
+android/.gradle/
+android/local.properties
+android/key.properties
+*.iml
+*.ipr
+*.iws
+.idea/
+*.keystore
+!debug.keystore
+
+# ============================================================
+# 资产二进制：不进 git，用 tools/fetch_assets.sh 下载
+# proot（GPL-2.0，源码链接见 THIRD-PARTY-NOTICES）
+# rootfs tarball（体积大）
+# ============================================================
+assets/tools/proot*
+assets/rootfs/*.tar.*
+assets/rootfs/*.tgz
+!assets/tools/.gitkeep
+!assets/rootfs/.gitkeep
+
+# ============================================================
+# IDE / 系统
+# ============================================================
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+*.swp
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# 测试 / 日志
+# ============================================================
+*.log
+coverage/
+test_reports/
