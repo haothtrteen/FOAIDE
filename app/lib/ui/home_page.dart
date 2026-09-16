@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../env/env_installer.dart';
+import '../editor/editor_page.dart';
 import 'terminal_page.dart';
 
 /// Step 1 主页：环境状态 + 初始化引导。
@@ -160,18 +161,32 @@ class _ActionCard extends StatelessWidget {
             ] else ...[
               const Text('环境就绪', style: TextStyle(fontWeight: FontWeight.bold)),
               const SizedBox(height: 4),
-              const Text('进入终端执行测试命令：echo hello / uname -a / apt --version。'),
+              const Text('进入终端执行测试命令，或打开编辑器浏览/编辑项目文件。'),
               const SizedBox(height: 12),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute(
-                        builder: (_) => const TerminalPage()),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                            builder: (_) => const TerminalPage()),
+                      ),
+                      icon: const Icon(Icons.terminal),
+                      label: const Text('打开终端'),
+                    ),
                   ),
-                  icon: const Icon(Icons.terminal),
-                  label: const Text('打开终端'),
-                ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                            builder: (_) => EditorPage()),
+                      ),
+                      icon: const Icon(Icons.code),
+                      label: const Text('打开编辑器'),
+                    ),
+                  ),
+                ],
               ),
             ],
             if (env.installLog.isNotEmpty) ...[

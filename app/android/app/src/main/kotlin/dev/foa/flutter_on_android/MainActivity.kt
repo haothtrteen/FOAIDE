@@ -30,6 +30,9 @@ class MainActivity : FlutterActivity() {
     companion object {
         const val CHANNEL = "dev.foa/proot"
         const val ROOTFS_REL = "rootfs/debian"
+        // Step 2：项目代码区（容器内 /root/projects ↔ 真实 filesDir/rootfs/debian/root/projects）。
+        // 所有文件操作只允许此区域，防止误改 rootfs 系统文件。
+        const val PROJECTS_REL = "rootfs/debian/root/projects"
         // 注意：原生 AssetManager 的路径相对 APK 的 assets/ 根，
         // 而 Flutter 打包的资产全部位于 flutter_assets/ 子目录下，
         // 因此必须带 flutter_assets/ 前缀（Bug 208：曾漏前缀导致真机
@@ -60,6 +63,33 @@ class MainActivity : FlutterActivity() {
                             result.success(exec(command, timeoutSec))
                         }
                         "installRootfs" -> result.success(installRootfs())
+                        // ---- Step 2 文件操作（全部限定在 /root/projects 内）----
+                        "fileList" -> {
+                            val path = call.argument<String>("path") ?: "/root/projects"
+                            result.success(fileList(path))
+                        }
+                        "fileRead" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(fileRead(path))
+                        }
+                        "fileWrite" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            val content = call.argument<String>("content") ?: ""
+                            result.success(fileWrite(path, content))
+                        }
+                        "fileMkdir" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(fileMkdir(path))
+                        }
+                        "fileRename" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            val newName = call.argument<String>("newName") ?: ""
+                            result.success(fileRename(path, newName))
+                        }
+                        "fileDelete" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(fileDelete(path))
+                        }
                         else -> result.notImplemented()
                     }
                 } catch (e: Exception) {
@@ -301,5 +331,96 @@ class MainActivity : FlutterActivity() {
             "files" to rootfs.walkBottomUp().count(),
             "prootCopiedFromAssets" to prootCopied,
         )
+    }
+
+    // ---------------- Step 2 · 文件操作（限定 /root/projects）----------------
+
+    private fun projectsRoot(): File = File(filesDir, PROJECTS_REL).apply { mkdirs() }
+
+    /**
+     * 容器内路径（/root/projects/...）→ 真实路径（filesDir/rootfs/debian/root/projects/...）。
+     * 严格白名单：
+     * - 必须以 /root/projects 开头（Step 2 只允许编辑项目区，防误改 rootfs 系统文件）；
+     * - canonicalize 后必须仍在 projects 根内（防 `..` 逃逸）。
+     * 非法路径返回 null，调用方以"ok=false + error"返回。
+     */
+    private fun resolveGuestPath(guest: String): File? {
+        if (!guest.startsWith("/root/projects")) return null
+        val rel = guest.removePrefix("/root/projects").removePrefix("/")
+        val root = projectsRoot().canonicalFile
+        val target = File(root, rel).canonicalFile
+        val inRoot = target == root || target.path.startsWith(root.path + File.separator)
+        return if (inRoot) target else null
+    }
+
+    private fun fileFail(msg: String): Map<String, Any> =
+        mapOf("ok" to false, "error" to msg)
+
+    private fun fileList(guest: String): Map<String, Any> {
+        val dir = resolveGuestPath(guest) ?: return fileFail("非法路径（仅允许 /root/projects 内）: $guest")
+        if (!dir.isDirectory) return fileFail("不是目录: $guest")
+        val entries = dir.listFiles()?.sortedBy { it.name }?.map { f ->
+            mapOf(
+                "name" to f.name,
+                "isDir" to f.isDirectory,
+                // 符号链接视为文件（不跟随，防循环）；体积用于排序/展示
+                "size" to (if (f.isFile) f.length() else 0L),
+                "mtime" to f.lastModified(),
+            )
+        } ?: emptyList()
+        return mapOf("ok" to true, "path" to guest, "entries" to entries)
+    }
+
+    private fun fileRead(guest: String): Map<String, Any> {
+        val f = resolveGuestPath(guest) ?: return fileFail("非法路径（仅允许 /root/projects 内）: $guest")
+        if (!f.isFile) return fileFail("不是文件: $guest")
+        // 代码文件 MVP 上限 2MB（500 行 Dart 远小于此）；超出提示而非 OOM
+        if (f.length() > 2L * 1024 * 1024) return fileFail("文件过大（>2MB），暂不支持打开: $guest")
+        return try {
+            val content = f.readText()
+            mapOf("ok" to true, "content" to content, "size" to content.length)
+        } catch (e: Exception) {
+            fileFail("读取失败: ${e.message}")
+        }
+    }
+
+    private fun fileWrite(guest: String, content: String): Map<String, Any> {
+        val f = resolveGuestPath(guest) ?: return fileFail("非法路径（仅允许 /root/projects 内）: $guest")
+        // 防御：rootfs 解压后部分文件 owner=root，app 非 owner 写不进去；
+        // setWritable 对 owner 生效，owner 是本应用时可自愈（失败会抛异常返回）
+        if (f.exists() && !f.canWrite()) f.setWritable(true, false)
+        return try {
+            f.parentFile?.mkdirs()
+            f.writeText(content)
+            mapOf("ok" to true, "size" to content.length)
+        } catch (e: Exception) {
+            fileFail("写入失败: ${e.message}")
+        }
+    }
+
+    private fun fileMkdir(guest: String): Map<String, Any> {
+        val f = resolveGuestPath(guest) ?: return fileFail("非法路径（仅允许 /root/projects 内）: $guest")
+        return if (f.exists()) fileFail("已存在: $guest")
+        else if (f.mkdirs()) mapOf("ok" to true)
+        else fileFail("创建目录失败: $guest")
+    }
+
+    private fun fileRename(guest: String, newName: String): Map<String, Any> {
+        if (newName.isBlank() || newName.contains('/') || newName == "." || newName == "..") {
+            return fileFail("非法文件名: $newName")
+        }
+        val f = resolveGuestPath(guest) ?: return fileFail("非法路径（仅允许 /root/projects 内）: $guest")
+        if (!f.exists()) return fileFail("不存在: $guest")
+        val dest = File(f.parentFile, newName)
+        if (dest.exists()) return fileFail("目标已存在: $newName")
+        return if (f.renameTo(dest)) mapOf("ok" to true)
+        else fileFail("重命名失败: $guest → $newName")
+    }
+
+    private fun fileDelete(guest: String): Map<String, Any> {
+        val f = resolveGuestPath(guest) ?: return fileFail("非法路径（仅允许 /root/projects 内）: $guest")
+        if (!f.exists()) return fileFail("不存在: $guest")
+        return if (f.deleteRecursively()) mapOf("ok" to true)
+        else fileFail("删除失败: $guest")
     }
 }
