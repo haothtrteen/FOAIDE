@@ -179,6 +179,12 @@ class MainActivity : FlutterActivity() {
             // Android 系统目录没有这两个库 → 注入 LD_LIBRARY_PATH 让 linker
             // 到 filesDir/tools 找（对主二进制的依赖查找同样生效）。
             pb.environment()["LD_LIBRARY_PATH"] = File(filesDir, "tools").absolutePath
+            // Bug 211：Termux 版 proot 编译时把临时目录硬编码为
+            // /data/data/com.termux/files/usr/tmp/，其他应用无写权限 →
+            // proot error: can't create glue rootfs。PROOT_TMP_DIR 重定向到
+            // 本应用私有可写目录（proot 官方推荐做法，日志也这么提示）。
+            val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
+            pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
             val proc = pb.start()
             // 双线程读流，防止管道缓冲区满导致死锁
             // 注意：submit 的 lambda 在 Callable/Runnable 重载间有歧义（Kotlin 2.4 报
