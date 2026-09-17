@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../env/env_installer.dart';
 import '../editor/editor_page.dart';
+import '../toolchain/toolchain_page.dart';
 import 'terminal_page.dart';
 
 /// Step 1 主页：环境状态 + 初始化引导。
@@ -184,6 +185,17 @@ class _ActionCard extends StatelessWidget {
                       ),
                       icon: const Icon(Icons.code),
                       label: const Text('打开编辑器'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                            builder: (_) => const ToolchainPage()),
+                      ),
+                      icon: const Icon(Icons.build),
+                      label: const Text('工具链'),
                     ),
                   ),
                 ],

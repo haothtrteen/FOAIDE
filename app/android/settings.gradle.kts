@@ -11,6 +11,11 @@ pluginManagement {
     includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
 
     repositories {
+        // FOA 国内镜像优先（阿里云 google/central/gradle-plugin 代理），
+        // 官方仓库兜底。构建机需配 ~/.gradle/gradle.properties 的 JVM 代理。
+        maven { url = uri("https://maven.aliyun.com/repository/google") }
+        maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+        maven { url = uri("https://maven.aliyun.com/repository/central") }
         google()
         mavenCentral()
         gradlePluginPortal()
