@@ -52,6 +52,12 @@ class MainActivity : FlutterActivity() {
         const val ASSET_LIBTALLOC = "flutter_assets/assets/tools/libtalloc.so.2"
         const val ASSET_LIBSHMEM = "flutter_assets/assets/tools/libandroid-shmem.so"
         const val LIB_PROOT = "libproot.so" // jniLibs 分发名
+        // Step 5 项目工作区迁移：外部存储下用户可见的项目目录名
+        // （/storage/emulated/0/Android/data/<pkg>/projects，文件管理器/USB 可见）；
+        // 构建位置仍是容器 /root/projects（= filesDir，可执行，W^X 安全）。
+        const val PROJECTS_EXTERNAL_NAME = "projects"
+        // toExternal 方向跳过这些构建缓存目录，避免污染用户可见区
+        val PROJECT_CACHE_DIRS = setOf("build", ".gradle", ".dart_tool")
     }
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -206,6 +212,11 @@ class MainActivity : FlutterActivity() {
                                     call.argument<String>("dst") ?: "",
                                 ),
                             )
+                        }
+                        // ---- Step 5 项目工作区同步（外部存储 ↔ 容器 /root/projects）----
+                        "syncProjects" -> {
+                            val direction = call.argument<String>("direction") ?: "toContainer"
+                            result.success(syncProjects(direction))
                         }
                         "pickImportFile" -> {
                             pendingImportResult = result
@@ -873,6 +884,71 @@ class MainActivity : FlutterActivity() {
             if (!src.deleteRecursively()) fileFail("已复制但源删除失败: ${src.path}") else mapOf("ok" to true)
         } catch (e: Exception) {
             fileFail("移动失败: ${e.message}")
+        }
+    }
+
+    // ---------------- Step 5 · 项目工作区迁移（外部存储 ↔ 容器）----------------
+
+    /** 外部存储项目工作区：Android/data/<pkg>/projects（用户可见可改；无外部存储时为 null）。 */
+    private fun externalProjectsDir(): File? {
+        val ext = externalDataDir() ?: return null
+        return File(ext, PROJECTS_EXTERNAL_NAME)
+    }
+
+    /**
+     * 项目目录双向同步。
+     *
+     * 背景（W^X / SELinux / FUSE，详见 foa-build-verify §十三）：
+     * - 构建必须在容器内 /root/projects（= filesDir，targetSdk 28 下可执行）进行；
+     * - 用户编辑在外部工作区（/sdcard/Android/data/<pkg>/projects，文件管理器/USB 可见）；
+     * - 本方法负责两处互拷：编辑后 toContainer 同步进容器再构建；
+     *   toExternal 把容器项目导出到用户可见区（首次迁移 / 备份）。
+     *
+     * direction: "toContainer"（外部 → 容器）| "toExternal"（容器 → 外部）
+     * 策略：全量拷贝 + 覆盖同名，不删除目标多余文件（防误删用户数据）；
+     * toExternal 跳过 build/.gradle/.dart_tool 缓存目录（walk 遇子树整体跳过）。
+     */
+    private fun syncProjects(direction: String): Map<String, Any> {
+        val ext = externalProjectsDir() ?: return fileFail("当前设备无外部存储，无法使用项目工作区")
+        val container = projectsRoot()
+        val (src, dst) = if (direction == "toExternal") container to ext else ext to container
+        if (!src.exists() || !src.isDirectory) {
+            return fileFail(
+                if (direction == "toExternal") "容器项目区为空（$PROJECTS_REL），没有可导出的项目。"
+                else "外部工作区为空。\n请先把项目文件放到\n${ext.path}\n（文件管理器/USB 可见），再点「外部 → 容器」。",
+            )
+        }
+        try {
+            dst.mkdirs()
+            var files = 0
+            var bytes = 0L
+            var skipped = 0
+            src.walkTopDown().forEach { f ->
+                if (f.isDirectory) return@forEach
+                val rel = f.relativeTo(src).path
+                val parts = rel.split(File.separatorChar)
+                // toExternal：跳过构建缓存目录（保留源文件，防污染用户可见区）
+                if (direction == "toExternal" && parts.any { it in PROJECT_CACHE_DIRS }) {
+                    skipped++
+                    return@forEach
+                }
+                val out = File(dst, rel)
+                out.parentFile?.mkdirs()
+                // rootfs 解压文件 owner=root 可能只读；FUSE 文件也可能缺写位 → 幂等补写
+                if (out.exists() && !out.canWrite()) out.setWritable(true, false)
+                f.copyTo(out, overwrite = true)
+                files++
+                bytes += f.length()
+            }
+            return mapOf(
+                "ok" to true,
+                "direction" to direction,
+                "files" to files,
+                "bytes" to bytes,
+                "skipped" to skipped,
+            )
+        } catch (e: Exception) {
+            return fileFail("同步失败: ${e.message}")
         }
     }
 

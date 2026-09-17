@@ -51,12 +51,25 @@ class FsBrowseResult {
 class FsOpResult {
   final bool ok;
   final String? error;
+  /// 同步统计（syncProjects 填充）：拷贝文件数 / 字节数 / 跳过缓存文件数。
+  final int files;
+  final int bytes;
+  final int skipped;
 
-  const FsOpResult({required this.ok, this.error});
+  const FsOpResult({
+    required this.ok,
+    this.error,
+    this.files = 0,
+    this.bytes = 0,
+    this.skipped = 0,
+  });
 
   factory FsOpResult.fromMap(Map<Object?, Object?> m) => FsOpResult(
         ok: m['ok'] == true,
         error: m['error'] as String?,
+        files: (m['files'] as num?)?.toInt() ?? 0,
+        bytes: (m['bytes'] as num?)?.toInt() ?? 0,
+        skipped: (m['skipped'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -181,6 +194,19 @@ class FileBrowserBridge {
     final raw = await _channel.invokeMethod(
       'hostMove',
       {'src': srcReal, 'dst': dstReal},
+    );
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  // ---------------- Step 5 · 项目工作区同步 ----------------
+
+  /// 项目目录双向同步（外部存储工作区 ↔ 容器 /root/projects）。
+  /// direction: "toContainer"（外部 → 容器，编辑后构建前同步）|
+  ///            "toExternal"（容器 → 外部，首次迁移 / 备份到用户可见区）。
+  Future<FsOpResult> syncProjects(String direction) async {
+    final raw = await _channel.invokeMethod(
+      'syncProjects',
+      {'direction': direction},
     );
     return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }

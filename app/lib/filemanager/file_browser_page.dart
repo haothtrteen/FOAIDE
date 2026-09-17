@@ -10,7 +10,14 @@ import 'fs_browser_bridge.dart';
 /// - 容器域（container）：rootfs 视角（/ 开头 = filesDir/rootfs/debian/...），
 ///   项目区 /root/projects、SDK /opt、导入区 /root/imports 都在其中；解压仅此域；
 /// - 宿主域（host）：真实文件系统（filesDir / Android/data/<pkg>），原生白名单校验；
-/// - 虚拟根（virtual）：根目录再返回上一级到达，展示三个"虚假链接目录"入口。
+/// - 虚拟根（virtual）：根目录再返回上一级到达，展示各区域入口 + 项目工作区同步。
+///
+/// Step 5 项目工作区（W^X 限制，见 foa-build-verify §十三）：
+/// - 构建位置 = 容器 /root/projects（= filesDir，可执行）；
+/// - 用户编辑位置 = 外部存储 Android/data/<pkg>/projects（文件管理器/USB 可见）；
+/// - 虚拟根提供双向同步：编辑后「外部 → 容器」再构建；「容器 → 外部」迁移/备份。
+///
+/// 返回键语义：子目录内系统返回键 → 返回上一级目录；左上角箭头 → 退出浏览器。
 ///
 /// 能力：浏览（面包屑/返回上级/刷新）、解压（zip/tar*，容器 exec）、导出（SAF）、
 /// 导入（SAF → 容器 /root/imports）、新建/重命名/删除、复制/移动/粘贴（文件与目录
@@ -53,6 +60,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     rootfsInstalled: false,
   );
   _Clip? _clip; // 复制/移动剪贴板
+  bool _syncing = false; // 项目工作区同步中（禁用按钮 + 进度框）
 
   bool get _isVirtual => _dir == _virtualRoot;
 
@@ -105,6 +113,11 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
         _env.filesDir,
         if (_env.externalDataDir != null) _env.externalDataDir!,
       ].where((p) => p.isNotEmpty).toList();
+
+  /// 外部存储项目工作区：Android/data/<pkg>/projects（用户可见；无外部存储为 null）。
+  String? get _externalProjects => _env.externalDataDir == null
+      ? null
+      : '${_env.externalDataDir}/projects';
 
   void _goUp() {
     if (_isVirtual) return;
@@ -259,6 +272,36 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       _domain = _Domain.container;
       _dir = '/root/imports';
     });
+    _load();
+  }
+
+  // ---------------- Step 5 · 项目工作区同步 ----------------
+
+  /// 双向同步：toContainer = 外部工作区 → 容器 /root/projects（编辑后构建前）；
+  /// toExternal = 容器 → 外部工作区（首次迁移 / 备份到用户可见区）。
+  Future<void> _syncProjects(String direction) async {
+    final isToContainer = direction == 'toContainer';
+    setState(() => _syncing = true);
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _ProgressDialog(
+        message: isToContainer ? '正在同步到容器…' : '正在导出到外部存储…',
+      ),
+    );
+    final r = await _bridge.syncProjects(direction);
+    if (!mounted) return;
+    Navigator.of(context, rootNavigator: true).pop(); // 关闭进度框
+    setState(() => _syncing = false);
+    if (!r.ok) {
+      _toast(r.error ?? '同步失败');
+      return;
+    }
+    final skipNote = r.skipped > 0 ? '（跳过构建缓存 ${r.skipped} 个）' : '';
+    _toast(
+      '${isToContainer ? '已同步到容器' : '已导出到外部'}：${r.files} 个文件'
+      ' ${_fmtSize(r.bytes)}$skipNote',
+    );
     _load();
   }
 
@@ -576,53 +619,67 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('文件浏览器'),
-        actions: [
-          if (_clip != null)
+    return PopScope<Object?>(
+      // 子目录内：系统返回键 → 返回上一级目录；虚拟根（_canGoUp=false）→ 正常退出。
+      // 左上角箭头为显式退出（Navigator.pop 绕过 PopScope，见 SDK navigator.dart）。
+      canPop: !_canGoUp,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _goUp();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            tooltip: '退出文件浏览器',
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+          title: const Text('文件浏览器'),
+          actions: [
+            if (_clip != null)
+              IconButton(
+                tooltip: _clip!.isCut ? '粘贴（移动）' : '粘贴（复制）',
+                icon: const Icon(Icons.content_paste_go),
+                onPressed: _isVirtual || _loading ? null : _paste,
+              ),
+            if (_clip != null)
+              IconButton(
+                tooltip: '取消剪贴板',
+                icon: const Icon(Icons.close),
+                onPressed: _clearClip,
+              ),
             IconButton(
-              tooltip: _clip!.isCut ? '粘贴（移动）' : '粘贴（复制）',
-              icon: const Icon(Icons.content_paste_go),
-              onPressed: _isVirtual || _loading ? null : _paste,
+              tooltip: '导入文件（到容器 /root/imports）',
+              icon: const Icon(Icons.file_download_outlined),
+              onPressed: _loading ? null : _import,
             ),
-          if (_clip != null)
             IconButton(
-              tooltip: '取消剪贴板',
-              icon: const Icon(Icons.close),
-              onPressed: _clearClip,
+              tooltip: '新建文件夹',
+              icon: const Icon(Icons.create_new_folder_outlined),
+              onPressed: _isVirtual || _loading ? null : _createDir,
             ),
-          IconButton(
-            tooltip: '导入文件（到容器 /root/imports）',
-            icon: const Icon(Icons.file_download_outlined),
-            onPressed: _loading ? null : _import,
-          ),
-          IconButton(
-            tooltip: '新建文件夹',
-            icon: const Icon(Icons.create_new_folder_outlined),
-            onPressed: _isVirtual || _loading ? null : _createDir,
-          ),
-          IconButton(
-            tooltip: '刷新',
-            icon: const Icon(Icons.refresh),
-            onPressed: _loading ? null : _load,
-          ),
-        ],
-      ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            _buildPathBar(),
-            const Divider(height: 1),
-            Expanded(child: _isVirtual ? _buildVirtualRoot() : _buildList()),
+            IconButton(
+              tooltip: '刷新',
+              icon: const Icon(Icons.refresh),
+              onPressed: _loading ? null : _load,
+            ),
           ],
+        ),
+        body: SafeArea(
+          child: Column(
+            children: [
+              _buildPathBar(),
+              const Divider(height: 1),
+              Expanded(child: _isVirtual ? _buildVirtualRoot() : _buildList()),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  /// 虚拟根：根目录再返回上一级后显示的"虚假链接目录"入口页。
+  /// 虚拟根：根目录再返回上一级后显示的入口页（各数据区域 + 项目工作区同步）。
   Widget _buildVirtualRoot() {
+    final extProjects = _externalProjects;
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: 8),
       children: [
@@ -640,6 +697,25 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
           onTap: () =>
               _jumpTo(domain: _Domain.container, path: '/'),
         ),
+        _VirtualEntryTile(
+          icon: Icons.code_outlined,
+          title: '项目目录',
+          subtitle: '一键跳转容器内 /root/projects（编辑器工作区 / 构建位置）',
+          onTap: () =>
+              _jumpTo(domain: _Domain.container, path: '/root/projects'),
+        ),
+        if (extProjects != null)
+          _VirtualEntryTile(
+            icon: Icons.folder_shared_outlined,
+            title: '项目工作区（外部存储）',
+            subtitle: '$_envDirLabel(extProjects)（文件管理器/USB 可见，可编辑）',
+            onTap: () async {
+              // 首次进入自动创建外部工作区（mkdirs 幂等；已存在时原生返回「已存在」，忽略）
+              await _bridge.hostMkdir(extProjects);
+              if (!mounted) return;
+              _jumpTo(domain: _Domain.host, path: extProjects);
+            },
+          ),
         _VirtualEntryTile(
           icon: Icons.storage_outlined,
           title: 'app 自身 /data 目录',
@@ -661,6 +737,52 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                     path: _env.externalDataDir!,
                   ),
         ),
+        if (extProjects != null) ...[
+          const SizedBox(height: 12),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+            child: Text(
+              '项目工作区同步（W^X 限制：构建必须在容器内执行）',
+              style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.upload_file_outlined, size: 16),
+                    label: const Text('外部 → 容器（构建前）',
+                        style: TextStyle(fontSize: 12)),
+                    onPressed: _syncing
+                        ? null
+                        : () => _syncProjects('toContainer'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.download_outlined, size: 16),
+                    label: const Text('容器 → 外部（备份）',
+                        style: TextStyle(fontSize: 12)),
+                    onPressed: _syncing
+                        ? null
+                        : () => _syncProjects('toExternal'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Text(
+              '在外部工作区（文件管理器/USB 可见）编辑代码后，点「外部 → 容器」同步进容器再构建；'
+              '已有项目点「容器 → 外部」迁移到用户可见区。',
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -670,21 +792,24 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     if (real == f) return '/data/user/0/<pkg>';
     final e = _env.externalDataDir;
     if (e != null && real == e) return '/storage/emulated/0/Android/data/<pkg>';
+    if (e != null && real == '$e/projects') {
+      return '/storage/emulated/0/Android/data/<pkg>/projects';
+    }
     return real;
   }
 
   Widget _buildPathBar() {
     if (_isVirtual) {
-      return Padding(
-        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      return const Padding(
+        padding: EdgeInsets.fromLTRB(12, 10, 12, 10),
         child: Row(
           children: [
             IconButton(
               tooltip: '返回上一级',
               onPressed: null,
-              icon: const Icon(Icons.arrow_upward, size: 18),
+              icon: Icon(Icons.arrow_upward, size: 18),
             ),
-            const Text(
+            Text(
               '虚拟根',
               style: TextStyle(fontSize: 13, color: Color(0xFF3DDC84)),
             ),
