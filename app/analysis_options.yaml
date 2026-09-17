@@ -13,6 +13,10 @@ analyzer:
   exclude:
     - build/**
     - android/**
+    # vendored 包的示例工程（Bug 216 时引入 third_party/）：引用未解析的
+    # package:example / font_awesome_flutter，不在编译依赖图内；
+    # lib/ 本体保留分析（仅 info 级弃用告警）。
+    - third_party/code_text_field/example/**
 
 linter:
   # The lint rules applied to this project can be customized in the

@@ -3,12 +3,19 @@ import 'package:flutter/material.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import 'jdk_installer.dart';
+import 'local_install_picker.dart';
 import 'sdk_downloader.dart';
+import 'sdk_installer.dart';
 
-/// Step 3 工具链页：JDK 17 安装 / 卸载 / 验证。
+/// Step 3 工具链页：JDK 17 / Android SDK / Flutter SDK(arm64) / 构建镜像配置。
 ///
-/// 状态机：idle → probing → downloading(进度) → extracting → validating
-///       → installed；任意阶段失败 → error（可重试）。
+/// 状态机（各卡片独立）：
+/// - JDK：idle → probing → downloading(进度) → extracting → validating
+///   → installed；任意阶段失败 → error（可重试）；网络全挂可走本地导入。
+/// - Android SDK / Flutter SDK：idle → apt → probing → downloading(进度)
+///   → extracting → validating → installed；失败 → error（分片续传保留）。
+/// - 构建镜像配置：idle → env → init-gradle → wrapper → probing
+///   → downloading(Gradle 224MB 预下载) → installed；失败 → error。
 class ToolchainPage extends StatefulWidget {
   const ToolchainPage({super.key});
 
@@ -20,6 +27,7 @@ enum JdkPhase {
   idle,
   probing,
   downloading,
+  importing, // 本地文件导入 + 校验
   extracting,
   validating,
   installed,
@@ -27,38 +35,137 @@ enum JdkPhase {
   error,
 }
 
+/// Android SDK / Flutter SDK 共用阶段。
+enum SdkPhase {
+  idle,
+  apt, // 容器内 apt 装 xz-utils/unzip
+  probing,
+  downloading,
+  importing, // 本地文件导入 + 校验
+  extracting,
+  validating,
+  installed,
+  error,
+}
+
+/// 构建镜像配置阶段。
+enum MirrorPhase {
+  idle,
+  env,
+  initGradle,
+  wrapper,
+  probing,
+  downloading,
+  installed,
+  error,
+}
+
 class _ToolchainPageState extends State<ToolchainPage> {
   final ProotBridge _bridge = ProotBridge();
 
+  // ---- JDK（原有逻辑）----
   JdkPhase _phase = JdkPhase.idle;
   DownloadProgress? _progress;
-  String _mirrorName = '';
+  final Set<String> _mirrors = {};
   String _version = '';
   String _error = '';
   EnvInfo? _env;
   DownloadCancelToken? _token;
+  bool _verifying = false;
+
+  // ---- Android SDK ----
+  SdkPhase _asdkPhase = SdkPhase.idle;
+  DownloadProgress? _asdkProgress;
+  final Set<String> _asdkMirrors = {};
+  String _asdkInfo = '';
+  String _asdkError = '';
+  DownloadCancelToken? _asdkToken;
+  bool _asdkVerifying = false;
+
+  // ---- Flutter SDK ----
+  SdkPhase _flPhase = SdkPhase.idle;
+  DownloadProgress? _flProgress;
+  final Set<String> _flMirrors = {};
+  String _flInfo = '';
+  String _flError = '';
+  DownloadCancelToken? _flToken;
+  bool _flVerifying = false;
+
+  // ---- 构建镜像配置 ----
+  MirrorPhase _mirrorPhase = MirrorPhase.idle;
+  DownloadProgress? _mirrorProgress;
+  String _mirrorInfo = '';
+  String _mirrorError = '';
+  DownloadCancelToken? _mirrorToken;
 
   @override
   void initState() {
     super.initState();
-    _refresh();
+    _refreshAll();
   }
 
-  Future<void> _refresh() async {
+  Future<void> _refreshAll() async {
     try {
       final env = await _bridge.envInfo();
-      final v = env.rootfsInstalled
-          ? await JdkInstaller.installedVersion(_bridge)
+      final v = env.rootfsInstalled ? await JdkInstaller.verify(_bridge) : null;
+      final a = env.rootfsInstalled
+          ? await AndroidSdkInstaller.verify(_bridge)
+          : null;
+      final f = env.rootfsInstalled
+          ? await FlutterSdkInstaller.verify(_bridge)
+          : null;
+      final m = env.rootfsInstalled
+          ? await MirrorConfigurator.verify(_bridge, env)
           : null;
       if (!mounted) return;
       setState(() {
         _env = env;
         _phase = v == null ? JdkPhase.idle : JdkPhase.installed;
         _version = v ?? '';
+        _asdkPhase = a == null ? SdkPhase.idle : SdkPhase.installed;
+        _asdkInfo = a ?? '';
+        _flPhase = f == null ? SdkPhase.idle : SdkPhase.installed;
+        _flInfo = f ?? '';
+        _mirrorPhase = m == null ? MirrorPhase.idle : MirrorPhase.installed;
+        _mirrorInfo = m ?? '';
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
+        _phase = JdkPhase.error;
+        _error = '检测失败：$e';
+      });
+    }
+  }
+
+  // ============================ JDK ============================
+
+  Future<void> _onVerify() async {
+    setState(() => _verifying = true);
+    try {
+      final env = await _bridge.envInfo();
+      final v = env.rootfsInstalled ? await JdkInstaller.verify(_bridge) : null;
+      if (!mounted) return;
+      setState(() {
+        _verifying = false;
+        _env = env;
+        _phase = v == null ? JdkPhase.idle : JdkPhase.installed;
+        _version = v ?? '';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            v == null
+                ? '验证失败：/opt/jdk 中未找到 java / javac'
+                : '验证通过：${v.replaceAll('\n', ' · ')}',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _verifying = false;
         _phase = JdkPhase.error;
         _error = '检测失败：$e';
       });
@@ -70,6 +177,7 @@ class _ToolchainPageState extends State<ToolchainPage> {
       _phase = JdkPhase.probing;
       _progress = null;
       _error = '';
+      _mirrors.clear();
     });
     _token = DownloadCancelToken();
     try {
@@ -97,9 +205,9 @@ class _ToolchainPageState extends State<ToolchainPage> {
           if (!mounted) return;
           setState(() => _progress = p);
         },
-        onMirrorSwitch: (m) {
+        onMirrorUsed: (m) {
           if (!mounted) return;
-          setState(() => _mirrorName = m.name);
+          setState(() => _mirrors.add(m.name));
         },
       );
       if (!mounted) return;
@@ -121,12 +229,443 @@ class _ToolchainPageState extends State<ToolchainPage> {
     setState(() => _phase = JdkPhase.idle);
   }
 
+  Future<void> _installFromLocal() async {
+    final picked = await LocalInstallPicker.pickInstallFile();
+    if (!mounted) return;
+    if (!picked.ok || picked.path == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(picked.error ?? '未选择文件')),
+      );
+      return;
+    }
+    setState(() {
+      _phase = JdkPhase.importing;
+      _progress = null;
+      _error = '';
+      _mirrors.clear();
+    });
+    _token = DownloadCancelToken();
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final ver = await JdkInstaller.installFromLocalFile(
+        _bridge,
+        env,
+        picked.path!,
+        token: _token,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() {
+            _phase = switch (p) {
+              'importing' => JdkPhase.importing,
+              'extracting' => JdkPhase.extracting,
+              'validating' => JdkPhase.validating,
+              _ => _phase,
+            };
+          });
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _phase = JdkPhase.installed;
+        _version = ver;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _phase = JdkPhase.error;
+        _error = e.toString();
+      });
+    }
+  }
+
   Future<void> _uninstall() async {
     final ok = await _confirm('卸载 JDK', '将删除 /opt/jdk（约 300MB），确定？');
     if (!ok) return;
     setState(() => _phase = JdkPhase.uninstalling);
     await JdkInstaller.uninstall(_bridge);
-    await _refresh();
+    await _refreshAll();
+  }
+
+  // ============================ Android SDK ============================
+
+  SdkPhase _sdkPhaseFrom(String p) => switch (p) {
+        'apt' => SdkPhase.apt,
+        'probing' => SdkPhase.probing,
+        'downloading' => SdkPhase.downloading,
+        'importing' => SdkPhase.importing,
+        'extracting' => SdkPhase.extracting,
+        'validating' => SdkPhase.validating,
+        _ => SdkPhase.idle,
+      };
+
+  Future<void> _asdkInstall() async {
+    setState(() {
+      _asdkPhase = SdkPhase.probing;
+      _asdkProgress = null;
+      _asdkError = '';
+      _asdkMirrors.clear();
+    });
+    _asdkToken = DownloadCancelToken();
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final v = await AndroidSdkInstaller.install(
+        _bridge,
+        env,
+        token: _asdkToken,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _asdkPhase = _sdkPhaseFrom(p));
+        },
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _asdkProgress = p);
+        },
+        onMirrorUsed: (m) {
+          if (!mounted) return;
+          setState(() => _asdkMirrors.add(m.name));
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _asdkPhase = SdkPhase.installed;
+        _asdkInfo = v;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _asdkPhase = SdkPhase.error;
+        _asdkError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _asdkVerify() async {
+    setState(() => _asdkVerifying = true);
+    try {
+      final v = await AndroidSdkInstaller.verify(_bridge);
+      if (!mounted) return;
+      setState(() {
+        _asdkVerifying = false;
+        _asdkPhase = v == null ? SdkPhase.idle : SdkPhase.installed;
+        _asdkInfo = v ?? '';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            v == null
+                ? '验证失败：Android SDK 关键组件缺失'
+                : '验证通过：$v',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _asdkVerifying = false;
+        _asdkPhase = SdkPhase.error;
+        _asdkError = '检测失败：$e';
+      });
+    }
+  }
+
+  Future<void> _asdkCancel() async {
+    _asdkToken?.cancel();
+    setState(() => _asdkPhase = SdkPhase.idle);
+  }
+
+  Future<void> _asdkInstallFromLocal() async {
+    final picked = await LocalInstallPicker.pickInstallFile();
+    if (!mounted) return;
+    if (!picked.ok || picked.path == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(picked.error ?? '未选择文件')),
+      );
+      return;
+    }
+    setState(() {
+      _asdkPhase = SdkPhase.importing;
+      _asdkProgress = null;
+      _asdkError = '';
+      _asdkMirrors.clear();
+    });
+    _asdkToken = DownloadCancelToken();
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final v = await AndroidSdkInstaller.installFromLocalFile(
+        _bridge,
+        env,
+        picked.path!,
+        token: _asdkToken,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _asdkPhase = _sdkPhaseFrom(p));
+        },
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _asdkProgress = p);
+        },
+        onMirrorUsed: (m) {
+          if (!mounted) return;
+          setState(() => _asdkMirrors.add(m.name));
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _asdkPhase = SdkPhase.installed;
+        _asdkInfo = v;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _asdkPhase = SdkPhase.error;
+        _asdkError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _asdkUninstall() async {
+    final ok = await _confirm(
+        '卸载 Android SDK', '将删除 /opt/android-sdk（约 1.3GB，含解压后），确定？');
+    if (!ok) return;
+    await AndroidSdkInstaller.uninstall(_bridge);
+    await _refreshAll();
+  }
+
+  // ============================ Flutter SDK ============================
+
+  Future<void> _flInstall() async {
+    setState(() {
+      _flPhase = SdkPhase.probing;
+      _flProgress = null;
+      _flError = '';
+      _flMirrors.clear();
+    });
+    _flToken = DownloadCancelToken();
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final v = await FlutterSdkInstaller.install(
+        _bridge,
+        env,
+        token: _flToken,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _flPhase = _sdkPhaseFrom(p));
+        },
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _flProgress = p);
+        },
+        onMirrorUsed: (m) {
+          if (!mounted) return;
+          setState(() => _flMirrors.add(m.name));
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _flPhase = SdkPhase.installed;
+        _flInfo = v;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _flPhase = SdkPhase.error;
+        _flError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _flVerify() async {
+    setState(() => _flVerifying = true);
+    try {
+      final v = await FlutterSdkInstaller.verify(_bridge);
+      if (!mounted) return;
+      setState(() {
+        _flVerifying = false;
+        _flPhase = v == null ? SdkPhase.idle : SdkPhase.installed;
+        _flInfo = v ?? '';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            v == null
+                ? '验证失败：/opt/flutter 缺失或 dart-sdk 版本不符'
+                : '验证通过：$v',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _flVerifying = false;
+        _flPhase = SdkPhase.error;
+        _flError = '检测失败：$e';
+      });
+    }
+  }
+
+  Future<void> _flCancel() async {
+    _flToken?.cancel();
+    setState(() => _flPhase = SdkPhase.idle);
+  }
+
+  Future<void> _flInstallFromLocal() async {
+    final picked = await LocalInstallPicker.pickInstallFile();
+    if (!mounted) return;
+    if (!picked.ok || picked.path == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(picked.error ?? '未选择文件')),
+      );
+      return;
+    }
+    setState(() {
+      _flPhase = SdkPhase.importing;
+      _flProgress = null;
+      _flError = '';
+      _flMirrors.clear();
+    });
+    _flToken = DownloadCancelToken();
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final v = await FlutterSdkInstaller.installFromLocalFile(
+        _bridge,
+        env,
+        picked.path!,
+        token: _flToken,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _flPhase = _sdkPhaseFrom(p));
+        },
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _flProgress = p);
+        },
+        onMirrorUsed: (m) {
+          if (!mounted) return;
+          setState(() => _flMirrors.add(m.name));
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _flPhase = SdkPhase.installed;
+        _flInfo = v;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _flPhase = SdkPhase.error;
+        _flError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _flUninstall() async {
+    final ok = await _confirm(
+        '卸载 Flutter SDK', '将删除 /opt/flutter（约 3GB，含解压后），确定？');
+    if (!ok) return;
+    await FlutterSdkInstaller.uninstall(_bridge);
+    await _refreshAll();
+  }
+
+  // ============================ 构建镜像配置 ============================
+
+  MirrorPhase _mirrorPhaseFrom(String p) => switch (p) {
+        'env' => MirrorPhase.env,
+        'init-gradle' => MirrorPhase.initGradle,
+        'wrapper' => MirrorPhase.wrapper,
+        'probing' => MirrorPhase.probing,
+        'downloading' => MirrorPhase.downloading,
+        _ => MirrorPhase.idle,
+      };
+
+  Future<void> _mirrorApply() async {
+    setState(() {
+      _mirrorPhase = MirrorPhase.env;
+      _mirrorProgress = null;
+      _mirrorError = '';
+    });
+    _mirrorToken = DownloadCancelToken();
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final v = await MirrorConfigurator.apply(
+        _bridge,
+        env,
+        token: _mirrorToken,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _mirrorPhase = _mirrorPhaseFrom(p));
+        },
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _mirrorProgress = p);
+        },
+        onMirrorUsed: (_) {},
+      );
+      if (!mounted) return;
+      setState(() {
+        _mirrorPhase = MirrorPhase.installed;
+        _mirrorInfo = v;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('镜像配置完成：$v'), duration: const Duration(seconds: 4)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _mirrorPhase = MirrorPhase.error;
+        _mirrorError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _mirrorVerify() async {
+    try {
+      final env = await _bridge.envInfo();
+      final m = env.rootfsInstalled
+          ? await MirrorConfigurator.verify(_bridge, env)
+          : null;
+      if (!mounted) return;
+      setState(() {
+        _mirrorPhase = m == null ? MirrorPhase.idle : MirrorPhase.installed;
+        _mirrorInfo = m ?? '';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(m == null ? '未检测到镜像配置' : '配置有效：$m'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _mirrorPhase = MirrorPhase.error;
+        _mirrorError = '检测失败：$e';
+      });
+    }
+  }
+
+  Future<void> _mirrorCancel() async {
+    _mirrorToken?.cancel();
+    setState(() => _mirrorPhase = MirrorPhase.idle);
   }
 
   Future<bool> _confirm(String title, String body) async {
@@ -152,50 +691,89 @@ class _ToolchainPageState extends State<ToolchainPage> {
 
   @override
   Widget build(BuildContext context) {
+    final rootfsReady = _env?.rootfsInstalled == true;
     return Scaffold(
-      appBar: AppBar(title: const Text('工具链 · JDK 17')),
+      appBar: AppBar(title: const Text('工具链')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
           _JdkCard(
             phase: _phase,
             progress: _progress,
-            mirrorName: _mirrorName,
+            mirrorName: _mirrors.join(' + '),
             version: _version,
             error: _error,
             env: _env,
             onInstall: _install,
             onCancel: _cancel,
             onUninstall: _uninstall,
-            onVerify: _refresh,
+            onVerify: _onVerify,
+            onInstallLocal: _installFromLocal,
+            verifying: _verifying,
           ),
           const SizedBox(height: 12),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('说明',
-                      style: TextStyle(
-                          fontWeight: FontWeight.bold, fontSize: 15)),
-                  const SizedBox(height: 8),
-                  Text(
-                    'JDK 17（Temurin）将安装到容器内 /opt/jdk，供后续构建 APK 使用。\n'
-                    '下载走国内镜像（TUNA 清华为主），支持断点续传与 SHA-256 校验，'
-                    '失败自动切换镜像。',
-                    style: TextStyle(
-                        fontSize: 13, color: Colors.grey.shade400),
-                  ),
-                ],
-              ),
-            ),
+          _SdkCard(
+            title: 'Android SDK',
+            icon: Icons.android,
+            phase: _asdkPhase,
+            progress: _asdkProgress,
+            mirrorName: _asdkMirrors.join(' + '),
+            info: _asdkInfo,
+            error: _asdkError,
+            sizeLabel: '约 ${(AndroidSdkInstaller.totalSize / 1048576).toStringAsFixed(0)} MB · 4 个组件',
+            desc: 'platform-tools r37 + platforms;android-36 + build-tools 36.0.0 '
+                '+ cmdline-tools（与 Flutter 3.47.4 的 compileSdk 36 对齐）。\n'
+                '国内源优先（腾讯云）探测取最快，4 线程分段并发 + SHA-1 校验；'
+                '解压到容器内 /opt/android-sdk 并预置许可。',
+            verifying: _asdkVerifying,
+            rootfsReady: rootfsReady,
+            onInstall: _asdkInstall,
+            onVerify: _asdkVerify,
+            onCancel: _asdkCancel,
+            onUninstall: _asdkUninstall,
+            onInstallLocal: _asdkInstallFromLocal,
+          ),
+          const SizedBox(height: 12),
+          _SdkCard(
+            title: 'Flutter SDK（arm64）',
+            icon: Icons.bolt,
+            phase: _flPhase,
+            progress: _flProgress,
+            mirrorName: _flMirrors.join(' + '),
+            info: _flInfo,
+            error: _flError,
+            sizeLabel: '约 1720 MB · 官方 tarball + Dart arm64',
+            desc: 'Flutter ${FlutterSdkInstaller.version} 官方仅发布 x64 Linux 构建，'
+                '本方案用官方 Dart SDK linux-arm64（${FlutterSdkInstaller.dartVersion}）'
+                '替换 dart-sdk 后即可在 aarch64 上执行 flutter build apk。\n'
+                '国内源（flutter-io.cn 官方中国镜像）优先；'
+                '解压到容器内 /opt/flutter。',
+            verifying: _flVerifying,
+            rootfsReady: rootfsReady,
+            onInstall: _flInstall,
+            onVerify: _flVerify,
+            onCancel: _flCancel,
+            onUninstall: _flUninstall,
+            onInstallLocal: _flInstallFromLocal,
+          ),
+          const SizedBox(height: 12),
+          _MirrorCard(
+            phase: _mirrorPhase,
+            progress: _mirrorProgress,
+            info: _mirrorInfo,
+            error: _mirrorError,
+            rootfsReady: rootfsReady,
+            onApply: _mirrorApply,
+            onVerify: _mirrorVerify,
+            onCancel: _mirrorCancel,
           ),
         ],
       ),
     );
   }
 }
+
+// ============================ JDK 卡片 ============================
 
 class _JdkCard extends StatelessWidget {
   final JdkPhase phase;
@@ -208,6 +786,8 @@ class _JdkCard extends StatelessWidget {
   final VoidCallback onCancel;
   final VoidCallback onUninstall;
   final VoidCallback onVerify;
+  final VoidCallback onInstallLocal;
+  final bool verifying;
 
   const _JdkCard({
     required this.phase,
@@ -220,12 +800,15 @@ class _JdkCard extends StatelessWidget {
     required this.onCancel,
     required this.onUninstall,
     required this.onVerify,
+    required this.onInstallLocal,
+    required this.verifying,
   });
 
   @override
   Widget build(BuildContext context) {
     final busy = phase == JdkPhase.probing ||
         phase == JdkPhase.downloading ||
+        phase == JdkPhase.importing ||
         phase == JdkPhase.extracting ||
         phase == JdkPhase.validating ||
         phase == JdkPhase.uninstalling;
@@ -257,6 +840,7 @@ class _JdkCard extends StatelessWidget {
                     JdkPhase.error => '安装失败',
                     JdkPhase.probing => '正在探测镜像源…',
                     JdkPhase.downloading => '正在下载 JDK…',
+                    JdkPhase.importing => '正在导入本地文件…',
                     JdkPhase.extracting => '正在解压到 /opt/jdk…',
                     JdkPhase.validating => '正在验证 java / javac…',
                     JdkPhase.uninstalling => '正在卸载…',
@@ -286,6 +870,16 @@ class _JdkCard extends StatelessWidget {
                 style: const TextStyle(fontSize: 12, color: Colors.grey),
               ),
             ],
+            if (verifying) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(
+                minHeight: 6,
+                borderRadius: BorderRadius.all(Radius.circular(3)),
+              ),
+              const SizedBox(height: 6),
+              const Text('正在重新验证 java / javac…',
+                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
             if (phase == JdkPhase.error && error.isNotEmpty) ...[
               const SizedBox(height: 8),
               SelectableText(error,
@@ -298,7 +892,7 @@ class _JdkCard extends StatelessWidget {
                 if (phase == JdkPhase.installed) ...[
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: onVerify,
+                      onPressed: verifying ? null : onVerify,
                       icon: const Icon(Icons.verified_outlined, size: 18),
                       label: const Text('重新验证'),
                     ),
@@ -306,7 +900,7 @@ class _JdkCard extends StatelessWidget {
                   const SizedBox(width: 8),
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: busy ? null : onUninstall,
+                      onPressed: busy || verifying ? null : onUninstall,
                       icon: const Icon(Icons.delete_outline, size: 18),
                       label: const Text('卸载'),
                       style: OutlinedButton.styleFrom(
@@ -333,6 +927,18 @@ class _JdkCard extends StatelessWidget {
                 ],
               ],
             ),
+            if (!busy && phase != JdkPhase.installed) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed:
+                      env?.rootfsInstalled != true ? null : onInstallLocal,
+                  icon: const Icon(Icons.folder_open, size: 18),
+                  label: const Text('从本地存储选择安装'),
+                ),
+              ),
+            ],
             if (env?.rootfsInstalled != true) ...[
               const SizedBox(height: 8),
               const Text('请先在主页初始化 rootfs 环境',
@@ -359,6 +965,396 @@ class _JdkCard extends StatelessWidget {
                 child: Text(v,
                     style: const TextStyle(
                         fontSize: 13, fontFamily: 'monospace'))),
+          ],
+        ),
+      );
+}
+
+// ============================ Android / Flutter 共用卡片 ============================
+
+class _SdkCard extends StatelessWidget {
+  final String title;
+  final IconData icon;
+  final SdkPhase phase;
+  final DownloadProgress? progress;
+  final String mirrorName;
+  final String info;
+  final String error;
+  final String sizeLabel;
+  final String desc;
+  final bool verifying;
+  final bool rootfsReady;
+  final VoidCallback onInstall;
+  final VoidCallback onVerify;
+  final VoidCallback onCancel;
+  final VoidCallback onUninstall;
+  final VoidCallback onInstallLocal;
+
+  const _SdkCard({
+    required this.title,
+    required this.icon,
+    required this.phase,
+    required this.progress,
+    required this.mirrorName,
+    required this.info,
+    required this.error,
+    required this.sizeLabel,
+    required this.desc,
+    required this.verifying,
+    required this.rootfsReady,
+    required this.onInstall,
+    required this.onVerify,
+    required this.onCancel,
+    required this.onUninstall,
+    required this.onInstallLocal,
+  });
+
+  String get _statusLabel => switch (phase) {
+        SdkPhase.installed => '$title 已安装',
+        SdkPhase.error => '安装失败',
+        SdkPhase.apt => '安装 apt 工具（xz-utils/unzip）…',
+        SdkPhase.probing => '正在探测镜像源…',
+        SdkPhase.downloading => '正在下载…',
+        SdkPhase.importing => '正在导入本地文件…',
+        SdkPhase.extracting => '正在解压…',
+        SdkPhase.validating => '正在验证…',
+        SdkPhase.idle => '$title 未安装',
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final busy = phase == SdkPhase.apt ||
+        phase == SdkPhase.probing ||
+        phase == SdkPhase.downloading ||
+        phase == SdkPhase.importing ||
+        phase == SdkPhase.extracting ||
+        phase == SdkPhase.validating;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  switch (phase) {
+                    SdkPhase.installed => Icons.check_circle,
+                    SdkPhase.error => Icons.error_outline,
+                    _ => Icons.downloading,
+                  },
+                  color: switch (phase) {
+                    SdkPhase.installed => const Color(0xFF3DDC84),
+                    SdkPhase.error => const Color(0xFFFF7A7A),
+                    _ => Colors.orangeAccent,
+                  },
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _statusLabel,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                Icon(icon, size: 20, color: Colors.grey.shade500),
+              ],
+            ),
+            const Divider(height: 20),
+            _kv('版本', phase == SdkPhase.installed ? info : '待安装'),
+            _kv('镜像', mirrorName.isEmpty ? '待选源' : mirrorName),
+            _kv('大小', sizeLabel),
+            if (phase == SdkPhase.downloading && progress != null) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(
+                value: progress!.fraction,
+                minHeight: 6,
+                borderRadius: BorderRadius.circular(3),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '${(progress!.received / 1048576).toStringAsFixed(1)} / '
+                '${(progress!.total / 1048576).toStringAsFixed(1)} MB · '
+                '${(progress!.speed / 1048576).toStringAsFixed(1)} MB/s',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
+            if (verifying) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(
+                minHeight: 6,
+                borderRadius: BorderRadius.all(Radius.circular(3)),
+              ),
+              const SizedBox(height: 6),
+              const Text('正在重新验证…',
+                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
+            if (phase == SdkPhase.error && error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SelectableText(error,
+                  style: const TextStyle(
+                      fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+            const SizedBox(height: 12),
+            Text(desc,
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                if (phase == SdkPhase.installed) ...[
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: verifying ? null : onVerify,
+                      icon: const Icon(Icons.verified_outlined, size: 18),
+                      label: const Text('重新验证'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: busy || verifying ? null : onUninstall,
+                      icon: const Icon(Icons.delete_outline, size: 18),
+                      label: const Text('卸载'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFFFF7A7A),
+                      ),
+                    ),
+                  ),
+                ] else if (busy) ...[
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: onCancel,
+                      icon: const Icon(Icons.stop, size: 18),
+                      label: const Text('取消'),
+                    ),
+                  ),
+                ] else ...[
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: rootfsReady ? onInstall : null,
+                      icon: const Icon(Icons.download, size: 18),
+                      label: const Text('下载并安装'),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            if (!busy && phase != SdkPhase.installed) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: rootfsReady ? onInstallLocal : null,
+                  icon: const Icon(Icons.folder_open, size: 18),
+                  label: const Text('从本地存储选择安装'),
+                ),
+              ),
+            ],
+            if (!rootfsReady) ...[
+              const SizedBox(height: 8),
+              const Text('请先在主页初始化 rootfs 环境',
+                  style: TextStyle(fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 76,
+              child: Text(k,
+                  style: TextStyle(
+                      color: Colors.grey.shade400, fontSize: 13)),
+            ),
+            Expanded(
+                child: Text(v,
+                    style: const TextStyle(
+                        fontSize: 13, fontFamily: 'monospace'))),
+          ],
+        ),
+      );
+}
+
+// ============================ 构建镜像配置卡片 ============================
+
+class _MirrorCard extends StatelessWidget {
+  final MirrorPhase phase;
+  final DownloadProgress? progress;
+  final String info;
+  final String error;
+  final bool rootfsReady;
+  final VoidCallback onApply;
+  final VoidCallback onVerify;
+  final VoidCallback onCancel;
+
+  const _MirrorCard({
+    required this.phase,
+    required this.progress,
+    required this.info,
+    required this.error,
+    required this.rootfsReady,
+    required this.onApply,
+    required this.onVerify,
+    required this.onCancel,
+  });
+
+  String get _statusLabel => switch (phase) {
+        MirrorPhase.installed => '构建镜像已配置',
+        MirrorPhase.error => '配置失败',
+        MirrorPhase.env => '写入环境变量…',
+        MirrorPhase.initGradle => '写入 init.gradle…',
+        MirrorPhase.wrapper => '改写项目 wrapper 镜像…',
+        MirrorPhase.probing => '探测 Gradle 镜像…',
+        MirrorPhase.downloading => '预下载 Gradle…',
+        MirrorPhase.idle => '构建镜像未配置',
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final busy = phase == MirrorPhase.env ||
+        phase == MirrorPhase.initGradle ||
+        phase == MirrorPhase.wrapper ||
+        phase == MirrorPhase.probing ||
+        phase == MirrorPhase.downloading;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  switch (phase) {
+                    MirrorPhase.installed => Icons.check_circle,
+                    MirrorPhase.error => Icons.error_outline,
+                    _ => Icons.settings_ethernet,
+                  },
+                  color: switch (phase) {
+                    MirrorPhase.installed => const Color(0xFF3DDC84),
+                    MirrorPhase.error => const Color(0xFFFF7A7A),
+                    _ => Colors.orangeAccent,
+                  },
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _statusLabel,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 20),
+            _kv('状态', phase == MirrorPhase.installed ? info : '一键完成以下四步'),
+            _kv('环境变量', 'PUB_HOSTED_URL / FLUTTER_STORAGE_BASE_URL / '
+                'ANDROID_HOME / JAVA_HOME / GRADLE_USER_HOME'),
+            _kv('Maven 镜像', '阿里云 public + google + gradle-plugin（init.gradle 全局生效）'),
+            _kv('Gradle 镜像', '腾讯云 ${MirrorConfigurator.gradleUrl.replaceFirst('https://', '')}'),
+            if (phase == MirrorPhase.downloading && progress != null) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(
+                value: progress!.fraction,
+                minHeight: 6,
+                borderRadius: BorderRadius.circular(3),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                '${(progress!.received / 1048576).toStringAsFixed(1)} / '
+                '${(progress!.total / 1048576).toStringAsFixed(1)} MB · '
+                '${(progress!.speed / 1048576).toStringAsFixed(1)} MB/s',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
+            if (phase == MirrorPhase.error && error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SelectableText(error,
+                  style: const TextStyle(
+                      fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+            const SizedBox(height: 12),
+            Text(
+              '把 Flutter/Dart 环境变量写入 /etc/profile.d/foa-env.sh 与 '
+              '~/.bashrc（app 内构建命令自动加载）；写入 ~/.gradle/init.gradle '
+              '让所有项目走阿里云 Maven；把 /root/projects 下所有项目的 '
+              'gradle-wrapper.properties 指向腾讯云镜像；预下载 '
+              'Gradle ${MirrorConfigurator.gradleVersion} 分发包（224MB）到 '
+              'wrapper 缓存目录，首次构建不再访问国外源。',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                if (phase == MirrorPhase.installed) ...[
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: onVerify,
+                      icon: const Icon(Icons.verified_outlined, size: 18),
+                      label: const Text('重新验证'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: busy ? null : onApply,
+                      icon: const Icon(Icons.refresh, size: 18),
+                      label: const Text('重新配置'),
+                    ),
+                  ),
+                ] else if (busy) ...[
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: onCancel,
+                      icon: const Icon(Icons.stop, size: 18),
+                      label: const Text('取消'),
+                    ),
+                  ),
+                ] else ...[
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: rootfsReady ? onApply : null,
+                      icon: const Icon(Icons.settings_ethernet, size: 18),
+                      label: const Text('一键配置'),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            if (!rootfsReady) ...[
+              const SizedBox(height: 8),
+              const Text('请先在主页初始化 rootfs 环境',
+                  style: TextStyle(fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 90,
+              child: Text(k,
+                  style: TextStyle(
+                      color: Colors.grey.shade400, fontSize: 13)),
+            ),
+            Expanded(
+                child: Text(v,
+                    style: const TextStyle(
+                        fontSize: 12, fontFamily: 'monospace'))),
           ],
         ),
       );

@@ -114,17 +114,144 @@ repack_for_android() {
   echo "✅ 重打包完成（$(du -h "$T" | cut -f1)）"
 }
 
+# 真机 DNS 中立化（Bug 402 根因，2026-09-17）：
+# debootstrap 构建 rootfs 时会从构建机拷入 /etc/resolv.conf（常见内网 10.x/192.168.x），
+# 用户真机容器内 glibc 用它解析必然失败 → apt/pub/gradle 全挂。
+# 若 tarball 内 resolv.conf 无公共 DNS，则全量重打包为公共 DNS（阿里/腾讯/谷歌三行）。
+normalize_resolvconf() {
+  local T="$1" D
+  D=$(mktemp -d)
+  if tar -xzf "$T" -C "$D" ./etc/resolv.conf 2>/dev/null \
+     && grep -qE '^nameserver (223\.5\.5\.5|119\.29\.29\.29|8\.8\.8\.8|114\.114\.114\.114|1\.1\.1\.1)' "$D/etc/resolv.conf"; then
+    echo "✅ resolv.conf 已是公共 DNS，无需改写"
+    rm -rf "$D"
+    return
+  fi
+  echo "→ 改写 resolv.conf 为公共 DNS（构建机内网 DNS 在真机不可达）..."
+  rm -rf "$D"; D=$(mktemp -d)
+  tar -xzf "$T" -C "$D" 2>/dev/null
+  printf 'nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 8.8.8.8\n' > "$D/etc/resolv.conf"
+  ( cd "$D" && tar --hard-dereference --exclude='./dev/*' --owner=0 --group=0 \
+      -czf "$T.new" . )
+  mv "$T.new" "$T"
+  rm -rf "$D"
+  echo "✅ resolv.conf 已中立化（$(du -h "$T" | cut -f1)）"
+}
+
+# rootfs 账户完整性（Bug 404，2026-09-17 真机抓到）：
+# 源 rootfs 打包时 /etc/passwd /etc/group 处于 dpkg 重写中间态（只剩 passwd-/+、
+# group-/+ 备份），真机容器内 apt 报 "No sandbox user '_apt'"、apt-key 写 /tmp
+# 失败、TUNA 源签名验证失败 → xz-utils/unzip 装不上。
+# 幂等检测：缺失或缺 _apt 用户时补标准 Debian bookworm 骨架（含 _apt/messagebus）
+# 与 /etc/hosts，再按 Android 友好格式重打包。
+fix_rootfs_accounts() {
+  local T="$1" D
+  D=$(mktemp -d)
+  tar -xzf "$T" -C "$D" 2>/dev/null
+  local need=0
+  if [[ ! -f "$D/etc/passwd" ]] || ! grep -q '^_apt:' "$D/etc/passwd" 2>/dev/null; then need=1; fi
+  if [[ ! -f "$D/etc/group" ]] || ! grep -q '^_apt:' "$D/etc/group" 2>/dev/null; then need=1; fi
+  if [[ ! -f "$D/etc/hosts" ]]; then need=1; fi
+  if [[ "$need" == 0 ]]; then
+    echo "✅ /etc/passwd /etc/group /etc/hosts 完整，无需修复"
+    rm -rf "$D"
+    return
+  fi
+  echo "→ 修复 rootfs 账户文件（补 /etc/passwd /etc/group /etc/hosts，含 _apt）..."
+  cat > "$D/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sys:x:3:3:sys:/dev:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+games:x:5:60:games:/usr/games:/usr/sbin/nologin
+man:x:6:12:man:/var/cache/man:/usr/sbin/nologin
+lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin
+mail:x:8:8:mail:/var/mail:/usr/sbin/nologin
+news:x:9:9:news:/var/spool/news:/usr/sbin/nologin
+uucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin
+proxy:x:13:13:proxy:/bin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+backup:x:34:34:backup:/var/backups:/usr/sbin/nologin
+list:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin
+irc:x:39:39:ircd:/run/ircd:/usr/sbin/nologin
+gnats:x:41:41:Gnats Bug-Reporting System (admin):/var/lib/gnats:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+_apt:x:100:65534::/nonexistent:/usr/sbin/nologin
+systemd-network:x:101:102:systemd Network Management,,,:/run/systemd:/usr/sbin/nologin
+systemd-resolve:x:102:103:systemd Resolver,,,:/run/systemd:/usr/sbin/nologin
+messagebus:x:103:104::/nonexistent:/usr/sbin/nologin
+EOF
+  cat > "$D/etc/group" <<'EOF'
+root:x:0:
+daemon:x:1:
+bin:x:2:
+sys:x:3:
+adm:x:4:
+tty:x:5:
+disk:x:6:
+lp:x:7:
+mail:x:8:
+news:x:9:
+uucp:x:10:
+man:x:12:
+proxy:x:13:
+kmem:x:15:
+dialout:x:20:
+fax:x:21:
+voice:x:22:
+cdrom:x:24:
+floppy:x:25:
+tape:x:26:
+sudo:x:27:
+audio:x:29:
+dip:x:30:
+www-data:x:33:
+backup:x:34:
+operator:x:37:
+list:x:38:
+irc:x:39:
+src:x:40:
+gnats:x:41:
+shadow:x:42:
+utmp:x:43:
+video:x:44:
+sasl:x:45:
+plugdev:x:46:
+staff:x:50:
+games:x:60:
+users:x:100:
+nogroup:x:65534:
+systemd-journal:x:101:
+systemd-network:x:102:
+systemd-resolve:x:103:
+messagebus:x:104:
+_apt:x:105:
+EOF
+  printf '127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n127.0.1.1 foa\n' > "$D/etc/hosts"
+  chmod 644 "$D/etc/passwd" "$D/etc/group" "$D/etc/hosts"
+  ( cd "$D" && tar --hard-dereference --exclude='./dev/*' --owner=0 --group=0 \
+      -czf "$T.new" . )
+  mv "$T.new" "$T"
+  rm -rf "$D"
+  echo "✅ 账户文件已修复并重打包（$(du -h "$T" | cut -f1)）"
+}
+
 fetch_rootfs() {
   local R="$ROOTFS_DIR/debian-minbase-arm64.tar.gz"
   if [[ -f "$R" ]]; then
     echo "ℹ️  rootfs tarball 已存在（$(du -h "$R" | cut -f1)），校验格式..."
     repack_for_android "$R"
+    normalize_resolvconf "$R"
+    fix_rootfs_accounts "$R"
     return
   fi
   if [[ -n "${ROOTFS_URL:-}" ]]; then
     echo "↓ 下载 rootfs: $ROOTFS_URL"
     curl -fsSL --retry 3 -o "$R.tmp" "$ROOTFS_URL" && mv "$R.tmp" "$R"
     repack_for_android "$R"
+    normalize_resolvconf "$R"
+    fix_rootfs_accounts "$R"
     echo "✅ rootfs 已就位（$(du -h "$R" | cut -f1)）"
   else
     cat <<'EOF'

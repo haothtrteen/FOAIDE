@@ -30,6 +30,13 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // APK 体积优化（2026-09-17）：只打包 arm64-v8a。
+        // 目标设备全为 64 位（proot 本体也仅分发 arm64，见 jniLibs/arm64-v8a），
+        // 移除 armeabi-v7a / x86_64 冗余库约 -38MB（libapp.so + libflutter.so × 2 套）。
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -37,6 +44,17 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+
+            // R8 代码压缩 + 资源缩减（APK 体积优化核心，2026-09-17）：
+            // Flutter 3.47 插件默认已对 release 开启（FlutterPlugin.kt shouldShrinkResources
+            // 默认 true），此处显式声明保证确定性（防 --no-shrink / 插件默认变更）；
+            // proguard-rules.pro 被插件自动追加（文件存在时）。
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 

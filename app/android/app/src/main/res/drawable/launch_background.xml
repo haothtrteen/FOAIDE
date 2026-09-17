@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Modify this file to customize your launch splash screen -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item android:drawable="@android:color/white" />
+    <!-- 暗色应用：启动屏与主题背景同色（Bug 410 顺带修复：原白色启动屏在暗色
+         应用冷启动时形成刺眼白闪） -->
+    <item android:drawable="@color/foa_bg" />
 
     <!-- You can insert your own image assets here -->
     <!-- <item>

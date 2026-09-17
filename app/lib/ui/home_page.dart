@@ -15,7 +15,9 @@ class HomePage extends StatelessWidget {
     final env = context.watch<EnvState>();
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Flutter On Android · Step 1'),
+        title: const SafeArea(
+          child: Text('Flutter On Android · Step 1'),
+        ),
         actions: [
           IconButton(
             tooltip: '重新检测',
@@ -164,41 +166,41 @@ class _ActionCard extends StatelessWidget {
               const SizedBox(height: 4),
               const Text('进入终端执行测试命令，或打开编辑器浏览/编辑项目文件。'),
               const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: () => Navigator.of(context).push(
+              LayoutBuilder(
+                builder: (context, constraints) => GridView.count(
+                  crossAxisCount: constraints.maxWidth >= 560 ? 3 : 2,
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  mainAxisSpacing: 10,
+                  crossAxisSpacing: 10,
+                  childAspectRatio: 2.2,
+                  children: [
+                    _ActionTile(
+                      icon: Icons.terminal,
+                      label: '打开终端',
+                      primary: true,
+                      onTap: () => Navigator.of(context).push(
                         MaterialPageRoute(
                             builder: (_) => const TerminalPage()),
                       ),
-                      icon: const Icon(Icons.terminal),
-                      label: const Text('打开终端'),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: FilledButton.tonalIcon(
-                      onPressed: () => Navigator.of(context).push(
-                        MaterialPageRoute(
-                            builder: (_) => EditorPage()),
+                    _ActionTile(
+                      icon: Icons.code,
+                      label: '打开编辑器',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => EditorPage()),
                       ),
-                      icon: const Icon(Icons.code),
-                      label: const Text('打开编辑器'),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: FilledButton.tonalIcon(
-                      onPressed: () => Navigator.of(context).push(
+                    _ActionTile(
+                      icon: Icons.build,
+                      label: '工具链',
+                      onTap: () => Navigator.of(context).push(
                         MaterialPageRoute(
                             builder: (_) => const ToolchainPage()),
                       ),
-                      icon: const Icon(Icons.build),
-                      label: const Text('工具链'),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ],
             if (env.installLog.isNotEmpty) ...[
@@ -213,6 +215,48 @@ class _ActionCard extends StatelessWidget {
                   style: const TextStyle(
                       fontSize: 12, color: Color(0xFFFF7A7A))),
             ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 宫格操作块：图标置顶、文字居下，主操作高亮。
+class _ActionTile extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool primary;
+
+  const _ActionTile({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.primary = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Material(
+      color: primary ? cs.primary : cs.secondaryContainer,
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon,
+                size: 30,
+                color: primary ? cs.onPrimary : cs.onSecondaryContainer),
+            const SizedBox(height: 8),
+            Text(label,
+                style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: primary ? cs.onPrimary : cs.onSecondaryContainer)),
           ],
         ),
       ),

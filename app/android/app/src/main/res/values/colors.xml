@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 应用主题背景（与 lib/core/theme.dart 的 FoaTheme.bg 一致）。
+         Bug 410（2026-09-17）：Flutter 引擎（3.47.4 实测字节码）在 Android 15+
+         设备（Build.VERSION.SDK_INT >= 35）上无条件跳过 Window.setStatusBarColor /
+         setNavigationBarColor——与 app targetSdk 无关。因此运行时 SystemChrome/
+         AppBar systemOverlayStyle 设的系统栏颜色在这类设备上完全失效，系统栏
+         回落主题默认值（黑状态栏 + 白导航条）。在主题 XML 里声明初始颜色，
+         由 OS 在窗口创建时直接应用，不经过 Flutter 引擎，对 targetSdk 28 的
+         应用在所有 Android 版本上均生效（edge-to-edge 强制仅限 targetSdk 35+）。 -->
+    <color name="foa_bg">#FF101418</color>
+</resources>

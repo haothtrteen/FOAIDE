@@ -1,6 +1,9 @@
 package dev.foa.flutter_on_android
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Build
+import android.provider.OpenableColumns
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -49,6 +52,12 @@ class MainActivity : FlutterActivity() {
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
 
+    // Step 3：本地安装兜底——系统文件选择器（ACTION_OPEN_DOCUMENT）的挂起结果。
+    // 原生层把用户所选文件拷贝到 filesDir/imports 后再回给 Dart，避免 SAF 的
+    // content:// URI 在 proot 子进程里不可读（proot 只能读真实文件路径）。
+    private var pendingPickResult: MethodChannel.Result? = null
+    private val pickRequestCode = 0x2001
+
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
         MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
@@ -63,6 +72,35 @@ class MainActivity : FlutterActivity() {
                             result.success(exec(command, timeoutSec))
                         }
                         "installRootfs" -> result.success(installRootfs())
+                        // ---- Step 3 · 本地安装兜底：系统文件选择器 ----
+                        "pickInstallFile" -> {
+                            pendingPickResult = result
+                            // startActivityForResult 必须在主线程调用
+                            runOnUiThread {
+                                try {
+                                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                                        addCategory(Intent.CATEGORY_OPENABLE)
+                                        type = "*/*"
+                                        putExtra(
+                                            Intent.EXTRA_MIME_TYPES,
+                                            arrayOf(
+                                                "application/gzip",
+                                                "application/x-gzip",
+                                                "application/x-tar",
+                                                "application/octet-stream",
+                                            ),
+                                        )
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    startActivityForResult(intent, pickRequestCode)
+                                } catch (e: Exception) {
+                                    pendingPickResult = null
+                                    result.success(
+                                        mapOf("ok" to false, "error" to "无法打开文件选择器: ${e.message}"),
+                                    )
+                                }
+                            }
+                        }
                         // ---- Step 2 文件操作（全部限定在 /root/projects 内）----
                         "fileList" -> {
                             val path = call.argument<String>("path") ?: "/root/projects"
@@ -103,6 +141,49 @@ class MainActivity : FlutterActivity() {
         executor.shutdownNow()
         super.onDestroy()
     }
+
+    /** 文件选择器回调：拷贝所选文件到 filesDir/imports（后台线程），再回结果。 */
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == pickRequestCode) {
+            val r = pendingPickResult
+            pendingPickResult = null
+            if (resultCode != RESULT_OK || data?.data == null) {
+                r?.success(mapOf("ok" to false, "error" to "已取消选择"))
+                return
+            }
+            val uri = data.data!!
+            // 183MB 级拷贝放后台线程，避免阻塞主线程（ANR）
+            executor.execute {
+                try {
+                    val importDir = File(filesDir, "imports").apply { mkdirs() }
+                    val displayName = queryDisplayName(uri) ?: "jdk_install.tar.gz"
+                    val safe = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                    val dest = File(importDir, safe)
+                    val input = contentResolver.openInputStream(uri)
+                        ?: throw IllegalStateException("无法读取所选文件")
+                    input.use { ins ->
+                        dest.outputStream().use { out -> ins.copyTo(out, 1 shl 16) }
+                    }
+                    r?.success(
+                        mapOf(
+                            "ok" to true,
+                            "path" to dest.absolutePath,
+                            "name" to dest.name,
+                            "size" to dest.length(),
+                        ),
+                    )
+                } catch (e: Exception) {
+                    r?.success(mapOf("ok" to false, "error" to "复制文件失败: ${e.message}"))
+                }
+            }
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    private fun queryDisplayName(uri: Uri): String? =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
 
     // ---------------- 环境信息 ----------------
 
@@ -188,16 +269,34 @@ class MainActivity : FlutterActivity() {
             return fail(-403, "rootfs 未安装：请回到主页点击「初始化环境」。")
         }
 
-        // proot -R = 绑定 /dev /proc /sys 等推荐目录；-0 = 模拟 root；TERM=dumb 避免控制序列
+        // proot 参数（Bug 404）：不用 -R！-R 会绑定宿主系统文件（/etc/passwd、
+        // /etc/group、/tmp 等推荐路径），Android 宿主没有这些文件 → 容器内 apt
+        // 找不到 _apt 用户、apt-key 写 /tmp 失败、源签名验证失败。
+        // 改用 -0 -r + 显式绑定 /dev /proc /sys：容器内全部使用 rootfs 自身文件。
+        // --link2symlink（Bug 407）：Android 沙箱禁 link()，dpkg 解压含硬链接的包
+        // （如 unzip 的 zipinfo→unzip）报 Permission denied、status-old 备份也失败；
+        // 该参数把硬链接转为符号链接，apt/dpkg 正常。
+        // -0 = 模拟 root；TERM=dumb 避免控制序列
+        // 注入 1（Bug 402 根因）：rootfs 打包时烤入了构建机内网 resolv.conf（如 10.x），
+        // 真机容器内 glibc 解析失败 → apt/pub/gradle 全部网络失败。每次 exec 幂等修正：
+        // 若 resolv.conf 无公共 DNS 则写入阿里/腾讯/谷歌三行，已有则不动。
+        // 详见 dev-handbook 04 十节 10.6。
+        // 注入 2：加载 /etc/profile.d/foa-env.sh（镜像配置器写入的 Flutter/Dart 镜像、
+        // ANDROID_HOME/JAVA_HOME/GRADLE_USER_HOME/PATH），构建命令自动生效。
+        val boot = "if ! grep -qE '^nameserver (223\\.5\\.5\\.5|119\\.29\\.29\\.29|8\\.8\\.8\\.8|114\\.114\\.114\\.114|1\\.1\\.1\\.1)' /etc/resolv.conf 2>/dev/null; then printf 'nameserver 223.5.5.5\\nnameserver 119.29.29.29\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; fi; [ -f /etc/profile.d/foa-env.sh ] && . /etc/profile.d/foa-env.sh; "
         val cmd = listOf(
             proot.absolutePath,
-            "-R", rootfs.absolutePath,
             "-0",
+            "-r", rootfs.absolutePath,
+            "-b", "/dev",
+            "-b", "/proc",
+            "-b", "/sys",
+            "--link2symlink",
             "-w", "/root",
             "/usr/bin/env", "-i",
             "HOME=/root", "TERM=dumb",
             "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
-            "/bin/sh", "-c", command,
+            "/bin/sh", "-c", boot + command,
         )
 
         return try {
