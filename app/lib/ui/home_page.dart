@@ -212,7 +212,7 @@ class _HomePageState extends State<HomePage> {
       body: switch (_tab) {
         0 => _buildProjectsTab(env),
         1 => _buildConfigTab(env),
-        _ => _buildSettingsTab(env),
+        _ => _buildSettingsTab(),
       },
     );
   }
@@ -224,22 +224,25 @@ class _HomePageState extends State<HomePage> {
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
         children: [
-          _StatusCard(env: env),
-          const SizedBox(height: 12),
-          _ActionCard(env: env),
-          const SizedBox(height: 16),
           _buildProjectsSection(env),
         ],
       ),
     );
   }
 
-  /// 配置页：工具链（JDK / Android SDK / Flutter SDK / x64 兼容层 / 构建镜像）
-  /// + 构建 APK 入口 + 方案说明。
+  /// 配置页：环境状态/操作 + 工具链（JDK / Android SDK / Flutter SDK /
+  /// x64 兼容层 / 构建镜像）+ 构建 APK 入口 + 方案说明。
   Widget _buildConfigTab(EnvState env) {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        const Text('环境',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        _StatusCard(env: env),
+        const SizedBox(height: 12),
+        _ActionCard(env: env),
+        const SizedBox(height: 16),
         const Text('工具链',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
@@ -286,8 +289,8 @@ class _HomePageState extends State<HomePage> {
                   'Flutter 官方 Linux 仅发布 x64 工具链；aarch64 上由「x64 兼容层」'
                   '用 qemu 转发 dart / gen_snapshot / aapt2 等 x64 二进制，'
                   '即可在设备上原生构建 arm64 APK。\n'
-                  '安装顺序建议：先应用「x64 兼容层(QEMU)」，再安装 Flutter SDK；'
-                  '装反了可点兼容层「重新应用」自动补上转发。',
+                  '安装顺序：先应用「x64 兼容层(QEMU)」，再安装 Flutter / Android SDK；'
+                  '若已装反顺序无需卸载——点兼容层「重新应用」自动补上转发。',
                   style: TextStyle(
                       fontSize: 12,
                       color: Colors.grey.shade500,
@@ -301,16 +304,11 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 设置页：环境信息 + 外观主题 + 工作区同步 + 关于。
-  Widget _buildSettingsTab(EnvState env) {
+  /// 设置页：外观主题 + 工作区同步 + 关于（环境状态已移至「配置」页）。
+  Widget _buildSettingsTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const Text('环境',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 8),
-        _StatusCard(env: env),
-        const SizedBox(height: 16),
         const Text('外观',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
@@ -425,7 +423,7 @@ class _HomePageState extends State<HomePage> {
                         Text('Flutter On Android',
                             style: TextStyle(
                                 fontSize: 15, fontWeight: FontWeight.bold)),
-                        Text('v0.1.0-alpha.24 · 在 Android 上原生构建 APK',
+                        Text('v0.1.0-alpha.25 · 在 Android 上原生构建 APK',
                             style: TextStyle(fontSize: 12)),
                       ],
                     ),

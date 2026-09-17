@@ -228,7 +228,17 @@ for d in "$S"/build-tools/* "$S"/platform-tools; do
     mv "$f" "$b"
   done
 done
-DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq qemu-user-static libc6:amd64 libstdc++6:amd64 libgcc-s1:amd64 zlib1g:amd64 libatomic1:amd64 2>&1 | tail -n 5 || true
+# 卸载核心：apt purge 失败会残留 qemu → 出现"卸载没效果"。此前
+# `purge ... | tail || true` 管道吞掉 apt 退出码，失败也报成功。
+# 现在逐条捕获状态：purge 非零 → 报错退出；qemu 仍在 → 报错退出。
+DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq qemu-user-static libc6:amd64 libstdc++6:amd64 libgcc-s1:amd64 zlib1g:amd64 libatomic1:amd64 > /tmp/foa_purge.log 2>&1
+rc=$?
+if [ "$rc" != 0 ]; then
+  echo "PURGE_FAILED rc=$rc"
+  tail -n 15 /tmp/foa_purge.log
+  exit 2
+fi
+[ -x @QEMU@ ] && { echo QEMU_STILL_PRESENT; exit 3; }
 dpkg --remove-architecture amd64 2>/dev/null || true
 echo UNINSTALL_OK
 ''';
@@ -385,13 +395,21 @@ echo UNINSTALL_OK
   // ---------------- 卸载 ----------------
 
   static Future<void> uninstall(ProotBridge bridge, EnvInfo env) async {
-    await bridge.exec(
+    final r = await bridge.exec(
       _uninstallScript
           .replaceAll('@SDK@', sdkHome)
           .replaceAll('@ENGINE@', engineDir)
           .replaceAll('@FLUTTER@', flutterHome),
       timeoutSec: 600,
     );
+    final out = r.stdout.trim();
+    if (!r.ok ||
+        out.contains('PURGE_FAILED') ||
+        out.contains('QEMU_STILL_PRESENT')) {
+      throw DownloadException(
+        'x64 兼容层卸载失败：${out.isEmpty ? r.stderr.trim() : out}',
+      );
+    }
     await _removeGradleOverride(env.rootfsPath);
   }
 

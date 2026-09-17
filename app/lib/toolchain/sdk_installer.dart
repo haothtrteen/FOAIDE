@@ -230,7 +230,15 @@ class AndroidSdkInstaller {
       return null;
     }
     final v = r.stdout.trim();
-    return v.isEmpty ? null : v;
+    if (v.isEmpty) return null;
+    // aapt2/adb 为 x64 宿主二进制：兼容层未装/已卸载时 Exec format error，
+    // 返回「需兼容层」提示而非把报错当版本号（避免"已安装"假象）。
+    if (v.contains('cannot execute') ||
+        v.contains('Exec format') ||
+        v.contains('error while loading shared libraries')) {
+      return 'Android SDK 已安装（x64 工具需先应用「x64 兼容层(QEMU)」）';
+    }
+    return v;
   }
 
   /// 完整安装：apt 工具 → 逐组件下载（快路径跳过）→ unzip 归位 → licenses → 验证。

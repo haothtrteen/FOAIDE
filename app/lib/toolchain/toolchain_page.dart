@@ -49,6 +49,7 @@ enum SdkPhase {
   extracting,
   validating,
   installed,
+  uninstalling,
   error,
 }
 
@@ -466,8 +467,17 @@ class _ToolchainPageState extends State<ToolchainPage> {
     final ok = await _confirm(
         '卸载 Android SDK', '将删除 /opt/android-sdk（约 1.3GB，含解压后），确定？');
     if (!ok) return;
-    await AndroidSdkInstaller.uninstall(_bridge);
-    await _refreshAll();
+    setState(() => _asdkPhase = SdkPhase.uninstalling);
+    try {
+      await AndroidSdkInstaller.uninstall(_bridge);
+      await _refreshAll();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _asdkPhase = SdkPhase.error;
+        _asdkError = e.toString();
+      });
+    }
   }
 
   // ============================ Flutter SDK ============================
@@ -612,8 +622,17 @@ class _ToolchainPageState extends State<ToolchainPage> {
     final ok = await _confirm(
         '卸载 Flutter SDK', '将删除 /opt/flutter（约 3GB，含解压后），确定？');
     if (!ok) return;
-    await FlutterSdkInstaller.uninstall(_bridge);
-    await _refreshAll();
+    setState(() => _flPhase = SdkPhase.uninstalling);
+    try {
+      await FlutterSdkInstaller.uninstall(_bridge);
+      await _refreshAll();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _flPhase = SdkPhase.error;
+        _flError = e.toString();
+      });
+    }
   }
 
   // ============================ x64 兼容层(QEMU) ============================
@@ -821,11 +840,24 @@ class _ToolchainPageState extends State<ToolchainPage> {
   @override
   Widget build(BuildContext context) {
     final rootfsReady = _env?.rootfsInstalled == true;
+    // 顺序门控：SDK 工具为 x64 宿主二进制，须先应用兼容层再装 SDK。
+    final sdkOrderReady = _qemuPhase == QemuPhase.installed;
     return Scaffold(
       appBar: AppBar(title: const Text('工具链')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          _QemuCard(
+            phase: _qemuPhase,
+            info: _qemuInfo,
+            error: _qemuError,
+            rootfsReady: rootfsReady,
+            verifying: _qemuVerifying,
+            onApply: _qemuApply,
+            onVerify: _qemuVerify,
+            onUninstall: _qemuUninstall,
+          ),
+          const SizedBox(height: 12),
           _JdkCard(
             phase: _phase,
             progress: _progress,
@@ -856,6 +888,9 @@ class _ToolchainPageState extends State<ToolchainPage> {
                 '解压到容器内 /opt/android-sdk 并预置许可。',
             verifying: _asdkVerifying,
             rootfsReady: rootfsReady,
+            orderReady: sdkOrderReady,
+            orderHint: '需先应用上方「x64 兼容层(QEMU)」再安装：aapt2/adb 为 '
+                'x64 宿主二进制，无 QEMU 转发无法执行，构建会失败。',
             onInstall: _asdkInstall,
             onVerify: _asdkVerify,
             onCancel: _asdkCancel,
@@ -878,26 +913,18 @@ class _ToolchainPageState extends State<ToolchainPage> {
                 '本方案保留官方 x64 dart-sdk 原样，由「x64 兼容层(QEMU)」统一转发 '
                 'dart/gen_snapshot/aapt2 等 x64 二进制后即可在 aarch64 上执行 '
                 'flutter build apk。\n'
-                '建议先应用兼容层再安装本 SDK；装反了可点兼容层「重新应用」自动补上。'
                 '国内源（flutter-io.cn 官方中国镜像）优先；解压到容器内 /opt/flutter。',
             verifying: _flVerifying,
             rootfsReady: rootfsReady,
+            orderReady: sdkOrderReady,
+            orderHint: '需先应用上方「x64 兼容层(QEMU)」再安装：flutter_tools.snapshot '
+                '为 x64 快照，dart 须经 QEMU 转发后才不会报 "Snapshot not compatible"。\n'
+                '若已装反顺序无需卸载——点兼容层「重新应用」会自动补上转发。',
             onInstall: _flInstall,
             onVerify: _flVerify,
             onCancel: _flCancel,
             onUninstall: _flUninstall,
             onInstallLocal: _flInstallFromLocal,
-          ),
-          const SizedBox(height: 12),
-          _QemuCard(
-            phase: _qemuPhase,
-            info: _qemuInfo,
-            error: _qemuError,
-            rootfsReady: rootfsReady,
-            verifying: _qemuVerifying,
-            onApply: _qemuApply,
-            onVerify: _qemuVerify,
-            onUninstall: _qemuUninstall,
           ),
           const SizedBox(height: 12),
           _MirrorCard(
@@ -1132,6 +1159,8 @@ class _SdkCard extends StatelessWidget {
   final VoidCallback onCancel;
   final VoidCallback onUninstall;
   final VoidCallback onInstallLocal;
+  final bool orderReady; // 前置依赖就绪（如 x64 兼容层已应用）才允许安装
+  final String orderHint; // orderReady=false 时展示的安装门槛提示
 
   const _SdkCard({
     required this.title,
@@ -1150,6 +1179,8 @@ class _SdkCard extends StatelessWidget {
     required this.onCancel,
     required this.onUninstall,
     required this.onInstallLocal,
+    required this.orderReady,
+    required this.orderHint,
   });
 
   String get _statusLabel => switch (phase) {
@@ -1161,6 +1192,7 @@ class _SdkCard extends StatelessWidget {
         SdkPhase.importing => '正在导入本地文件…',
         SdkPhase.extracting => '正在解压…',
         SdkPhase.validating => '正在验证…',
+        SdkPhase.uninstalling => '正在卸载…',
         SdkPhase.idle => '$title 未安装',
       };
 
@@ -1264,6 +1296,14 @@ class _SdkCard extends StatelessWidget {
                       ),
                     ),
                   ),
+                ] else if (phase == SdkPhase.uninstalling) ...[
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: null,
+                      icon: const Icon(Icons.delete_outline, size: 18),
+                      label: const Text('正在卸载…'),
+                    ),
+                  ),
                 ] else if (busy) ...[
                   Expanded(
                     child: FilledButton.tonalIcon(
@@ -1275,7 +1315,9 @@ class _SdkCard extends StatelessWidget {
                 ] else ...[
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: rootfsReady ? onInstall : null,
+                      // 顺序门控：前置依赖（x64 兼容层）未就绪时禁用安装，
+                      // 避免小白先装 SDK 后装兼容层导致验证失败/困惑。
+                      onPressed: orderReady && rootfsReady ? onInstall : null,
                       icon: const Icon(Icons.download, size: 18),
                       label: const Text('下载并安装'),
                     ),
@@ -1283,12 +1325,40 @@ class _SdkCard extends StatelessWidget {
                 ],
               ],
             ),
-            if (!busy && phase != SdkPhase.installed) ...[
+            if (!orderReady && rootfsReady &&
+                phase == SdkPhase.idle) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0x33FFB74D),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.info_outline,
+                        size: 16, color: Color(0xFFFFB74D)),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        orderHint,
+                        style: const TextStyle(
+                            fontSize: 12, color: Color(0xFFFFB74D), height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (!busy &&
+                phase != SdkPhase.installed &&
+                phase != SdkPhase.uninstalling) ...[
               const SizedBox(height: 8),
               SizedBox(
                 width: double.infinity,
                 child: OutlinedButton.icon(
-                  onPressed: rootfsReady ? onInstallLocal : null,
+                  // 本地导入同样受顺序门控：前置依赖未就绪时禁用。
+                  onPressed: orderReady && rootfsReady ? onInstallLocal : null,
                   icon: const Icon(Icons.folder_open, size: 18),
                   label: const Text('从本地存储选择安装'),
                 ),
