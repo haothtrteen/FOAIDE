@@ -4,15 +4,18 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Step 1 核心：proot 桥。
@@ -87,6 +90,22 @@ class MainActivity : FlutterActivity() {
                             val timeoutSec = (call.argument<Number>("timeoutSec") ?: 180).toLong()
                             result.success(exec(command, timeoutSec))
                         }
+                        // ---- Step 6 构建：流式执行（长任务，轮询增量输出 + 可取消）----
+                        "execStream" -> {
+                            val command = call.argument<String>("command") ?: ""
+                            val timeoutSec = (call.argument<Number>("timeoutSec") ?: 7200).toLong()
+                            result.success(execStream(command, timeoutSec))
+                        }
+                        "execStreamPoll" -> {
+                            val id = (call.argument<Number>("id") ?: -1L).toLong()
+                            val offset = (call.argument<Number>("offset") ?: 0).toInt()
+                            result.success(execStreamPoll(id, offset))
+                        }
+                        "execStreamStop" -> {
+                            val id = (call.argument<Number>("id") ?: -1L).toLong()
+                            result.success(execStreamStop(id))
+                        }
+                        "installApk" -> installApkAsync(result, call.argument<String>("path") ?: "")
                         "installRootfs" -> result.success(installRootfs())
                         // ---- Step 3 · 本地安装兜底：系统文件选择器 ----
                         "pickInstallFile" -> {
@@ -439,15 +458,20 @@ class MainActivity : FlutterActivity() {
         return synced
     }
 
-    private fun exec(command: String, timeoutSec: Long): Map<String, Any> {
-        val start = System.currentTimeMillis()
+    /**
+     * 构建 proot 命令（Step 1 定稿；Step 6 流式执行复用）。
+     * proot/rootfs 未就绪时返回 ProotCmd(null, error)。
+     */
+    private data class ProotCmd(val cmd: List<String>?, val error: Map<String, Any>?)
+
+    private fun buildProotCmd(command: String): ProotCmd {
         // 先补齐依赖再定位 proot：findProot() 的 assets 兜底路径依赖本次同步
         ensureProotRuntime()
         val proot = findProot()
-            ?: return fail(-404, "proot 二进制未找到。\n请先运行 ./tools/fetch_assets.sh，并参考 SETUP_ANDROID.md 把它放进 jniLibs 或 assets。")
+            ?: return ProotCmd(null, fail(-404, "proot 二进制未找到。\n请先运行 ./tools/fetch_assets.sh，并参考 SETUP_ANDROID.md 把它放进 jniLibs 或 assets。"))
         val rootfs = File(filesDir, ROOTFS_REL)
         if (!File(rootfs, "bin/sh").exists()) {
-            return fail(-403, "rootfs 未安装：请回到主页点击「初始化环境」。")
+            return ProotCmd(null, fail(-403, "rootfs 未安装：请回到主页点击「初始化环境」。"))
         }
 
         // proot 参数（Bug 404）：不用 -R！-R 会绑定宿主系统文件（/etc/passwd、
@@ -465,23 +489,32 @@ class MainActivity : FlutterActivity() {
         // 注入 2：加载 /etc/profile.d/foa-env.sh（镜像配置器写入的 Flutter/Dart 镜像、
         // ANDROID_HOME/JAVA_HOME/GRADLE_USER_HOME/PATH），构建命令自动生效。
         val boot = "if ! grep -qE '^nameserver (223\\.5\\.5\\.5|119\\.29\\.29\\.29|8\\.8\\.8\\.8|114\\.114\\.114\\.114|1\\.1\\.1\\.1)' /etc/resolv.conf 2>/dev/null; then printf 'nameserver 223.5.5.5\\nnameserver 119.29.29.29\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; fi; [ -f /etc/profile.d/foa-env.sh ] && . /etc/profile.d/foa-env.sh; "
-        val cmd = listOf(
-            proot.absolutePath,
-            "-0",
-            "-r", rootfs.absolutePath,
-            "-b", "/dev",
-            "-b", "/proc",
-            "-b", "/sys",
-            "--link2symlink",
-            "-w", "/root",
-            "/usr/bin/env", "-i",
-            "HOME=/root", "TERM=dumb",
-            "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
-            "/bin/sh", "-c", boot + command,
+        return ProotCmd(
+            listOf(
+                proot.absolutePath,
+                "-0",
+                "-r", rootfs.absolutePath,
+                "-b", "/dev",
+                "-b", "/proc",
+                "-b", "/sys",
+                "--link2symlink",
+                "-w", "/root",
+                "/usr/bin/env", "-i",
+                "HOME=/root", "TERM=dumb",
+                "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
+                "/bin/sh", "-c", boot + command,
+            ),
+            null,
         )
+    }
+
+    private fun exec(command: String, timeoutSec: Long): Map<String, Any> {
+        val start = System.currentTimeMillis()
+        val built = buildProotCmd(command)
+        if (built.cmd == null) return built.error!!
 
         return try {
-            val pb = ProcessBuilder(cmd)
+            val pb = ProcessBuilder(built.cmd)
             // Termux 构建的 proot 默认 loader 路径指向 com.termux 包，
             // 用 PROOT_LOADER 重定向到本应用私有目录（实测有效）。
             findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
@@ -520,6 +553,134 @@ class MainActivity : FlutterActivity() {
                     "请确认 android/app/build.gradle 中 targetSdk 为 28 后重新构建。"
             } else ""
             fail(-500, "启动 proot 失败: $msg$hint")
+        }
+    }
+
+    // ---------------- Step 6 · 流式执行（构建日志） ----------------
+
+    /** 运行中的流式命令：进程 + 合并输出缓冲（stdout/stderr 单流保时序）。 */
+    private class StreamingCmd(val process: Process, val buffer: StringBuffer) {
+        val lock = Any()
+        @Volatile var finished = false
+        @Volatile var exitCode: Int? = null
+    }
+
+    private val streamingCmds = ConcurrentHashMap<Long, StreamingCmd>()
+    private val streamSeq = AtomicLong(0)
+
+    /**
+     * 启动流式命令（构建用，超时默认 2h）。
+     * 输出合并进内存缓冲（redirectErrorStream），Dart 侧轮询取增量；
+     * 读取在独立线程，不阻塞 MethodChannel 的单线程 executor。
+     */
+    private fun execStream(command: String, timeoutSec: Long): Map<String, Any> {
+        val built = buildProotCmd(command)
+        if (built.cmd == null) return built.error!!
+        return try {
+            val pb = ProcessBuilder(built.cmd)
+            findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
+            pb.environment()["LD_LIBRARY_PATH"] = File(filesDir, "tools").absolutePath
+            val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
+            pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
+            pb.redirectErrorStream(true) // 合并：gradle/flutter 多线程输出交错，单流保时序
+            val proc = pb.start()
+            val id = streamSeq.incrementAndGet()
+            val sc = StreamingCmd(proc, StringBuffer())
+            streamingCmds[id] = sc
+            Thread {
+                try {
+                    val reader = proc.inputStream.bufferedReader(Charsets.UTF_8)
+                    val buf = CharArray(8192)
+                    while (true) {
+                        val n = try { reader.read(buf) } catch (_: Exception) { -1 }
+                        if (n <= 0) break
+                        synchronized(sc.lock) { sc.buffer.append(buf, 0, n) }
+                    }
+                    val finished = proc.waitFor(timeoutSec, TimeUnit.SECONDS)
+                    sc.exitCode = if (finished) proc.exitValue() else {
+                        proc.destroyForcibly()
+                        -999
+                    }
+                } catch (_: Exception) {
+                    if (sc.exitCode == null) sc.exitCode = -500
+                } finally {
+                    sc.finished = true
+                }
+            }.apply { name = "foa-stream-$id" }.start()
+            mapOf("ok" to true, "id" to id)
+        } catch (e: Exception) {
+            fail(-500, "启动 proot 失败: ${e.message}")
+        }
+    }
+
+    /** 轮询增量输出：返回自 offset 起的新增文本（锁内快照，读尽后清理任务）。 */
+    private fun execStreamPoll(id: Long, offset: Int): Map<String, Any?> {
+        val sc = streamingCmds[id] ?: return mapOf<String, Any?>(
+            "ok" to false, "error" to "未知任务 id=$id")
+        val chunk: String
+        val len: Int
+        synchronized(sc.lock) {
+            len = sc.buffer.length
+            chunk = if (offset >= len) "" else sc.buffer.substring(offset, len)
+        }
+        if (sc.finished && offset >= len) streamingCmds.remove(id)
+        return mapOf<String, Any?>(
+            "ok" to true,
+            "running" to !sc.finished,
+            "chunk" to chunk,
+            "len" to len,
+            "exitCode" to sc.exitCode,
+        )
+    }
+
+    /** 取消：SIGTERM → 短等 → 强杀，再关流让读取线程退出（防 gradle daemon 继承管道卡死）。 */
+    private fun execStreamStop(id: Long): Map<String, Any?> {
+        val sc = streamingCmds[id]
+            ?: return mapOf<String, Any?>("ok" to true, "killed" to false)
+        return try {
+            sc.process.destroy()
+            if (!sc.finished && !sc.process.waitFor(3, TimeUnit.SECONDS)) {
+                sc.process.destroyForcibly()
+            }
+            try { sc.process.inputStream.close() } catch (_: Exception) {}
+            mapOf<String, Any?>("ok" to true, "killed" to true)
+        } catch (e: Exception) {
+            mapOf<String, Any?>("ok" to false, "error" to e.message)
+        }
+    }
+
+    // ---------------- Step 6 · APK 安装 ----------------
+
+    private var pendingInstallResult: MethodChannel.Result? = null
+
+    /**
+     * 安装 APK：FileProvider 授权 content:// 给系统安装器（ACTION_VIEW，
+     * application/vnd.android.package-archive）。real 必须是宿主白名单路径
+     * （filesDir 内，含 rootfs 下的构建产物）；startActivity 必须主线程。
+     */
+    private fun installApkAsync(result: MethodChannel.Result, real: String) {
+        val f = resolveHostPath(real) ?: return result.success(fileFail("路径不在白名单内: $real"))
+        if (!f.exists() || !f.isFile) return result.success(fileFail("APK 不存在: $real"))
+        val uri = try {
+            FileProvider.getUriForFile(this, "dev.foa.flutter_on_android.fileprovider", f)
+        } catch (e: Exception) {
+            return result.success(fileFail("FileProvider 授权失败: ${e.message}"))
+        }
+        pendingInstallResult = result
+        runOnUiThread {
+            try {
+                val intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+                pendingInstallResult?.success(mapOf("ok" to true))
+            } catch (e: Exception) {
+                pendingInstallResult?.success(fileFail("拉起安装器失败: ${e.message}"))
+            } finally {
+                pendingInstallResult = null
+            }
         }
     }
 

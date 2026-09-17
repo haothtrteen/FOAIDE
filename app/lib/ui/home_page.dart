@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../toolchain/build_page.dart';
 import '../env/env_installer.dart';
 import '../editor/editor_page.dart';
 import '../filemanager/file_browser_page.dart';
@@ -206,6 +207,14 @@ class _ActionCard extends StatelessWidget {
                       onTap: () => Navigator.of(context).push(
                         MaterialPageRoute(
                             builder: (_) => const ToolchainPage()),
+                      ),
+                    ),
+                    _ActionTile(
+                      icon: Icons.phone_android,
+                      label: '构建 APK',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                            builder: (_) => const BuildPage()),
                       ),
                     ),
                   ],

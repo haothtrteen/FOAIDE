@@ -211,6 +211,15 @@ class FileBrowserBridge {
     return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }
 
+  // ---------------- Step 6 · APK 安装 ----------------
+
+  /// 安装 APK：FileProvider 授权 content:// 拉起系统安装器。
+  /// path 为真实宿主路径（filesDir 内，含 rootfs 下的构建产物）。
+  Future<FsOpResult> installApk(String realPath) async {
+    final raw = await _channel.invokeMethod('installApk', {'path': realPath});
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
   /// 系统文件选择器导入任意文件到容器 /root/imports，返回容器路径。
   Future<ImportedFile> pickImport() async {
     try {

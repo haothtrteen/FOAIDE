@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Step 6：APK 安装 FileProvider 路径映射（installApk 白名单外还需 FileProvider 授权） -->
+<paths>
+    <!-- filesDir：容器 rootfs 内的构建产物（/root/projects/.../build/app/outputs/flutter-apk） -->
+    <files-path name="files" path="." />
+    <!-- 外部存储应用目录：/storage/emulated/0/Android/data/<pkg>/files -->
+    <external-files-path name="ext_files" path="." />
+</paths>

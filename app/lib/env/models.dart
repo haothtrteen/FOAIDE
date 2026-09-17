@@ -87,3 +87,46 @@ class InstallResult {
         error: m['error'] as String?,
       );
 }
+
+/// Step 6 流式命令启动结果（构建用长任务）。
+class ExecStreamStart {
+  final bool ok;
+  final int id;
+  final String? error;
+
+  const ExecStreamStart({required this.ok, this.id = -1, this.error});
+
+  factory ExecStreamStart.fromMap(Map<Object?, Object?> m) => ExecStreamStart(
+        ok: m['ok'] == true,
+        id: (m['id'] as num?)?.toInt() ?? -1,
+        error: m['error'] as String?,
+      );
+}
+
+/// Step 6 流式命令轮询结果：自 offset 起的新增输出快照。
+class ExecStreamPoll {
+  final bool ok;
+  final bool running;
+  final String chunk; // 本次新增文本（原样，含 ANSI/\r，Dart 侧清洗）
+  final int len; // 缓冲总长度（下次轮询的 offset）
+  final int? exitCode; // 已结束时非空
+  final String? error;
+
+  const ExecStreamPoll({
+    required this.ok,
+    required this.running,
+    this.chunk = '',
+    this.len = 0,
+    this.exitCode,
+    this.error,
+  });
+
+  factory ExecStreamPoll.fromMap(Map<Object?, Object?> m) => ExecStreamPoll(
+        ok: m['ok'] == true,
+        running: m['running'] == true,
+        chunk: m['chunk'] as String? ?? '',
+        len: (m['len'] as num?)?.toInt() ?? 0,
+        exitCode: (m['exitCode'] as num?)?.toInt(),
+        error: m['error'] as String?,
+      );
+}

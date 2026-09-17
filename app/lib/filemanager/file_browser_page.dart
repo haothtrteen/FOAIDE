@@ -47,8 +47,10 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
   late final FileBrowserBridge _bridge = widget.bridge ?? FileBrowserBridge();
   late final ProotBridge _proot = widget.proot ?? ProotBridge();
 
-  String _dir = '/'; // 当前浏览目录（容器 /… / 宿主真实路径 / virtual://）
-  _Domain _domain = _Domain.container;
+  // 首次打开默认虚拟根目录（各域入口 + 项目工作区同步），
+  // 之后由导航（进入子目录 / 返回上一级）在 容器域/宿主域/虚拟根 间切换。
+  String _dir = _virtualRoot;
+  _Domain _domain = _Domain.virtual;
   List<FsBrowserEntry> _entries = [];
   bool _loading = true;
   String? _error;
