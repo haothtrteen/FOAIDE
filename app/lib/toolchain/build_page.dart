@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import '../filemanager/fs_browser_bridge.dart';
+import 'toolchain_ensure.dart';
 
 /// Step 6 构建页：项目列表 → 流式构建日志 → 取消 → 安装 APK。
 ///
@@ -152,9 +153,20 @@ class _BuildPageState extends State<BuildPage> {
     _lines.add('  目录：$_projectsDir/$name');
     _lines.add('');
 
+    // flutter 工具硬依赖 git，缺失时先自动安装（幂等；已装秒过）
+    final gitErr = await ToolchainEnsure().git();
+    if (!mounted) return;
+    if (gitErr != null) {
+      setState(() {
+        _status = _BuildStatus.error;
+        _lines.add('✗ $gitErr');
+      });
+      return;
+    }
+
     final cmd =
-        'cd $_projectsDir/${_q(name)} && flutter build apk --release '
-        '--target-platform=android-arm64';
+        'cd $_projectsDir/${_q(name)} && FLUTTER_ALLOW_ROOT=true '
+        'flutter build apk --release --target-platform=android-arm64';
     final start = await _bridge.execStream(cmd);
     if (!mounted) return;
     if (!start.ok || start.id <= 0) {

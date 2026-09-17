@@ -24,6 +24,8 @@ class _HomePageState extends State<HomePage> {
 
   List<FsBrowserEntry> _projects = const [];
   bool _didLoad = false; // 防重复加载标志
+  int _tab = 0; // 0 工程 / 1 设置（底部导航）
+  bool _syncing = false;
 
   @override
   void initState() {
@@ -137,6 +139,26 @@ class _HomePageState extends State<HomePage> {
     _loadProjects();
   }
 
+  /// 外部工作区 ↔ 容器 双向同步（设置页）。
+  Future<void> _sync(String direction) async {
+    setState(() => _syncing = true);
+    final r = await _fb.syncProjects(direction);
+    if (!mounted) return;
+    setState(() => _syncing = false);
+    final label = direction == 'toContainer' ? '同步到容器' : '同步到外部';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          r.ok
+              ? '$label完成：${r.files} 个文件'
+              : '$label失败：${r.error}',
+        ),
+        duration: const Duration(seconds: 4),
+      ),
+    );
+    if (r.ok && direction == 'toContainer') _loadProjects();
+  }
+
   // ============================ 构建 ============================
 
   @override
@@ -158,25 +180,172 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _showCreateSheet,
-        tooltip: '创建 Demo 工程',
-        child: const Icon(Icons.add),
+      floatingActionButton: _tab == 0
+          ? FloatingActionButton(
+              onPressed: _showCreateSheet,
+              tooltip: '创建 Demo 工程',
+              child: const Icon(Icons.add),
+            )
+          : null,
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) => setState(() => _tab = i),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.folder_outlined),
+            selectedIcon: Icon(Icons.folder),
+            label: '工程',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings),
+            label: '设置',
+          ),
+        ],
       ),
-      body: RefreshIndicator(
-        onRefresh: _loadProjects,
-        child: ListView(
-          physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
-          children: [
-            _StatusCard(env: env),
-            const SizedBox(height: 12),
-            _ActionCard(env: env),
-            const SizedBox(height: 16),
-            _buildProjectsSection(env),
-          ],
+      body: _tab == 0 ? _buildProjectsTab(env) : _buildSettingsTab(env),
+    );
+  }
+
+  Widget _buildProjectsTab(EnvState env) {
+    return RefreshIndicator(
+      onRefresh: _loadProjects,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
+        children: [
+          _StatusCard(env: env),
+          const SizedBox(height: 12),
+          _ActionCard(env: env),
+          const SizedBox(height: 16),
+          _buildProjectsSection(env),
+        ],
+      ),
+    );
+  }
+
+  /// 设置页：环境信息 + 工作区同步 + 工具链 + 关于。
+  Widget _buildSettingsTab(EnvState env) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('环境',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        _StatusCard(env: env),
+        const SizedBox(height: 16),
+        const Text('项目工作区',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '容器 /root/projects ↔ 外部 /sdcard/Android/data/<包名>/projects 双向同步，'
+                  '让系统文件管理器 / 电脑可以直接读写项目文件。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _syncing ? null : () => _sync('toContainer'),
+                        icon: const Icon(Icons.south, size: 18),
+                        label: const Text('外部 → 容器'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _syncing ? null : () => _sync('toExternal'),
+                        icon: const Icon(Icons.north, size: 18),
+                        label: const Text('容器 → 外部'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
         ),
-      ),
+        const SizedBox(height: 16),
+        const Text('工具',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Card(
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.build),
+                title: const Text('工具链'),
+                subtitle: const Text('JDK / Android SDK / Flutter SDK / 构建镜像'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const ToolchainPage()),
+                ),
+              ),
+              const Divider(height: 1, indent: 56),
+              ListTile(
+                leading: const Icon(Icons.phone_android),
+                title: const Text('构建 APK'),
+                subtitle: const Text('项目列表 · 流式日志 · 安装'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const BuildPage()),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Text('关于',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.primaryContainer,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Icon(Icons.flutter_dash, size: 22),
+                    ),
+                    const SizedBox(width: 12),
+                    const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Flutter On Android',
+                            style: TextStyle(
+                                fontSize: 15, fontWeight: FontWeight.bold)),
+                        Text('v0.1.0-alpha.22 · 在 Android 上原生构建 APK',
+                            style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '内置 Debian rootfs（proot 模拟 root）+ 本地 JDK / Android SDK / Flutter SDK，'
+                  '内置官方 Demo 模板，在设备上完成创建 → 编辑 → 构建 → 安装全流程。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
     );
   }
 
