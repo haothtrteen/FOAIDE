@@ -900,6 +900,32 @@ mv "$d" /opt/flutter                 # 必报 cannot stat
 
 ---
 
+### 10.13 · Flutter 工具链 x64 快照不兼容：`Snapshot not compatible ... requires x64 linux ... VM has arm64`（Bug 412，2026-09-17 真机抓到）
+
+**症状**：aarch64 容器内用**官方 x64 Flutter SDK** 执行任何 `flutter` 命令必报：
+```
+Snapshot not compatible: /opt/flutter/bin/cache/flutter_tools.snapshot
+  requires x64 linux, and the current machine is arm64 linux (VM has arm64)
+```
+（此前误以为换 arm64 dart-sdk 即可，实则 `flutter_tools.snapshot` 是 **app-jit 快照、含 x64 机器码**，与 dart VM 架构强绑定，架构不匹配必炸。）
+
+**原因**：Flutter 官方 Linux 仅发布 x64 宿主构建（`releases_linux.json` 全量检索无 arm64），且 `bin/cache/flutter_tools.snapshot` 为架构相关的 app-jit 快照。`bin/cache/dart-sdk/bin/dart`、`dartaotruntime` 等也是 x64 ELF，arm64 直接 exec 报 `Exec format error`；就算用 arm64 dart 加载 x64 快照也报 `Snapshot not compatible`。引擎宿主产物同理：`gen_snapshot`、`impellerc`、`font-subset` 官方只发布 `linux-x64`（Flutter issue #189724/#168980 已核实）。
+
+**解决**（方案 A：官方 SDK + QEMU 全链转发，`qemu_compat.dart`）：
+- 容器内装 `qemu-user-static`（静态 aarch64）+ `libc6:amd64 / libstdc++6:amd64 / libgcc-s1:amd64 / zlib1g:amd64 / libatomic1:amd64` 多架构运行库；
+- `bin/cache/dart-sdk/bin/` 下 x64 ELF **原地改名 `.foa-real`**，生成 qemu 转发脚本：`exec qemu-x86_64-static -L / <原二进制> "$@"`。`flutter`（bash 脚本）照常按路径调用 `dart`，经转发脚本进入 qemu 模拟，x64 快照由 x64 dart VM 加载即恢复；qemu 内 fork 的 x64 子进程（frontend_server、gen_snapshot）由 qemu 继续模拟，全链路自洽；
+- 引擎产物：为每个 `artifacts/engine/android-*/linux-x64` 生成 `linux-arm64/` 目录，内含指向 `../linux-x64/<tool>` 的转发脚本——不复制大文件、不改官方原件，缓存 stamp 校验不受影响；
+- `sdk_installer.dart` 相应**移除 arm64 dart-sdk 替换逻辑**，保留官方 x64 dart-sdk 原样；安装顺序建议先应用兼容层再装 Flutter SDK（装反了可点兼容层「重新应用」补上转发）。
+
+**验证**：`verify()` 内置分步冒烟：qemu-x86_64-static 存在 → qemu 能运行 x86_64 动态链接器（`/lib64/ld-linux-x86-64.so.2`，验多架构 glibc）→ 包装后 gen_snapshot `--help` 无 "cannot execute"/"shared libraries" 报错。真机逐卡片全流程待装机确认。
+
+**教训**：
+- **快照是架构相关的**：app-jit / app-aot 快照含目标机器码，换 VM 架构必炸——"换 arm64 dart 就能跑 x64 快照"是想当然，真机复现为准；
+- 官方 SDK 宿主工具（gen_snapshot 等）只发 x64 是长期现状，arm64 设备要跑官方工具链必须走翻译层（qemu）或社区重编译（termux-flutter-wsl），二选一不可兼得；
+- 架构问题必须真机验证：沙箱是 x86_64，`Exec format error`/`Snapshot not compatible` 只在 arm64 宿主暴露。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
