@@ -636,7 +636,7 @@ Termux 构建 proot 时把 `P_tmpdir` 硬编码为 `/data/data/com.termux/files/
 | 文件系统 | dpkg 解压 `Permission denied` | Android 禁 `link()`，Debian 包内硬链接 | proot `--link2symlink` | 10.11 |
 | dpkg 状态 | `E: dpkg was interrupted` | 前次失败留半安装中间态 + 残留锁 | apt 前置恢复三步（清锁 / --configure -a / -f install） | 10.9 |
 
-**2026-09-17 真机复测通过**：工具链卡片（Android SDK / Flutter SDK）下载安装全流程跑通——apt 阶段零报错、组件下载/SHA 校验/解压成功、`verify()` 输出版本号。
+**2026-09-17 真机复测通过（apt 链 + Android SDK）**：工具链卡片 apt 阶段零报错，Android SDK 组件下载/SHA 校验/解压/`verify()` 全流程通过。注意：**当时 Flutter SDK 未完整装机验证**（1.5GB 下载未跑完），后续真机暴露解压编排 bug（Bug 411，见 10.12，alpha.16 修复）——教训：DoD 必须逐卡片全流程跑完，"大部分通过"不算通过。
 
 **总教训**：多层失败链要靠「报错透传 + 逐层修复 + 每层修完真机回归」推进（402 DNS → 404 passwd → 407 link → 409 dpkg 状态，每修一层才暴露下一层）；包管理器状态自愈必须是安装前置步骤；rootfs 类"构建机生成、用户设备运行"的资产，生成侧中立化与运行时幂等自愈缺一不可。
 
@@ -806,7 +806,7 @@ E: Unable to locate package unzip
 
 **验证**：
 - 沙箱解包新 tarball：`/etc/passwd` 含 `root`/`_apt`，`/etc/group` 含 `_apt`，`/etc/hosts`、公共 DNS resolv.conf、`/tmp` 1777 全部就位；
-- 真机复测：工具链卡片 apt 阶段不再报 `_apt`/签名错误（2026-09-17 装机确认，工具链下载安装全流程通过，见 10.0 总览）。
+- 真机复测：工具链卡片 apt 阶段不再报 `_apt`/签名错误（2026-09-17 装机确认，Android SDK 全流程通过，见 10.0 总览）。
 
 **教训**：proot 的 `-R` 是给"浏览/调试"用的便利选项，**装包场景必须用 `-0 -r` + 显式白名单绑定**；rootfs 这类"随 APK 分发的系统镜像"要按"可运行的最小完整系统"验收（passwd/group/hosts 齐备），不能只看关键二进制在位。
 
@@ -869,9 +869,34 @@ E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct 
 
 **解决**：proot 启动参数加 `--link2symlink`——把容器内的硬链接语义转为符号链接实现，apt/dpkg 全流程正常（MainActivity `exec()` 已固化，平台模板同步修改）。
 
-**验证**：2026-09-17 真机：apt 安装 xz-utils/unzip 成功（dpkg 解压含硬链接的 unzip 包零报错），工具链下载安装全流程通过（见 10.0 总览）。
+**验证**：2026-09-17 真机：apt 安装 xz-utils/unzip 成功（dpkg 解压含硬链接的 unzip 包零报错），Android SDK 下载安装全流程通过（见 10.0 总览）。
 
 **教训**：与 Bug 209（rootfs tar 解压的 mknod/link 限制，**生成侧重打包**治本）对照——运行时才发生的包管理操作没法靠生成侧预处理，要靠 proot 参数（`--link2symlink`）在容器层抹平文件系统语义差异；rootfs 容器的验收清单必须包含「apt 装一个含硬链接的包」。
+
+### 10.12 · Flutter SDK 解压必失败：`mv: cannot stat '/opt/flutter'`（Bug 411，2026-09-17 真机抓到）
+
+**症状**：Flutter SDK 卡片安装到「解压」阶段必报：
+```
+Flutter 解压失败: mv: cannot stat '/opt/flutter': No such file or directory
+```
+（同屏 Android SDK 卡片正常、apt 阶段零报错——四层自愈链全部生效，本次是纯编排逻辑 bug，与前四层无关。）
+
+**原因**：解压命令链**自毁**——
+```
+d=$(ls -d /opt/flutter* | head -1)   # d = 刚解压出的 /opt/flutter 本身
+rm -rf /opt/flutter                  # 把要 mv 的源删了
+mv "$d" /opt/flutter                 # 必报 cannot stat
+```
+官方 Flutter tarball 顶层目录恰好叫 `flutter/`，glob 结果与归位目标同路径，**100% 复现**。该写法本意是防御"tarball 顶层目录名与目标不同（如 `flutter-3.47.4/`）需改名归位"，却没防住"恰好相同"的情形。对照：JDK 安装器无此问题（glob 是 `/opt/jdk-*`，与目标 `/opt/jdk` 不同路径）；Android SDK 安装器因用暂存目录天然免疫。
+
+**解决**：改暂存目录模式（与 `AndroidSdkInstaller` 对齐）：解压到 `/opt/foa-flutter-stage` → 取顶层目录 mv 归位 → 清暂存。源与目标**永不同路径**；旧 `/opt/flutter` 保留到解压成功后才删（中途失败不毁存量安装）。
+
+**验证**：沙箱 mock tarball（顶层 `flutter/`）实测三条——旧链报出与真机**逐字一致**的错误、新链 `FLUTTER_EXTRACT_OK` 且暂存目录清理干净、模拟 tar 中途失败后旧安装存活；release APK（alpha.16）`libapp.so` 断言：新暂存链在位、旧自毁 glob（`ls -d /opt/flutter*`）零残留；真机复测待装机确认。
+
+**教训**：
+- **容器内 shell 命令链必须先在沙箱实跑**（mock 一个小 tarball 就够）——代码审查拦不住"glob 命中归位目标自身"这种时序自毁；上一轮"工具链测试通过"实际只覆盖了 apt 链与 Android SDK，Flutter tarball 从未端到端装机过，bug 因此拖到用户手上；
+- `rm 旧目录 + mv 新目录` 模式只在**源 ≠ 目标**时成立；源路径来自 glob/`ls` 时，必须解压到独立暂存目录再 mv，保证源目标路径空间隔离；
+- 错误透传（Bug 402 起的惯例）再次立功：一行 `cannot stat` 即定位到自毁命令，无需额外日志。
 
 ---
 
