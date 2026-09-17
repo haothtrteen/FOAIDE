@@ -13,16 +13,55 @@ class DemoTemplate {
   final IconData icon;
   final String mainDart;
 
+  /// 是否依赖 git：空白工程为 false（本地离线组装，秒级创建）；
+  /// 其余模板走 flutter create（工具启动强制 git 检查），为 true。
+  final bool needsGit;
+
   const DemoTemplate({
     required this.id,
     required this.name,
     required this.description,
     required this.icon,
     required this.mainDart,
+    this.needsGit = true,
   });
 }
 
+const String kBlankTemplateId = 'blank';
+
 const List<DemoTemplate> kDemoTemplates = [
+  // Step 8：空白默认模板——离线生成（无需 git / 网络），默认选中，构建最快。
+  DemoTemplate(
+    id: kBlankTemplateId,
+    name: '空白工程',
+    description: '最小空白工程：本地离线生成，无需 Git，构建最快',
+    icon: Icons.auto_awesome_outlined,
+    needsGit: false,
+    mainDart: r'''
+import 'package:flutter/material.dart';
+
+void main() => runApp(const BlankApp());
+
+class BlankApp extends StatelessWidget {
+  const BlankApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '空白工程',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3DDC84)),
+      ),
+      home: const Scaffold(
+        body: Center(child: Text('Hello, Flutter!')),
+      ),
+    );
+  }
+}
+''',
+  ),
   DemoTemplate(
     id: 'counter',
     name: '计数器',

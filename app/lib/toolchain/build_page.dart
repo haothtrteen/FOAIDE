@@ -164,6 +164,14 @@ class _BuildPageState extends State<BuildPage> {
       return;
     }
 
+    // gradle 发行包统一走腾讯镜像（Step 8）：老工程仍是官方源 URL，哈希
+    // 与 Step 3 预下载缓存不匹配会直连 services.gradle.org；幂等改写，
+    // 失败仅警告不阻断（构建仍可尝试直连）。
+    final mirrorErr = await ToolchainEnsure().projectGradleMirror(name);
+    if (mirrorErr != null && mounted) {
+      setState(() => _lines.add('⚠ $mirrorErr'));
+    }
+
     final cmd =
         'cd $_projectsDir/${_q(name)} && FLUTTER_ALLOW_ROOT=true '
         'flutter build apk --release --target-platform=android-arm64';

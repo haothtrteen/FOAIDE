@@ -183,7 +183,7 @@ class _HomePageState extends State<HomePage> {
       floatingActionButton: _tab == 0
           ? FloatingActionButton(
               onPressed: _showCreateSheet,
-              tooltip: '创建 Demo 工程',
+              tooltip: '创建工程',
               child: const Icon(Icons.add),
             )
           : null,
@@ -329,7 +329,7 @@ class _HomePageState extends State<HomePage> {
                         Text('Flutter On Android',
                             style: TextStyle(
                                 fontSize: 15, fontWeight: FontWeight.bold)),
-                        Text('v0.1.0-alpha.22 · 在 Android 上原生构建 APK',
+                        Text('v0.1.0-alpha.23 · 在 Android 上原生构建 APK',
                             style: TextStyle(fontSize: 12)),
                       ],
                     ),
@@ -397,7 +397,7 @@ class _HomePageState extends State<HomePage> {
                       style: TextStyle(fontWeight: FontWeight.w600)),
                   const SizedBox(height: 4),
                   Text(
-                    '点击右下角「+」选择模板，创建内置 Flutter 官方 Demo 工程。',
+                    '点击右下角「+」选择模板：离线空白工程（免 Git，秒建）或内置 Flutter 官方 Demo。',
                     textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
                   ),
@@ -488,6 +488,13 @@ class _CreateDemoSheetState extends State<_CreateDemoSheet> {
   String _error = '';
 
   @override
+  void initState() {
+    super.initState();
+    // Step 8：空白工程为默认模板（离线生成、无需 git），打开即选中。
+    _selected = kDemoTemplates.first;
+  }
+
+  @override
   void dispose() {
     _ctrl.dispose();
     super.dispose();
@@ -541,7 +548,7 @@ class _CreateDemoSheetState extends State<_CreateDemoSheet> {
                     child: Icon(Icons.add, size: 18, color: cs.onPrimary),
                   ),
                   const SizedBox(width: 10),
-                  const Text('创建 Demo 工程',
+                  const Text('创建工程',
                       style: TextStyle(
                           fontSize: 16, fontWeight: FontWeight.bold)),
                   const Spacer(),
@@ -601,6 +608,32 @@ class _CreateDemoSheetState extends State<_CreateDemoSheet> {
                   for (final t in kDemoTemplates) _templateCard(t),
                 ],
               ),
+              if (_selected?.needsGit == true) ...[
+                const SizedBox(height: 10),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0x33FFB74D),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.cloud_download_outlined,
+                          size: 16, color: Color(0xFFFFB74D)),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '该模板由 flutter create 生成，需连接 Git 自动下载安装（国内镜像，首次约 1 分钟）；「空白工程」完全离线，推荐优先使用。',
+                          style: TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFFFFB74D),
+                              height: 1.4),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (_error.isNotEmpty) ...[
                 const SizedBox(height: 10),
                 SelectableText(
@@ -648,7 +681,17 @@ class _CreateDemoSheetState extends State<_CreateDemoSheet> {
         ),
         child: Row(
           children: [
-            Icon(t.icon, size: 26, color: sel ? cs.primary : cs.onSurfaceVariant),
+            // Step 8：非空白模板（需 git）在图标右上角显示「需Git」角标，
+            // 配合选中后的提示横幅提醒联网下载 git 组件。
+            Badge(
+              label: const Text('需Git', style: TextStyle(fontSize: 9)),
+              isLabelVisible: t.needsGit,
+              child: Icon(
+                t.icon,
+                size: 26,
+                color: sel ? cs.primary : cs.onSurfaceVariant,
+              ),
+            ),
             const SizedBox(width: 8),
             Expanded(
               child: Column(
