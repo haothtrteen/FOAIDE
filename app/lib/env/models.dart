@@ -5,6 +5,8 @@ class EnvInfo {
   final String nativeLibraryDir;
   final String rootfsPath;
   final bool rootfsInstalled;
+  // Step 4 文件浏览器宿主域根：外部 Android/data/<pkg>（无外部存储时为 null）
+  final String? externalDataDir;
   final String? prootPath;
   final String? abi;
   final int androidSdk;
@@ -16,6 +18,7 @@ class EnvInfo {
     required this.nativeLibraryDir,
     required this.rootfsPath,
     required this.rootfsInstalled,
+    this.externalDataDir,
     this.prootPath,
     this.abi,
     this.androidSdk = 0,
@@ -28,6 +31,7 @@ class EnvInfo {
         nativeLibraryDir: m['nativeLibraryDir'] as String? ?? '',
         rootfsPath: m['rootfsPath'] as String? ?? '',
         rootfsInstalled: m['rootfsInstalled'] as bool? ?? false,
+        externalDataDir: m['externalDataDir'] as String?,
         prootPath: m['prootPath'] as String?,
         abi: m['abi'] as String?,
         androidSdk: m['androidSdk'] as int? ?? 0,

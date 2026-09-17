@@ -157,6 +157,56 @@ class MainActivity : FlutterActivity() {
                             val path = call.argument<String>("path") ?: ""
                             result.success(fsDelete(path))
                         }
+                        "fsCopy" -> {
+                            result.success(
+                                fsCopy(
+                                    call.argument<String>("src") ?: "",
+                                    call.argument<String>("dst") ?: "",
+                                ),
+                            )
+                        }
+                        "fsMove" -> {
+                            result.success(
+                                fsMove(
+                                    call.argument<String>("src") ?: "",
+                                    call.argument<String>("dst") ?: "",
+                                ),
+                            )
+                        }
+                        // ---- Step 4 宿主域（真实路径）：/data 与 Android/data 白名单 ----
+                        "hostBrowse" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(hostBrowse(path))
+                        }
+                        "hostMkdir" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(hostMkdir(path))
+                        }
+                        "hostRename" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            val newName = call.argument<String>("newName") ?: ""
+                            result.success(hostRename(path, newName))
+                        }
+                        "hostDelete" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(hostDelete(path))
+                        }
+                        "hostCopy" -> {
+                            result.success(
+                                hostCopy(
+                                    call.argument<String>("src") ?: "",
+                                    call.argument<String>("dst") ?: "",
+                                ),
+                            )
+                        }
+                        "hostMove" -> {
+                            result.success(
+                                hostMove(
+                                    call.argument<String>("src") ?: "",
+                                    call.argument<String>("dst") ?: "",
+                                ),
+                            )
+                        }
                         "pickImportFile" -> {
                             pendingImportResult = result
                             runOnUiThread {
@@ -309,12 +359,18 @@ class MainActivity : FlutterActivity() {
             "nativeLibraryDir" to applicationInfo.nativeLibraryDir,
             "rootfsPath" to rootfs.absolutePath,
             "rootfsInstalled" to File(rootfs, "bin/sh").exists(),
+            // Step 4 文件浏览器宿主域根：内部 filesDir + 外部 Android/data/<pkg>
+            "externalDataDir" to externalDataDir()?.absolutePath,
             "prootPath" to findProot()?.absolutePath,
             "abi" to Build.SUPPORTED_ABIS.firstOrNull(),
             "androidSdk" to Build.VERSION.SDK_INT,
             "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
         )
     }
+
+    /** 外部存储的 app 专属目录：/storage/emulated/0/Android/data/<pkg>（getExternalFilesDir 的父级）。 */
+    private fun externalDataDir(): File? =
+        getExternalFilesDir(null)?.parentFile
 
     /** proot 定位：jniLibs 优先（不受 W^X 限制），assets 拷贝兜底（需 targetSdk 28） */
     private fun findProot(): File? {
@@ -702,9 +758,128 @@ class MainActivity : FlutterActivity() {
         else fileFail("删除失败: $guest")
     }
 
+    private fun fsCopy(srcGuest: String, dstGuest: String): Map<String, Any> {
+        val src = resolveRootfsPath(srcGuest) ?: return fileFail("非法源路径（仅允许 rootfs 内）: $srcGuest")
+        val dst = resolveRootfsPath(dstGuest) ?: return fileFail("非法目标路径（仅允许 rootfs 内）: $dstGuest")
+        return copyEntry(src, dst)
+    }
+
+    private fun fsMove(srcGuest: String, dstGuest: String): Map<String, Any> {
+        val src = resolveRootfsPath(srcGuest) ?: return fileFail("非法源路径（仅允许 rootfs 内）: $srcGuest")
+        val dst = resolveRootfsPath(dstGuest) ?: return fileFail("非法目标路径（仅允许 rootfs 内）: $dstGuest")
+        return moveEntry(src, dst)
+    }
+
+    // ---------------- Step 4 · 宿主域（真实路径：filesDir / Android/data/<pkg>）----------------
+
+    private fun hostRoots(): List<File> {
+        val roots = mutableListOf(filesDir)
+        externalDataDir()?.let { roots.add(it) }
+        return roots
+    }
+
+    /** 宿主域路径白名单校验：canonicalize 后必须在 filesDir 或 Android/data/<pkg> 内。 */
+    private fun resolveHostPath(real: String): File? {
+        if (real.isBlank()) return null
+        val target = File(real).canonicalFile
+        return hostRoots().firstOrNull { root ->
+            val r = root.canonicalFile
+            target == r || target.path.startsWith(r.path + File.separator)
+        }?.let { target }
+    }
+
+    private fun hostBrowse(real: String): Map<String, Any> {
+        val dir = resolveHostPath(real) ?: return fileFail("非法路径（仅允许 app 自有目录）: $real")
+        if (!dir.isDirectory) return fileFail("不是目录: $real")
+        val entries = dir.listFiles()?.sortedBy { it.name }?.map { f ->
+            mapOf(
+                "name" to f.name,
+                "isDir" to f.isDirectory,
+                "size" to (if (f.isFile) f.length() else 0L),
+                "mtime" to f.lastModified(),
+            )
+        } ?: emptyList()
+        return mapOf("ok" to true, "path" to real, "entries" to entries)
+    }
+
+    private fun hostMkdir(real: String): Map<String, Any> {
+        val f = resolveHostPath(real) ?: return fileFail("非法路径（仅允许 app 自有目录）: $real")
+        return if (f.exists()) fileFail("已存在: $real")
+        else if (f.mkdirs()) mapOf("ok" to true)
+        else fileFail("创建目录失败: $real")
+    }
+
+    private fun hostRename(real: String, newName: String): Map<String, Any> {
+        if (newName.isBlank() || newName.contains('/') || newName == "." || newName == "..") {
+            return fileFail("非法文件名: $newName")
+        }
+        val f = resolveHostPath(real) ?: return fileFail("非法路径（仅允许 app 自有目录）: $real")
+        if (!f.exists()) return fileFail("不存在: $real")
+        val dest = File(f.parentFile, newName)
+        if (dest.exists()) return fileFail("目标已存在: $newName")
+        return if (f.renameTo(dest)) mapOf("ok" to true)
+        else fileFail("重命名失败: $real → $newName")
+    }
+
+    private fun hostDelete(real: String): Map<String, Any> {
+        val f = resolveHostPath(real) ?: return fileFail("非法路径（仅允许 app 自有目录）: $real")
+        if (!f.exists()) return fileFail("不存在: $real")
+        return if (f.deleteRecursively()) mapOf("ok" to true)
+        else fileFail("删除失败: $real")
+    }
+
+    private fun hostCopy(srcReal: String, dstReal: String): Map<String, Any> {
+        val src = resolveHostPath(srcReal) ?: return fileFail("非法源路径（仅允许 app 自有目录）: $srcReal")
+        val dst = resolveHostPath(dstReal) ?: return fileFail("非法目标路径（仅允许 app 自有目录）: $dstReal")
+        return copyEntry(src, dst)
+    }
+
+    private fun hostMove(srcReal: String, dstReal: String): Map<String, Any> {
+        val src = resolveHostPath(srcReal) ?: return fileFail("非法源路径（仅允许 app 自有目录）: $srcReal")
+        val dst = resolveHostPath(dstReal) ?: return fileFail("非法目标路径（仅允许 app 自有目录）: $dstReal")
+        return moveEntry(src, dst)
+    }
+
+    // ---------------- 通用复制 / 移动（容器域与宿主域共用）----------------
+
+    /** 复制文件或目录到目标（含递归）；禁止复制到自身子目录内（无限递归）。 */
+    private fun copyEntry(src: File, dst: File): Map<String, Any> {
+        if (!src.exists()) return fileFail("源不存在: ${src.path}")
+        if (dst.exists()) return fileFail("目标已存在: ${dst.path}")
+        if (dst.canonicalFile.path.startsWith(src.canonicalFile.path + File.separator)) {
+            return fileFail("不能复制到自身子目录内: ${src.path} → ${dst.path}")
+        }
+        return try {
+            if (src.isDirectory) src.copyRecursively(dst, overwrite = false)
+            else src.copyTo(dst, overwrite = false)
+            mapOf("ok" to true)
+        } catch (e: Exception) {
+            fileFail("复制失败: ${e.message}")
+        }
+    }
+
+    /** 移动：优先 renameTo（同分区原子）；跨分区失败回退 复制+删除（保留源目录树）。 */
+    private fun moveEntry(src: File, dst: File): Map<String, Any> {
+        if (!src.exists()) return fileFail("源不存在: ${src.path}")
+        if (dst.exists()) return fileFail("目标已存在: ${dst.path}")
+        if (dst.canonicalFile.path.startsWith(src.canonicalFile.path + File.separator)) {
+            return fileFail("不能移动到自身子目录内: ${src.path} → ${dst.path}")
+        }
+        if (src.renameTo(dst)) return mapOf("ok" to true)
+        // 跨分区（如 /data/data ↔ /storage/emulated/0）：复制后删除源
+        return try {
+            if (src.isDirectory) src.copyRecursively(dst, overwrite = false)
+            else src.copyTo(dst, overwrite = false)
+            if (!src.deleteRecursively()) fileFail("已复制但源删除失败: ${src.path}") else mapOf("ok" to true)
+        } catch (e: Exception) {
+            fileFail("移动失败: ${e.message}")
+        }
+    }
+
     /** 导出：校验源文件后挂起 result，拉起 SAF 保存对话框（主线程）。 */
     private fun exportFile(result: MethodChannel.Result, guest: String, displayName: String) {
-        val f = resolveRootfsPath(guest)
+        // 兼容容器路径（rootfs 内）与宿主路径（filesDir / Android/data 内）
+        val f = resolveRootfsPath(guest) ?: resolveHostPath(guest)
         if (f == null || !f.isFile) {
             result.success(fileFail("非法路径或不是文件: $guest"))
             return

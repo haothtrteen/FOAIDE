@@ -126,6 +126,65 @@ class FileBrowserBridge {
     return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }
 
+  /// 复制文件或目录（容器域，递归；目标不得已存在/不得在源内部）。
+  Future<FsOpResult> copy(String src, String dst) async {
+    final raw = await _channel
+        .invokeMethod('fsCopy', {'src': src, 'dst': dst});
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  /// 移动文件或目录（容器域，递归；跨分区由原生回退复制+删除）。
+  Future<FsOpResult> move(String src, String dst) async {
+    final raw = await _channel
+        .invokeMethod('fsMove', {'src': src, 'dst': dst});
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  // ---------------- 宿主域（真实路径：filesDir / Android/data/<pkg>）----------------
+
+  /// 列出宿主域真实路径目录内容（白名单：app 自有目录）。
+  Future<FsBrowseResult> hostBrowse(String realPath) async {
+    final raw = await _channel
+        .invokeMethod('hostBrowse', {'path': realPath});
+    return FsBrowseResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  Future<FsOpResult> hostMkdir(String realPath) async {
+    final raw = await _channel
+        .invokeMethod('hostMkdir', {'path': realPath});
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  Future<FsOpResult> hostRename(String realPath, String newName) async {
+    final raw = await _channel.invokeMethod(
+      'hostRename',
+      {'path': realPath, 'newName': newName},
+    );
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  Future<FsOpResult> hostDelete(String realPath) async {
+    final raw = await _channel
+        .invokeMethod('hostDelete', {'path': realPath});
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  Future<FsOpResult> hostCopy(String srcReal, String dstReal) async {
+    final raw = await _channel.invokeMethod(
+      'hostCopy',
+      {'src': srcReal, 'dst': dstReal},
+    );
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  Future<FsOpResult> hostMove(String srcReal, String dstReal) async {
+    final raw = await _channel.invokeMethod(
+      'hostMove',
+      {'src': srcReal, 'dst': dstReal},
+    );
+    return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
   /// 系统文件选择器导入任意文件到容器 /root/imports，返回容器路径。
   Future<ImportedFile> pickImport() async {
     try {

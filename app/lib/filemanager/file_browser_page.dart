@@ -1,20 +1,20 @@
 import 'package:flutter/material.dart';
 
+import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import 'fs_browser_bridge.dart';
 
-/// Step 4 · 文件浏览器：浏览当前 app 的完整数据（rootfs 容器视角）。
+/// Step 4 · 文件浏览器：浏览当前 app 的完整数据。
 ///
-/// 能力：
-/// - 浏览：面包屑导航（点任意层级跳回）、返回上级、刷新、空目录占位；
-/// - 解压：zip / tar.gz / tgz / tar.xz / tar → 解压到当前目录下的同名子目录
-///   （走容器 exec，unzip/tar 已由工具链 apt 安装）；
-/// - 导出：任意文件 → 系统保存对话框（SAF ACTION_CREATE_DOCUMENT）；
-/// - 导入：系统文件选择器 → 容器 /root/imports（自动跳转过去，可直接解压）；
-/// - CRUD：新建文件夹、重命名、删除（二次确认）。
+/// 三个浏览域（域 = 路径语义空间，切换靠虚拟根入口）：
+/// - 容器域（container）：rootfs 视角（/ 开头 = filesDir/rootfs/debian/...），
+///   项目区 /root/projects、SDK /opt、导入区 /root/imports 都在其中；解压仅此域；
+/// - 宿主域（host）：真实文件系统（filesDir / Android/data/<pkg>），原生白名单校验；
+/// - 虚拟根（virtual）：根目录再返回上一级到达，展示三个"虚假链接目录"入口。
 ///
-/// 根目录 = 容器 /（= filesDir/rootfs/debian，app 的数据主体）；
-/// 项目区 /root/projects、SDK /opt、导入区 /root/imports 都在其中。
+/// 能力：浏览（面包屑/返回上级/刷新）、解压（zip/tar*，容器 exec）、导出（SAF）、
+/// 导入（SAF → 容器 /root/imports）、新建/重命名/删除、复制/移动/粘贴（文件与目录
+/// 通用，支持跨域——容器 ↔ 宿主经 rootfsPath 前缀互转）。
 class FileBrowserPage extends StatefulWidget {
   final FileBrowserBridge? bridge;
   final ProotBridge? proot;
@@ -25,17 +25,47 @@ class FileBrowserPage extends StatefulWidget {
   State<FileBrowserPage> createState() => _FileBrowserPageState();
 }
 
+enum _Domain { virtual, container, host }
+
+/// 剪贴板项（复制/移动）。path 为当前域语义路径。
+class _Clip {
+  final String path;
+  final bool isCut;
+  const _Clip({required this.path, required this.isCut});
+}
+
 class _FileBrowserPageState extends State<FileBrowserPage> {
+  static const _virtualRoot = 'virtual://';
+
   late final FileBrowserBridge _bridge = widget.bridge ?? FileBrowserBridge();
   late final ProotBridge _proot = widget.proot ?? ProotBridge();
-  String _dir = '/'; // 当前浏览目录（容器内路径）
+
+  String _dir = '/'; // 当前浏览目录（容器 /… / 宿主真实路径 / virtual://）
+  _Domain _domain = _Domain.container;
   List<FsBrowserEntry> _entries = [];
   bool _loading = true;
   String? _error;
+  EnvInfo _env = const EnvInfo(
+    filesDir: '',
+    cacheDir: '',
+    nativeLibraryDir: '',
+    rootfsPath: '',
+    rootfsInstalled: false,
+  );
+  _Clip? _clip; // 复制/移动剪贴板
+
+  bool get _isVirtual => _dir == _virtualRoot;
 
   @override
   void initState() {
     super.initState();
+    _loadEnv();
+  }
+
+  Future<void> _loadEnv() async {
+    final env = await _proot.envInfo();
+    if (!mounted) return;
+    setState(() => _env = env);
     _load();
   }
 
@@ -44,7 +74,11 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       _loading = true;
       _error = null;
     });
-    final r = await _bridge.browse(_dir);
+    final r = _isVirtual
+        ? const FsBrowseResult(ok: true)
+        : _domain == _Domain.container
+            ? await _bridge.browse(_dir)
+            : await _bridge.hostBrowse(_dir);
     if (!mounted) return;
     if (!r.ok) {
       setState(() {
@@ -59,44 +93,78 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     });
   }
 
-  bool get _canGoUp => _dir != '/';
+  // ---------------- 路径/域导航 ----------------
+
+  bool get _canGoUp {
+    if (_isVirtual) return false;
+    // 容器域 '/'、宿主域根（filesDir / externalDataDir）再返回 → 虚拟根
+    return true;
+  }
+
+  List<String> get _hostRoots => [
+        _env.filesDir,
+        if (_env.externalDataDir != null) _env.externalDataDir!,
+      ].where((p) => p.isNotEmpty).toList();
 
   void _goUp() {
-    if (!_canGoUp) return;
+    if (_isVirtual) return;
+    if (_domain == _Domain.container) {
+      if (_dir == '/') {
+        setState(() {
+          _domain = _Domain.virtual;
+          _dir = _virtualRoot;
+        });
+        _load();
+        return;
+      }
+      setState(() {
+        _dir = _dir.substring(0, _dir.lastIndexOf('/'));
+        if (_dir.isEmpty) _dir = '/';
+      });
+      _load();
+      return;
+    }
+    // 宿主域
+    if (_hostRoots.contains(_dir)) {
+      setState(() {
+        _domain = _Domain.virtual;
+        _dir = _virtualRoot;
+      });
+      _load();
+      return;
+    }
     setState(() {
-      _dir = _dir == '/' ? '/' : _dir.substring(0, _dir.lastIndexOf('/'));
-      if (_dir.isEmpty) _dir = '/';
+      _dir = _dir.substring(0, _dir.lastIndexOf('/'));
     });
     _load();
   }
 
-  void _enter(String path) {
-    setState(() => _dir = path);
+  /// 进入子目录（保持当前域）。
+  void _enter(FsBrowserEntry e) {
+    setState(() {
+      _dir = _domain == _Domain.container
+          ? e.pathOf(_dir)
+          : '$_dir/${e.name}';
+    });
     _load();
   }
 
-  /// 面包屑分段（含根）。如 /root/projects/a → ['/', '/root', '/root/projects', ...]。
-  List<String> get _crumbs {
-    final parts = _dir.split('/').where((s) => s.isNotEmpty).toList();
-    final list = <String>['/'];
-    var acc = '';
-    for (final p in parts) {
-      acc = '$acc/$p';
-      list.add(acc);
-    }
-    return list;
+  /// 虚拟根入口跳转。
+  void _jumpTo({required _Domain domain, required String path}) {
+    setState(() {
+      _domain = domain;
+      _dir = path;
+    });
+    _load();
   }
 
-  void _onTap(FsBrowserEntry e) {
-    if (e.isDir) {
-      _enter(e.pathOf(_dir));
-    }
-  }
+  // ---------------- 解压 / 导入 / 导出 ----------------
 
-  // ---------------- 操作 ----------------
-
-  /// 解压到当前目录下的同名子目录（重名自动加 -1/-2）。
   Future<void> _extract(FsBrowserEntry entry, String path) async {
+    if (_domain != _Domain.container) {
+      _toast('解压仅支持容器内文件（可在虚拟根进入「根目录」后操作）');
+      return;
+    }
     final lower = entry.name.toLowerCase();
     final String? tool;
     final String destFlag;
@@ -116,7 +184,6 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       _toast('不支持的压缩格式（支持 zip / tar.gz / tar.xz / tar）');
       return;
     }
-    // 目标目录：去掉扩展名的文件名；已存在则追加 -1/-2...
     var base = entry.name;
     for (final ext in ['.tar.gz', '.tar.xz', '.tgz', '.txz', '.zip', '.tar']) {
       if (base.toLowerCase().endsWith(ext)) {
@@ -133,7 +200,6 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       i++;
     }
 
-    // 确认对话框（大文件提示耗时）
     final go = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -153,7 +219,6 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     );
     if (go != true || !mounted) return;
 
-    // 进度对话框（exec 阻塞期间显示，完成后关闭）
     showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -165,7 +230,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       timeoutSec: 600,
     );
     if (!mounted) return;
-    Navigator.of(context, rootNavigator: true).pop(); // 关进度框
+    Navigator.of(context, rootNavigator: true).pop();
     if (r.exitCode == 0) {
       _toast('解压完成');
       _load();
@@ -176,14 +241,12 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     }
   }
 
-  /// 导出文件到系统。
   Future<void> _export(FsBrowserEntry entry, String path) async {
     final r = await _bridge.export(path, entry.name);
     if (!mounted) return;
     _toast(r.ok ? '已导出' : (r.error ?? '导出失败'));
   }
 
-  /// 导入文件：SAF 选择 → 落容器 /root/imports → 自动跳转过去。
   Future<void> _import() async {
     final r = await _bridge.pickImport();
     if (!mounted) return;
@@ -192,20 +255,119 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       return;
     }
     _toast('已导入 ${r.name}');
-    setState(() => _dir = '/root/imports');
+    setState(() {
+      _domain = _Domain.container;
+      _dir = '/root/imports';
+    });
     _load();
   }
 
-  /// 新建文件夹。
+  // ---------------- 复制 / 移动 / 粘贴 ----------------
+
+  void _copyEntry(FsBrowserEntry entry, String path) {
+    setState(() => _clip = _Clip(path: path, isCut: false));
+    _toast('已复制：${entry.name}（到目标目录粘贴）');
+  }
+
+  void _moveEntry(FsBrowserEntry entry, String path) {
+    setState(() => _clip = _Clip(path: path, isCut: true));
+    _toast('已剪切：${entry.name}（到目标目录粘贴）');
+  }
+
+  void _clearClip() => setState(() => _clip = null);
+
+  /// 容器路径 ↔ 宿主真实路径互转（rootfsPath 前缀）。
+  String _containerToHost(String guest) =>
+      guest == '/' ? _env.rootfsPath : '${_env.rootfsPath}$guest';
+
+  String? _hostToContainer(String real) {
+    final rp = _env.rootfsPath;
+    if (real == rp) return '/';
+    if (real.startsWith('$rp/')) return real.substring(rp.length);
+    return null; // 不在 rootfs 内，无法转容器路径
+  }
+
+  /// 粘贴：源（_clip，含其域）→ 当前目录（目标域）。同域直调；跨域先转路径。
+  Future<void> _paste() async {
+    final clip = _clip;
+    if (clip == null || _isVirtual) return;
+
+    final srcDomain = _domainOf(clip.path);
+    final dstDomain = _domain;
+    final dstDir = _dir;
+    final targetName = clip.path.split('/').last;
+
+    String? srcPath; // 原生操作需要的路径（容器路径或真实路径）
+    String? dstPath;
+    bool useHost = false;
+    try {
+      if (srcDomain == _Domain.container && dstDomain == _Domain.container) {
+        srcPath = clip.path;
+        dstPath = '$dstDir/$targetName';
+      } else if (srcDomain == _Domain.host && dstDomain == _Domain.host) {
+        useHost = true;
+        srcPath = clip.path;
+        dstPath = '$dstDir/$targetName';
+      } else if (srcDomain == _Domain.container && dstDomain == _Domain.host) {
+        useHost = true;
+        srcPath = _containerToHost(clip.path);
+        dstPath = '$dstDir/$targetName';
+      } else if (srcDomain == _Domain.host && dstDomain == _Domain.container) {
+        final guest = _hostToContainer(clip.path);
+        if (guest == null) {
+          _toast('该文件不在容器内，无法粘贴到容器（可用「导出」到系统再导入）');
+          return;
+        }
+        srcPath = guest;
+        dstPath = '$dstDir/$targetName';
+      } else {
+        return;
+      }
+    } catch (_) {
+      _toast('路径转换失败');
+      return;
+    }
+
+    final r = useHost
+        ? (clip.isCut
+            ? await _bridge.hostMove(srcPath, dstPath)
+            : await _bridge.hostCopy(srcPath, dstPath))
+        : (clip.isCut
+            ? await _bridge.move(srcPath, dstPath)
+            : await _bridge.copy(srcPath, dstPath));
+    if (!mounted) return;
+    if (!r.ok) {
+      _toast(r.error ?? '操作失败');
+      return;
+    }
+    _toast(clip.isCut ? '已移动' : '已复制');
+    if (clip.isCut) _clearClip();
+    _load();
+  }
+
+  _Domain _domainOf(String path) {
+    if (path == _virtualRoot) return _Domain.virtual;
+    return _hostRoots.any((r) => path == r || path.startsWith('$r/'))
+        ? _Domain.host
+        : _Domain.container;
+  }
+
+  // ---------------- CRUD ----------------
+
   Future<void> _createDir() async {
+    if (_isVirtual) return;
     final name = await _promptText(
       title: '新建文件夹',
       hint: '文件夹名称',
       confirmLabel: '创建',
     );
     if (name == null) return;
-    final path = _dir == '/' ? '/$name' : '$_dir/$name';
-    final r = await _bridge.mkdir(path);
+    final path = _domain == _Domain.container
+        ? (_dir == '/' ? '/$name' : '$_dir/$name')
+        : '$_dir/$name';
+    final r = _domain == _Domain.container
+        ? await _bridge.mkdir(path)
+        : await _bridge.hostMkdir(path);
     if (!mounted) return;
     if (!r.ok) {
       _toast(r.error ?? '创建失败');
@@ -214,7 +376,6 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     _load();
   }
 
-  /// 重命名。
   Future<void> _rename(String path, String oldName) async {
     final name = await _promptText(
       title: '重命名',
@@ -223,7 +384,9 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       confirmLabel: '重命名',
     );
     if (name == null || name == oldName) return;
-    final r = await _bridge.rename(path, name);
+    final r = _domain == _Domain.container
+        ? await _bridge.rename(path, name)
+        : await _bridge.hostRename(path, name);
     if (!mounted) return;
     if (!r.ok) {
       _toast(r.error ?? '重命名失败');
@@ -232,7 +395,6 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     _load();
   }
 
-  /// 删除（二次确认）。
   Future<void> _delete(String path, String name) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -253,7 +415,9 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       ),
     );
     if (confirmed != true) return;
-    final r = await _bridge.delete(path);
+    final r = _domain == _Domain.container
+        ? await _bridge.delete(path)
+        : await _bridge.hostDelete(path);
     if (!mounted) return;
     if (!r.ok) {
       _toast(r.error ?? '删除失败');
@@ -262,9 +426,11 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     _load();
   }
 
-  /// 长按/更多菜单：解压、导出、重命名、删除。
   void _showMenu(FsBrowserEntry entry) {
-    final path = entry.pathOf(_dir);
+    final path = _domain == _Domain.container
+        ? entry.pathOf(_dir)
+        : '$_dir/${entry.name}';
+    final canExtract = !entry.isDir && _domain == _Domain.container;
     showModalBottomSheet<void>(
       context: context,
       builder: (ctx) => SafeArea(
@@ -277,7 +443,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
               subtitle: Text(path),
             ),
             const Divider(height: 1),
-            if (!entry.isDir) ...[
+            if (canExtract)
               ListTile(
                 leading: const Icon(Icons.unarchive_outlined),
                 title: const Text('解压到当前目录'),
@@ -286,15 +452,30 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                   _extract(entry, path);
                 },
               ),
-              ListTile(
-                leading: const Icon(Icons.upload_file_outlined),
-                title: const Text('导出到系统'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _export(entry, path);
-                },
-              ),
-            ],
+            ListTile(
+              leading: const Icon(Icons.copy_outlined),
+              title: const Text('复制'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _copyEntry(entry, path);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.drive_file_move_outlined),
+              title: const Text('移动'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _moveEntry(entry, path);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.upload_file_outlined),
+              title: const Text('导出到系统'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _export(entry, path);
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.drive_file_rename_outline),
               title: const Text('重命名'),
@@ -399,15 +580,27 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       appBar: AppBar(
         title: const Text('文件浏览器'),
         actions: [
+          if (_clip != null)
+            IconButton(
+              tooltip: _clip!.isCut ? '粘贴（移动）' : '粘贴（复制）',
+              icon: const Icon(Icons.content_paste_go),
+              onPressed: _isVirtual || _loading ? null : _paste,
+            ),
+          if (_clip != null)
+            IconButton(
+              tooltip: '取消剪贴板',
+              icon: const Icon(Icons.close),
+              onPressed: _clearClip,
+            ),
           IconButton(
-            tooltip: '导入文件',
+            tooltip: '导入文件（到容器 /root/imports）',
             icon: const Icon(Icons.file_download_outlined),
             onPressed: _loading ? null : _import,
           ),
           IconButton(
             tooltip: '新建文件夹',
             icon: const Icon(Icons.create_new_folder_outlined),
-            onPressed: _loading ? null : _createDir,
+            onPressed: _isVirtual || _loading ? null : _createDir,
           ),
           IconButton(
             tooltip: '刷新',
@@ -421,14 +614,84 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
           children: [
             _buildPathBar(),
             const Divider(height: 1),
-            Expanded(child: _buildList()),
+            Expanded(child: _isVirtual ? _buildVirtualRoot() : _buildList()),
           ],
         ),
       ),
     );
   }
 
+  /// 虚拟根：根目录再返回上一级后显示的"虚假链接目录"入口页。
+  Widget _buildVirtualRoot() {
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+          child: Text(
+            '虚拟上级目录：从这里可跳转到 app 的不同数据区域',
+            style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+          ),
+        ),
+        _VirtualEntryTile(
+          icon: Icons.folder_special_outlined,
+          title: '根目录',
+          subtitle: '容器完整文件系统（rootfs）：项目区 /root/projects、SDK /opt、导入区 /root/imports',
+          onTap: () =>
+              _jumpTo(domain: _Domain.container, path: '/'),
+        ),
+        _VirtualEntryTile(
+          icon: Icons.storage_outlined,
+          title: 'app 自身 /data 目录',
+          subtitle: '应用内部私有数据（filesDir）：$_envDirLabel(_env.filesDir)',
+          onTap: _env.filesDir.isEmpty
+              ? null
+              : () => _jumpTo(domain: _Domain.host, path: _env.filesDir),
+        ),
+        _VirtualEntryTile(
+          icon: Icons.sd_storage_outlined,
+          title: 'app 自身 Android/data 目录',
+          subtitle: _env.externalDataDir == null
+              ? '当前设备无外部存储'
+              : '外部存储应用目录：$_envDirLabel(_env.externalDataDir!)',
+          onTap: _env.externalDataDir == null
+              ? null
+              : () => _jumpTo(
+                    domain: _Domain.host,
+                    path: _env.externalDataDir!,
+                  ),
+        ),
+      ],
+    );
+  }
+
+  String _envDirLabel(String real) {
+    final f = _env.filesDir;
+    if (real == f) return '/data/user/0/<pkg>';
+    final e = _env.externalDataDir;
+    if (e != null && real == e) return '/storage/emulated/0/Android/data/<pkg>';
+    return real;
+  }
+
   Widget _buildPathBar() {
+    if (_isVirtual) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+        child: Row(
+          children: [
+            IconButton(
+              tooltip: '返回上一级',
+              onPressed: null,
+              icon: const Icon(Icons.arrow_upward, size: 18),
+            ),
+            const Text(
+              '虚拟根',
+              style: TextStyle(fontSize: 13, color: Color(0xFF3DDC84)),
+            ),
+          ],
+        ),
+      );
+    }
     final crumbs = _crumbs;
     return Padding(
       padding: const EdgeInsets.fromLTRB(4, 4, 4, 0),
@@ -450,7 +713,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                           size: 14, color: Colors.grey),
                     InkWell(
                       onTap: () {
-                        if (crumbs[i] != _dir) _enter(crumbs[i]);
+                        if (crumbs[i] != _dir) _jumpToPath(crumbs[i]);
                       },
                       child: Padding(
                         padding: const EdgeInsets.symmetric(
@@ -477,6 +740,28 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
         ],
       ),
     );
+  }
+
+  /// 面包屑：容器域按 / 分段；宿主域整路径显示（前缀已用虚拟根说明，此处
+  /// 显示真实路径，便于区分内部/外部存储）。
+  List<String> get _crumbs {
+    if (_domain == _Domain.container) {
+      final parts = _dir.split('/').where((s) => s.isNotEmpty).toList();
+      final list = <String>['/'];
+      var acc = '';
+      for (final p in parts) {
+        acc = '$acc/$p';
+        list.add(acc);
+      }
+      return list;
+    }
+    return [_dir];
+  }
+
+  void _jumpToPath(String path) {
+    if (path == _dir) return;
+    setState(() => _dir = path);
+    _load();
   }
 
   Widget _buildList() {
@@ -548,7 +833,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                 style: const TextStyle(fontSize: 11, color: Colors.grey),
               ),
             IconButton(
-              tooltip: '更多操作（解压 / 导出 / 重命名 / 删除）',
+              tooltip: '更多操作（复制 / 移动 / 导出 / 重命名 / 删除）',
               visualDensity: VisualDensity.compact,
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
@@ -559,6 +844,10 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
         ),
       ),
     );
+  }
+
+  void _onTap(FsBrowserEntry e) {
+    if (e.isDir) _enter(e);
   }
 
   IconData _fileIcon(String name) {
@@ -572,7 +861,10 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       return Icons.archive_outlined;
     }
     if (l.endsWith('.apk')) return Icons.android;
-    if (l.endsWith('.png') || l.endsWith('.jpg') || l.endsWith('.jpeg') || l.endsWith('.webp')) {
+    if (l.endsWith('.png') ||
+        l.endsWith('.jpg') ||
+        l.endsWith('.jpeg') ||
+        l.endsWith('.webp')) {
       return Icons.image_outlined;
     }
     return Icons.description_outlined;
@@ -582,6 +874,38 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
     return '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
+  }
+}
+
+/// 虚拟根入口卡片。
+class _VirtualEntryTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback? onTap;
+
+  const _VirtualEntryTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: Icon(icon, color: onTap == null ? Colors.grey : Colors.amber.shade300),
+      title: Text(title, style: const TextStyle(fontSize: 14)),
+      subtitle: Text(
+        subtitle,
+        style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+      ),
+      trailing: onTap == null
+          ? Icon(Icons.lock_outline, size: 14, color: Colors.grey.shade700)
+          : const Icon(Icons.chevron_right, size: 18, color: Colors.grey),
+      enabled: onTap != null,
+      onTap: onTap,
+    );
   }
 }
 
