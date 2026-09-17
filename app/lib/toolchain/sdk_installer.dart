@@ -663,12 +663,19 @@ class FlutterSdkInstaller {
     }
 
     // 3. 解压 tarball → 替换 dart-sdk → 写 version → 验证
+    // Bug 411（2026-09-17 真机抓到）：原命令 d=$(ls -d /opt/flutter*) 取到的
+    // 就是刚解压出的 /opt/flutter 本身，紧接着 rm -rf /opt/flutter 把它删掉，
+    // mv "$d" /opt/flutter 必报 "cannot stat"——官方 tarball 顶层目录恰好叫
+    // flutter/，100% 复现。改为暂存目录模式（与 AndroidSdkInstaller 一致）：
+    // 先解压到 /opt/foa-flutter-stage 再 mv 归位，源与目标永不同路径；
+    // 旧 /opt/flutter 保留到解压成功后才删（中途失败不毁存量安装）。
     onPhase?.call('extracting');
     final ex = await bridge.exec(
-      'rm -rf $flutterHome && '
-      'tar -xJf /opt/foa-dl/$tarFile -C /opt && '
-      'd=\$(ls -d /opt/flutter* 2>/dev/null | head -1) && '
+      'rm -rf /opt/foa-flutter-stage && mkdir -p /opt/foa-flutter-stage && '
+      'tar -xJf /opt/foa-dl/$tarFile -C /opt/foa-flutter-stage && '
+      'd=\$(ls -d /opt/foa-flutter-stage/* 2>/dev/null | head -1) && '
       'rm -rf $flutterHome && mv "\$d" $flutterHome && '
+      'rm -rf /opt/foa-flutter-stage && '
       'rm -rf $flutterHome/bin/cache/dart-sdk && '
       'mkdir -p $flutterHome/bin/cache && '
       'unzip -qo /opt/foa-dl/$dartFile -d $flutterHome/bin/cache/ && '
