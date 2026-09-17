@@ -36,6 +36,10 @@ class MainActivity : FlutterActivity() {
         // Step 2：项目代码区（容器内 /root/projects ↔ 真实 filesDir/rootfs/debian/root/projects）。
         // 所有文件操作只允许此区域，防止误改 rootfs 系统文件。
         const val PROJECTS_REL = "rootfs/debian/root/projects"
+        // Step 4 文件浏览器：导入文件的容器落脚点（↔ filesDir/rootfs/debian/root/imports）。
+        // 与 SDK 安装的导入区 filesDir/imports（pickInstallFile）分开——容器内可见，
+        // 导入后可直接解压/浏览；SDK 导入区是内部缓存，文件浏览器不展示。
+        const val IMPORTS_GUEST = "/root/imports"
         // 注意：原生 AssetManager 的路径相对 APK 的 assets/ 根，
         // 而 Flutter 打包的资产全部位于 flutter_assets/ 子目录下，
         // 因此必须带 flutter_assets/ 前缀（Bug 208：曾漏前缀导致真机
@@ -57,6 +61,12 @@ class MainActivity : FlutterActivity() {
     // content:// URI 在 proot 子进程里不可读（proot 只能读真实文件路径）。
     private var pendingPickResult: MethodChannel.Result? = null
     private val pickRequestCode = 0x2001
+    // Step 4 文件浏览器：导入（任意文件 → /root/imports）与导出（文件 → SAF 目标）的挂起状态。
+    private var pendingImportResult: MethodChannel.Result? = null
+    private val importRequestCode = 0x2002
+    private var pendingExportResult: MethodChannel.Result? = null
+    private var pendingExportSource: File? = null
+    private val exportRequestCode = 0x2003
 
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
@@ -128,6 +138,48 @@ class MainActivity : FlutterActivity() {
                             val path = call.argument<String>("path") ?: ""
                             result.success(fileDelete(path))
                         }
+                        // ---- Step 4 文件浏览器（rootfs 全路径白名单，与编辑器 file* 的
+                        //      /root/projects 白名单独立；浏览+CRUD+导入导出）----
+                        "fsBrowse" -> {
+                            val path = call.argument<String>("path") ?: "/"
+                            result.success(fsBrowse(path))
+                        }
+                        "fsMkdir" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(fsMkdir(path))
+                        }
+                        "fsRename" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            val newName = call.argument<String>("newName") ?: ""
+                            result.success(fsRename(path, newName))
+                        }
+                        "fsDelete" -> {
+                            val path = call.argument<String>("path") ?: ""
+                            result.success(fsDelete(path))
+                        }
+                        "pickImportFile" -> {
+                            pendingImportResult = result
+                            runOnUiThread {
+                                try {
+                                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                                        addCategory(Intent.CATEGORY_OPENABLE)
+                                        type = "*/*" // 任意文件（不限 SDK 安装包）
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    startActivityForResult(intent, importRequestCode)
+                                } catch (e: Exception) {
+                                    pendingImportResult = null
+                                    result.success(
+                                        mapOf("ok" to false, "error" to "无法打开文件选择器: ${e.message}"),
+                                    )
+                                }
+                            }
+                        }
+                        "exportFile" -> exportFile(
+                            result,
+                            call.argument<String>("path") ?: "",
+                            call.argument<String>("displayName") ?: "export.bin",
+                        )
                         else -> result.notImplemented()
                     }
                 } catch (e: Exception) {
@@ -174,6 +226,68 @@ class MainActivity : FlutterActivity() {
                     )
                 } catch (e: Exception) {
                     r?.success(mapOf("ok" to false, "error" to "复制文件失败: ${e.message}"))
+                }
+            }
+            return
+        }
+        // Step 4 文件浏览器 · 导入：拷贝到容器 /root/imports（真实 filesDir/rootfs/debian/root/imports），
+        // 返回容器路径——Dart 侧直接可见、可解压/导出，无需二次映射。
+        if (requestCode == importRequestCode) {
+            val r = pendingImportResult
+            pendingImportResult = null
+            if (resultCode != RESULT_OK || data?.data == null) {
+                r?.success(mapOf("ok" to false, "error" to "已取消选择"))
+                return
+            }
+            val uri = data.data!!
+            executor.execute {
+                try {
+                    val importDir = File(File(filesDir, ROOTFS_REL), IMPORTS_GUEST.removePrefix("/"))
+                        .apply { mkdirs() }
+                    val displayName = queryDisplayName(uri) ?: "import.bin"
+                    val safe = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                    val dest = File(importDir, safe)
+                    val input = contentResolver.openInputStream(uri)
+                        ?: throw IllegalStateException("无法读取所选文件")
+                    input.use { ins ->
+                        dest.outputStream().use { out -> ins.copyTo(out, 1 shl 16) }
+                    }
+                    r?.success(
+                        mapOf(
+                            "ok" to true,
+                            "path" to "$IMPORTS_GUEST/${dest.name}",
+                            "name" to dest.name,
+                            "size" to dest.length(),
+                        ),
+                    )
+                } catch (e: Exception) {
+                    r?.success(mapOf("ok" to false, "error" to "复制文件失败: ${e.message}"))
+                }
+            }
+            return
+        }
+        // Step 4 文件浏览器 · 导出：把 pendingExportSource 写入用户选择的 SAF 目标。
+        if (requestCode == exportRequestCode) {
+            val r = pendingExportResult
+            val src = pendingExportSource
+            pendingExportResult = null
+            pendingExportSource = null
+            if (resultCode != RESULT_OK || data?.data == null) {
+                r?.success(mapOf("ok" to false, "error" to "已取消导出"))
+                return
+            }
+            val uri = data.data!!
+            executor.execute {
+                try {
+                    val srcFile = src ?: throw IllegalStateException("导出源文件丢失")
+                    val out = contentResolver.openOutputStream(uri)
+                        ?: throw IllegalStateException("无法写入目标位置")
+                    srcFile.inputStream().use { ins ->
+                        out.use { o -> ins.copyTo(o, 1 shl 16) }
+                    }
+                    r?.success(mapOf("ok" to true, "size" to srcFile.length()))
+                } catch (e: Exception) {
+                    r?.success(mapOf("ok" to false, "error" to "导出失败: ${e.message}"))
                 }
             }
             return
@@ -521,5 +635,96 @@ class MainActivity : FlutterActivity() {
         if (!f.exists()) return fileFail("不存在: $guest")
         return if (f.deleteRecursively()) mapOf("ok" to true)
         else fileFail("删除失败: $guest")
+    }
+
+    // ---------------- Step 4 · 文件浏览器（rootfs 全路径白名单）----------------
+
+    /**
+     * 容器内任意路径（/...）→ 真实路径（filesDir/rootfs/debian/...）。
+     * 白名单：rootfs 根内；禁止操作根自身（"/"）；canonicalize 后必须仍在
+     * rootfs 内（防 `..` 逃逸到 filesDir 其他区域）。与编辑器的 resolveGuestPath
+     * （/root/projects 严格白名单）独立——文件浏览器是"浏览整个 app 数据"的入口。
+     */
+    private fun resolveRootfsPath(guest: String): File? {
+        if (!guest.startsWith("/") || guest == "/") return null
+        val root = File(filesDir, ROOTFS_REL).canonicalFile
+        val target = File(root, guest.removePrefix("/")).canonicalFile
+        val inRoot = target == root || target.path.startsWith(root.path + File.separator)
+        return if (inRoot) target else null
+    }
+
+    private fun rootfsRoot(): File? {
+        val root = File(filesDir, ROOTFS_REL)
+        return if (File(root, "bin/sh").exists()) root else null
+    }
+
+    private fun fsBrowse(guest: String): Map<String, Any> {
+        val dir = if (guest == "/") rootfsRoot()
+        else resolveRootfsPath(guest) ?: return fileFail("非法路径（仅允许 rootfs 内）: $guest")
+        if (dir == null) return fileFail("rootfs 未安装：请回到主页点击「初始化环境」。")
+        if (!dir.isDirectory) return fileFail("不是目录: $guest")
+        val entries = dir.listFiles()?.sortedBy { it.name }?.map { f ->
+            mapOf(
+                "name" to f.name,
+                "isDir" to f.isDirectory,
+                "size" to (if (f.isFile) f.length() else 0L),
+                "mtime" to f.lastModified(),
+            )
+        } ?: emptyList()
+        return mapOf("ok" to true, "path" to guest, "entries" to entries)
+    }
+
+    private fun fsMkdir(guest: String): Map<String, Any> {
+        val f = resolveRootfsPath(guest) ?: return fileFail("非法路径（仅允许 rootfs 内）: $guest")
+        return if (f.exists()) fileFail("已存在: $guest")
+        else if (f.mkdirs()) mapOf("ok" to true)
+        else fileFail("创建目录失败: $guest")
+    }
+
+    private fun fsRename(guest: String, newName: String): Map<String, Any> {
+        if (newName.isBlank() || newName.contains('/') || newName == "." || newName == "..") {
+            return fileFail("非法文件名: $newName")
+        }
+        val f = resolveRootfsPath(guest) ?: return fileFail("非法路径（仅允许 rootfs 内）: $guest")
+        if (!f.exists()) return fileFail("不存在: $guest")
+        val dest = File(f.parentFile, newName)
+        if (dest.exists()) return fileFail("目标已存在: $newName")
+        return if (f.renameTo(dest)) mapOf("ok" to true)
+        else fileFail("重命名失败: $guest → $newName")
+    }
+
+    private fun fsDelete(guest: String): Map<String, Any> {
+        val f = resolveRootfsPath(guest) ?: return fileFail("非法路径（仅允许 rootfs 内）: $guest")
+        if (!f.exists()) return fileFail("不存在: $guest")
+        // rootfs 根自身已由 resolveRootfsPath 拒绝（guest != "/"）；递归删除由
+        // Dart 侧二次确认（AlertDialog），原生层不再设额外保护。
+        return if (f.deleteRecursively()) mapOf("ok" to true)
+        else fileFail("删除失败: $guest")
+    }
+
+    /** 导出：校验源文件后挂起 result，拉起 SAF 保存对话框（主线程）。 */
+    private fun exportFile(result: MethodChannel.Result, guest: String, displayName: String) {
+        val f = resolveRootfsPath(guest)
+        if (f == null || !f.isFile) {
+            result.success(fileFail("非法路径或不是文件: $guest"))
+            return
+        }
+        pendingExportResult = result
+        pendingExportSource = f
+        runOnUiThread {
+            try {
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                    putExtra(Intent.EXTRA_TITLE, displayName)
+                    addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                }
+                startActivityForResult(intent, exportRequestCode)
+            } catch (e: Exception) {
+                pendingExportResult = null
+                pendingExportSource = null
+                result.success(fileFail("无法打开保存对话框: ${e.message}"))
+            }
+        }
     }
 }

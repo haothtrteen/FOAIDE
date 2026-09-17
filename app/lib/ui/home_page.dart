@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../env/env_installer.dart';
 import '../editor/editor_page.dart';
+import '../filemanager/file_browser_page.dart';
 import '../toolchain/toolchain_page.dart';
 import 'terminal_page.dart';
 
@@ -189,6 +190,14 @@ class _ActionCard extends StatelessWidget {
                       label: '打开编辑器',
                       onTap: () => Navigator.of(context).push(
                         MaterialPageRoute(builder: (_) => EditorPage()),
+                      ),
+                    ),
+                    _ActionTile(
+                      icon: Icons.folder_open,
+                      label: '文件浏览器',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                            builder: (_) => const FileBrowserPage()),
                       ),
                     ),
                     _ActionTile(
