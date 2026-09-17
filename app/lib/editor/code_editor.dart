@@ -1,7 +1,8 @@
 import 'dart:async';
 
 import 'package:code_text_field/code_text_field.dart';
-import 'package:flutter/foundation.dart' show listEquals;
+import 'package:dart_style/dart_style.dart';
+import 'package:flutter/foundation.dart' show compute, listEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter_highlight/themes/monokai-sublime.dart'
     show monokaiSublimeTheme;
@@ -45,10 +46,12 @@ class CodeEditor extends StatefulWidget {
   });
 
   @override
-  State<CodeEditor> createState() => _CodeEditorState();
+  State<CodeEditor> createState() => CodeEditorState();
 }
 
-class _CodeEditorState extends State<CodeEditor> {
+/// 公开 State：EditorPage 通过 GlobalKey<CodeEditorState> 调用
+/// 撤销/跳转行/搜索/格式化等顶栏操作（Bug 218）。
+class CodeEditorState extends State<CodeEditor> {
   late CodeController _controller;
   final FocusNode _focus = FocusNode();
 
@@ -69,10 +72,10 @@ class _CodeEditorState extends State<CodeEditor> {
   }
 
   @override
-  void didUpdateWidget(covariant CodeEditor old) {
-    super.didUpdateWidget(old);
+  void didUpdateWidget(covariant CodeEditor oldWidget) {
+    super.didUpdateWidget(oldWidget);
     // 切换文件：以旧控制器内容为准（可能含未保存编辑），重建控制器
-    if (old.path != widget.path) {
+    if (oldWidget.path != widget.path) {
       _controller.dispose();
       _controller = CodeController(
         text: widget.initialContent,
@@ -171,6 +174,83 @@ class _CodeEditorState extends State<CodeEditor> {
     // listener 会刷新补全与检查
   }
 
+  /// 在光标处插入符号（Bug 217 符号栏）。
+  void _insertSymbol(String symbol) {
+    final value = _controller.value;
+    final off = value.selection.baseOffset;
+    if (off < 0 || off > value.text.length) {
+      _controller.text += symbol;
+      return;
+    }
+    final newText = value.text.replaceRange(off, off, symbol);
+    _controller.value = value.copyWith(
+      text: newText,
+      selection: TextSelection.collapsed(offset: off + symbol.length),
+      composing: TextRange.empty,
+    );
+    // listener 会刷新补全与检查
+  }
+
+  // ---------------- 外部操作 API（顶栏按钮经 GlobalKey 调用） ----------------
+
+  /// 撤销更改：重置为打开时的初始内容（Bug 218）。
+  void reset(String content) {
+    _controller.value = TextEditingValue(
+      text: content,
+      selection: TextSelection.collapsed(offset: content.length),
+      composing: TextRange.empty,
+    );
+    _issues = const [];
+    _hideSuggestions();
+    _scheduleCheck(immediate: true);
+  }
+
+  /// 跳转到第 [line] 行（1 起）：光标置于行首，EditableText 自动滚动到光标。
+  void jumpToLine(int line) {
+    final lines = _controller.text.split('\n');
+    if (lines.isEmpty) return;
+    if (line < 1) line = 1;
+    final target = line - 1 < lines.length ? line - 1 : lines.length - 1;
+    var offset = 0;
+    for (var i = 0; i < target; i++) {
+      offset += lines[i].length + 1;
+    }
+    _controller.value = _controller.value.copyWith(
+      selection: TextSelection.collapsed(offset: offset),
+      composing: TextRange.empty,
+    );
+  }
+
+  /// 打开文件内搜索对话框（Bug 218）。
+  void openSearch() {
+    showDialog<void>(
+      context: context,
+      builder: (_) => _SearchDialog(controller: _controller),
+    );
+  }
+
+  /// 格式化代码：Dart 用 dart_style（compute 隔离线程防卡 UI）。
+  /// 返回 null 表示成功，否则返回错误信息。
+  Future<String?> formatCode() async {
+    final lang = _languageName;
+    if (lang != 'dart') {
+      return '仅支持 Dart 文件格式化';
+    }
+    try {
+      final formatted = await compute(_formatDartSource, _controller.text);
+      if (formatted != _controller.text) {
+        _controller.value = TextEditingValue(
+          text: formatted,
+          selection: TextSelection.collapsed(offset: formatted.length),
+          composing: TextRange.empty,
+        );
+      }
+      return null;
+    } catch (e) {
+      return '格式化失败（语法错误？）：$e';
+    }
+  }
+
   // ---------------- UI ----------------
 
   /// 按扩展名选语法高亮语言（highlight 包语言，导出名为小写 Mode 变量）。
@@ -259,8 +339,63 @@ class _CodeEditorState extends State<CodeEditor> {
             ],
           ),
         ),
+        // Bug 217 常用符号快捷栏：常驻显示（v2）。
+        // 首版用 viewInsets.bottom > 0 检测键盘弹出才显示，但真机 01:09 截图
+        // 证实部分中文输入法（百度/搜狗等带自身工具栏的 IME）不会把 insets
+        // 变化传给 Flutter → 符号栏从未渲染。改为常驻：键盘弹出时天然位于
+        // 键盘正上方（Column 底部被键盘顶起），收起时贴在编辑区底部，
+        // 任何输入法/ROM 下都稳定可见。
+        _buildSymbolBar(),
         _buildStatusBar(),
       ],
+    );
+  }
+
+  /// Bug 217 常用符号栏：横向滚动按钮行，点击在光标处插入符号。
+  ///
+  /// 覆盖代码高频符号：括号/引号/运算符/比较符/箭头/分号等，
+  /// 深色低饱和配色与编辑器一致，按钮热区足够大方便手指点按。
+  Widget _buildSymbolBar() {
+    const symbols = [
+      '(', ')', '{', '}', '[', ']', ';', ',', ':', '.',
+      '"', "'", '=', '+', '-', '*', '/', '<', '>', '!', '?', '_', '=>', '->', '&&', '||',
+    ];
+    return Container(
+      height: 36,
+      color: const Color(0xFF14181E),
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        itemCount: symbols.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 4),
+        itemBuilder: (context, i) {
+          final s = symbols[i];
+          return Tooltip(
+            message: '插入 $s',
+            waitDuration: const Duration(milliseconds: 600),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: () => _insertSymbol(s),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 11),
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF232A35),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  s,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontFamily: 'monospace',
+                    color: Color(0xFFE6E6E6),
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 
@@ -384,5 +519,118 @@ class _CodeEditorState extends State<CodeEditor> {
     _controller.dispose();
     _focus.dispose();
     super.dispose();
+  }
+}
+
+/// compute 隔离线程内的 Dart 格式化入口（top-level 函数，供 compute 调用）。
+/// dart_style 3.x 构造器必填 languageVersion，用其自带的最新版本。
+String _formatDartSource(String src) => DartFormatter(
+      languageVersion: DartFormatter.latestLanguageVersion,
+    ).format(src);
+
+/// 文件内搜索对话框：关键词 → 匹配数 → 上一个/下一个循环跳转（Bug 218）。
+/// 直接操作 CodeController 的 selection，EditableText 自动滚动到匹配处。
+class _SearchDialog extends StatefulWidget {
+  final CodeController controller;
+  const _SearchDialog({required this.controller});
+
+  @override
+  State<_SearchDialog> createState() => _SearchDialogState();
+}
+
+class _SearchDialogState extends State<_SearchDialog> {
+  final TextEditingController _kw = TextEditingController();
+  List<RegExpMatch> _matches = const [];
+  int _index = -1;
+
+  @override
+  void dispose() {
+    _kw.dispose();
+    super.dispose();
+  }
+
+  void _search() {
+    final q = _kw.text;
+    if (q.isEmpty) {
+      setState(() {
+        _matches = const [];
+        _index = -1;
+      });
+      return;
+    }
+    final all = RegExp(RegExp.escape(q), caseSensitive: false)
+        .allMatches(widget.controller.text)
+        .toList();
+    setState(() {
+      _matches = all;
+      _index = all.isEmpty ? -1 : 0;
+    });
+    if (all.isNotEmpty) _jump(0);
+  }
+
+  void _jump(int i) {
+    if (_matches.isEmpty) return;
+    final m = _matches[i];
+    widget.controller.value = widget.controller.value.copyWith(
+      selection: TextSelection(baseOffset: m.start, extentOffset: m.end),
+      composing: TextRange.empty,
+    );
+    setState(() => _index = i);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('搜索'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _kw,
+            autofocus: true,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
+            decoration: const InputDecoration(
+              hintText: '输入关键词（不区分大小写）',
+              isDense: true,
+            ),
+            onSubmitted: (_) => _search(),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Text(
+                _matches.isEmpty
+                    ? (_kw.text.isEmpty ? '' : '无匹配')
+                    : '${_index + 1} / ${_matches.length}',
+                style: const TextStyle(fontSize: 13, color: Colors.grey),
+              ),
+              const Spacer(),
+              IconButton(
+                tooltip: '上一个',
+                visualDensity: VisualDensity.compact,
+                onPressed: _matches.isEmpty
+                    ? null
+                    : () => _jump((_index - 1 + _matches.length) % _matches.length),
+                icon: const Icon(Icons.keyboard_arrow_up),
+              ),
+              IconButton(
+                tooltip: '下一个',
+                visualDensity: VisualDensity.compact,
+                onPressed: _matches.isEmpty
+                    ? null
+                    : () => _jump((_index + 1) % _matches.length),
+                icon: const Icon(Icons.keyboard_arrow_down),
+              ),
+            ],
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
   }
 }

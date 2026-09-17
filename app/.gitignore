@@ -8,6 +8,8 @@
 build/
 *.dart_tool
 flutter_*.png
+# pub get 自动生成（记录插件依赖解析结果，随构建变化）
+.flutter-plugins-dependencies
 
 # ============================================================
 # Android / Gradle
