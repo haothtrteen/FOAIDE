@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../core/theme.dart';
 import '../demo/demo_project_creator.dart';
 import '../demo/demo_templates.dart';
 import '../env/env_installer.dart';
@@ -24,7 +25,7 @@ class _HomePageState extends State<HomePage> {
 
   List<FsBrowserEntry> _projects = const [];
   bool _didLoad = false; // 防重复加载标志
-  int _tab = 0; // 0 工程 / 1 设置（底部导航）
+  int _tab = 0; // 0 工程 / 1 配置 / 2 设置（底部导航）
   bool _syncing = false;
 
   @override
@@ -197,13 +198,22 @@ class _HomePageState extends State<HomePage> {
             label: '工程',
           ),
           NavigationDestination(
+            icon: Icon(Icons.tune),
+            selectedIcon: Icon(Icons.tune),
+            label: '配置',
+          ),
+          NavigationDestination(
             icon: Icon(Icons.settings_outlined),
             selectedIcon: Icon(Icons.settings),
             label: '设置',
           ),
         ],
       ),
-      body: _tab == 0 ? _buildProjectsTab(env) : _buildSettingsTab(env),
+      body: switch (_tab) {
+        0 => _buildProjectsTab(env),
+        1 => _buildConfigTab(env),
+        _ => _buildSettingsTab(env),
+      },
     );
   }
 
@@ -224,7 +234,74 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  /// 设置页：环境信息 + 工作区同步 + 工具链 + 关于。
+  /// 配置页：工具链（JDK / Android SDK / Flutter SDK / x64 兼容层 / 构建镜像）
+  /// + 构建 APK 入口 + 方案说明。
+  Widget _buildConfigTab(EnvState env) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('工具链',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Card(
+          clipBehavior: Clip.antiAlias,
+          child: Column(
+            children: [
+              ListTile(
+                leading: const Icon(Icons.build),
+                title: const Text('工具链'),
+                subtitle: const Text('JDK / Android SDK / Flutter SDK / x64 兼容层(QEMU) / 构建镜像'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const ToolchainPage()),
+                ),
+              ),
+              const Divider(height: 1, indent: 56),
+              ListTile(
+                leading: const Icon(Icons.phone_android),
+                title: const Text('构建 APK'),
+                subtitle: const Text('项目列表 · 流式日志 · 安装'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const BuildPage()),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Text('方案说明',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('官方 SDK + QEMU 兼容层',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                Text(
+                  'Flutter 官方 Linux 仅发布 x64 工具链；aarch64 上由「x64 兼容层」'
+                  '用 qemu 转发 dart / gen_snapshot / aapt2 等 x64 二进制，'
+                  '即可在设备上原生构建 arm64 APK。\n'
+                  '安装顺序建议：先应用「x64 兼容层(QEMU)」，再安装 Flutter SDK；'
+                  '装反了可点兼容层「重新应用」自动补上转发。',
+                  style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade500,
+                      height: 1.5),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 设置页：环境信息 + 外观主题 + 工作区同步 + 关于。
   Widget _buildSettingsTab(EnvState env) {
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -233,6 +310,55 @@ class _HomePageState extends State<HomePage> {
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
         _StatusCard(env: env),
+        const SizedBox(height: 16),
+        const Text('外观',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.brightness_6_outlined, size: 20),
+                    SizedBox(width: 10),
+                    Text('主题模式',
+                        style: TextStyle(fontWeight: FontWeight.w600)),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Consumer<ThemeController>(
+                  builder: (context, tc, _) => SegmentedButton<ThemeMode>(
+                    segments: const [
+                      ButtonSegment(
+                        value: ThemeMode.light,
+                        icon: Icon(Icons.light_mode_outlined, size: 18),
+                        label: Text('浅色'),
+                      ),
+                      ButtonSegment(
+                        value: ThemeMode.dark,
+                        icon: Icon(Icons.dark_mode_outlined, size: 18),
+                        label: Text('深色'),
+                      ),
+                      ButtonSegment(
+                        value: ThemeMode.system,
+                        icon: Icon(Icons.settings_brightness_outlined,
+                            size: 18),
+                        label: Text('跟随系统'),
+                      ),
+                    ],
+                    selected: {tc.mode},
+                    onSelectionChanged: (s) => tc.mode = s.first,
+                    showSelectedIcon: false,
+                    expandedInsets: EdgeInsets.zero,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
         const SizedBox(height: 16),
         const Text('项目工作区',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
@@ -273,36 +399,6 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         const SizedBox(height: 16),
-        const Text('工具',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 8),
-        Card(
-          clipBehavior: Clip.antiAlias,
-          child: Column(
-            children: [
-              ListTile(
-                leading: const Icon(Icons.build),
-                title: const Text('工具链'),
-                subtitle: const Text('JDK / Android SDK / Flutter SDK / 构建镜像'),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const ToolchainPage()),
-                ),
-              ),
-              const Divider(height: 1, indent: 56),
-              ListTile(
-                leading: const Icon(Icons.phone_android),
-                title: const Text('构建 APK'),
-                subtitle: const Text('项目列表 · 流式日志 · 安装'),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const BuildPage()),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 16),
         const Text('关于',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
@@ -329,7 +425,7 @@ class _HomePageState extends State<HomePage> {
                         Text('Flutter On Android',
                             style: TextStyle(
                                 fontSize: 15, fontWeight: FontWeight.bold)),
-                        Text('v0.1.0-alpha.23 · 在 Android 上原生构建 APK',
+                        Text('v0.1.0-alpha.24 · 在 Android 上原生构建 APK',
                             style: TextStyle(fontSize: 12)),
                       ],
                     ),
@@ -370,8 +466,8 @@ class _HomePageState extends State<HomePage> {
         ),
         const SizedBox(height: 4),
         if (!env.isInstalled)
-          Card(
-            child: const Padding(
+          const Card(
+            child: Padding(
               padding: EdgeInsets.all(16),
               child: Row(
                 children: [

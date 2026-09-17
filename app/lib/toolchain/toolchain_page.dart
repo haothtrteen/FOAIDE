@@ -4,10 +4,12 @@ import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import 'jdk_installer.dart';
 import 'local_install_picker.dart';
+import 'qemu_compat.dart';
 import 'sdk_downloader.dart';
 import 'sdk_installer.dart';
 
-/// Step 3 工具链页：JDK 17 / Android SDK / Flutter SDK(arm64) / 构建镜像配置。
+/// Step 3 工具链页：JDK 17 / Android SDK / Flutter SDK(官方 x64 · QEMU 转发) /
+/// x64 兼容层(QEMU) / 构建镜像配置。
 ///
 /// 状态机（各卡片独立）：
 /// - JDK：idle → probing → downloading(进度) → extracting → validating
@@ -16,6 +18,8 @@ import 'sdk_installer.dart';
 ///   → extracting → validating → installed；失败 → error（分片续传保留）。
 /// - 构建镜像配置：idle → env → init-gradle → wrapper → probing
 ///   → downloading(Gradle 224MB 预下载) → installed；失败 → error。
+/// - x64 兼容层(QEMU)：idle → apt → engine → sdk → validating
+///   → installed；失败 → error（apt/预下载阶段为不确定进度条，无取消）。
 class ToolchainPage extends StatefulWidget {
   const ToolchainPage({super.key});
 
@@ -60,6 +64,18 @@ enum MirrorPhase {
   error,
 }
 
+/// x64 兼容层(QEMU)阶段。
+enum QemuPhase {
+  idle,
+  apt, // 容器内 apt 装 qemu-user + x86_64 多架构运行库
+  engine, // 引擎产物预下载 + linux-arm64 转发层
+  sdk, // SDK 工具接管 + AGP aapt2 指向
+  validating, // 分步冒烟验证
+  installed,
+  uninstalling,
+  error,
+}
+
 class _ToolchainPageState extends State<ToolchainPage> {
   final ProotBridge _bridge = ProotBridge();
 
@@ -98,6 +114,12 @@ class _ToolchainPageState extends State<ToolchainPage> {
   String _mirrorError = '';
   DownloadCancelToken? _mirrorToken;
 
+  // ---- x64 兼容层(QEMU) ----
+  QemuPhase _qemuPhase = QemuPhase.idle;
+  String _qemuInfo = '';
+  String _qemuError = '';
+  bool _qemuVerifying = false;
+
   @override
   void initState() {
     super.initState();
@@ -117,6 +139,7 @@ class _ToolchainPageState extends State<ToolchainPage> {
       final m = env.rootfsInstalled
           ? await MirrorConfigurator.verify(_bridge, env)
           : null;
+      final q = env.rootfsInstalled ? await QemuCompat.verify(_bridge) : null;
       if (!mounted) return;
       setState(() {
         _env = env;
@@ -128,6 +151,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
         _flInfo = f ?? '';
         _mirrorPhase = m == null ? MirrorPhase.idle : MirrorPhase.installed;
         _mirrorInfo = m ?? '';
+        _qemuPhase = q == null ? QemuPhase.idle : QemuPhase.installed;
+        _qemuInfo = q ?? '';
       });
     } catch (e) {
       if (!mounted) return;
@@ -336,6 +361,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
         _asdkPhase = SdkPhase.installed;
         _asdkInfo = v;
       });
+      // QEMU 兼容层在位时接管 aapt2/adb/zipalign（幂等，未装则跳过）。
+      await QemuCompat.wrapSdkIfReady(_bridge, env);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -424,6 +451,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
         _asdkPhase = SdkPhase.installed;
         _asdkInfo = v;
       });
+      // QEMU 兼容层在位时接管 aapt2/adb/zipalign（幂等，未装则跳过）。
+      await QemuCompat.wrapSdkIfReady(_bridge, env);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -478,6 +507,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
         _flPhase = SdkPhase.installed;
         _flInfo = v;
       });
+      // QEMU 兼容层在位时预下载引擎产物并生成 linux-arm64 转发层（幂等）。
+      await QemuCompat.syncEngineIfReady(_bridge);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -566,6 +597,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
         _flPhase = SdkPhase.installed;
         _flInfo = v;
       });
+      // QEMU 兼容层在位时预下载引擎产物并生成 linux-arm64 转发层（幂等）。
+      await QemuCompat.syncEngineIfReady(_bridge);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -581,6 +614,102 @@ class _ToolchainPageState extends State<ToolchainPage> {
     if (!ok) return;
     await FlutterSdkInstaller.uninstall(_bridge);
     await _refreshAll();
+  }
+
+  // ============================ x64 兼容层(QEMU) ============================
+
+  QemuPhase _qemuPhaseFrom(String p) => switch (p) {
+        'apt' => QemuPhase.apt,
+        'engine' => QemuPhase.engine,
+        'sdk' => QemuPhase.sdk,
+        'validating' => QemuPhase.validating,
+        _ => QemuPhase.idle,
+      };
+
+  Future<void> _qemuApply() async {
+    setState(() {
+      _qemuPhase = QemuPhase.apt;
+      _qemuError = '';
+    });
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final v = await QemuCompat.apply(
+        _bridge,
+        env,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _qemuPhase = _qemuPhaseFrom(p));
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _qemuPhase = QemuPhase.installed;
+        _qemuInfo = v;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('x64 兼容层已应用：$v'),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _qemuPhase = QemuPhase.error;
+        _qemuError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _qemuVerify() async {
+    setState(() => _qemuVerifying = true);
+    try {
+      final v = await QemuCompat.verify(_bridge);
+      if (!mounted) return;
+      setState(() {
+        _qemuVerifying = false;
+        _qemuPhase = v == null ? QemuPhase.idle : QemuPhase.installed;
+        _qemuInfo = v ?? '';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            v == null ? '未检测到 x64 兼容层' : '兼容层有效：$v',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _qemuVerifying = false;
+        _qemuPhase = QemuPhase.error;
+        _qemuError = '检测失败：$e';
+      });
+    }
+  }
+
+  Future<void> _qemuUninstall() async {
+    final ok = await _confirm(
+        '卸载 x64 兼容层', '将移除 qemu 转发脚本、x86_64 多架构库并恢复工具原样，确定？');
+    if (!ok) return;
+    setState(() => _qemuPhase = QemuPhase.uninstalling);
+    try {
+      final env = await _bridge.envInfo();
+      if (env.rootfsInstalled) {
+        await QemuCompat.uninstall(_bridge, env);
+      }
+      await _refreshAll();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _qemuPhase = QemuPhase.error;
+        _qemuError = e.toString();
+      });
+    }
   }
 
   // ============================ 构建镜像配置 ============================
@@ -735,19 +864,22 @@ class _ToolchainPageState extends State<ToolchainPage> {
           ),
           const SizedBox(height: 12),
           _SdkCard(
-            title: 'Flutter SDK（arm64）',
+            title: 'Flutter SDK（官方 x64 · QEMU 转发）',
             icon: Icons.bolt,
             phase: _flPhase,
             progress: _flProgress,
             mirrorName: _flMirrors.join(' + '),
             info: _flInfo,
             error: _flError,
-            sizeLabel: '约 1720 MB · 官方 tarball + Dart arm64',
+            sizeLabel: '约 1575 MB · 官方 tarball（x64 工具链由 QEMU 转发）',
             desc: 'Flutter ${FlutterSdkInstaller.version} 官方仅发布 x64 Linux 构建，'
-                '本方案用官方 Dart SDK linux-arm64（${FlutterSdkInstaller.dartVersion}）'
-                '替换 dart-sdk 后即可在 aarch64 上执行 flutter build apk。\n'
-                '国内源（flutter-io.cn 官方中国镜像）优先；'
-                '解压到容器内 /opt/flutter。',
+                '其 flutter_tools.snapshot 为 x64 快照，aarch64 直跑报 '
+                '"Snapshot not compatible"（真机已复现）。\n'
+                '本方案保留官方 x64 dart-sdk 原样，由「x64 兼容层(QEMU)」统一转发 '
+                'dart/gen_snapshot/aapt2 等 x64 二进制后即可在 aarch64 上执行 '
+                'flutter build apk。\n'
+                '建议先应用兼容层再安装本 SDK；装反了可点兼容层「重新应用」自动补上。'
+                '国内源（flutter-io.cn 官方中国镜像）优先；解压到容器内 /opt/flutter。',
             verifying: _flVerifying,
             rootfsReady: rootfsReady,
             onInstall: _flInstall,
@@ -755,6 +887,17 @@ class _ToolchainPageState extends State<ToolchainPage> {
             onCancel: _flCancel,
             onUninstall: _flUninstall,
             onInstallLocal: _flInstallFromLocal,
+          ),
+          const SizedBox(height: 12),
+          _QemuCard(
+            phase: _qemuPhase,
+            info: _qemuInfo,
+            error: _qemuError,
+            rootfsReady: rootfsReady,
+            verifying: _qemuVerifying,
+            onApply: _qemuApply,
+            onVerify: _qemuVerify,
+            onUninstall: _qemuUninstall,
           ),
           const SizedBox(height: 12),
           _MirrorCard(
@@ -1324,6 +1467,184 @@ class _MirrorCard extends StatelessWidget {
                       onPressed: rootfsReady ? onApply : null,
                       icon: const Icon(Icons.settings_ethernet, size: 18),
                       label: const Text('一键配置'),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            if (!rootfsReady) ...[
+              const SizedBox(height: 8),
+              const Text('请先在主页初始化 rootfs 环境',
+                  style: TextStyle(fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 90,
+              child: Text(k,
+                  style: TextStyle(
+                      color: Colors.grey.shade400, fontSize: 13)),
+            ),
+            Expanded(
+                child: Text(v,
+                    style: const TextStyle(
+                        fontSize: 12, fontFamily: 'monospace'))),
+          ],
+        ),
+      );
+}
+
+// ============================ x64 兼容层(QEMU) 卡片 ============================
+
+class _QemuCard extends StatelessWidget {
+  final QemuPhase phase;
+  final String info;
+  final String error;
+  final bool rootfsReady;
+  final bool verifying;
+  final VoidCallback onApply;
+  final VoidCallback onVerify;
+  final VoidCallback onUninstall;
+
+  const _QemuCard({
+    required this.phase,
+    required this.info,
+    required this.error,
+    required this.rootfsReady,
+    required this.verifying,
+    required this.onApply,
+    required this.onVerify,
+    required this.onUninstall,
+  });
+
+  String get _statusLabel => switch (phase) {
+        QemuPhase.installed => 'x64 兼容层已启用',
+        QemuPhase.error => '应用失败',
+        QemuPhase.apt => '安装 qemu-user + x86_64 运行库…',
+        QemuPhase.engine => '同步引擎产物并生成转发层…',
+        QemuPhase.sdk => '接管 SDK 工具 + AGP 指向…',
+        QemuPhase.validating => '分步冒烟验证…',
+        QemuPhase.uninstalling => '正在卸载…',
+        QemuPhase.idle => 'x64 兼容层未启用',
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final busy = phase == QemuPhase.apt ||
+        phase == QemuPhase.engine ||
+        phase == QemuPhase.sdk ||
+        phase == QemuPhase.validating ||
+        phase == QemuPhase.uninstalling;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  switch (phase) {
+                    QemuPhase.installed => Icons.check_circle,
+                    QemuPhase.error => Icons.error_outline,
+                    _ => Icons.memory,
+                  },
+                  color: switch (phase) {
+                    QemuPhase.installed => const Color(0xFF3DDC84),
+                    QemuPhase.error => const Color(0xFFFF7A7A),
+                    _ => Colors.orangeAccent,
+                  },
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _statusLabel,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 20),
+            _kv('状态', phase == QemuPhase.installed ? info : '一键完成以下三步'),
+            _kv('qemu', '/usr/bin/qemu-x86_64-static（apt 安装，静态 aarch64）'),
+            _kv('多架构库', 'libc6 / libstdc++6 / libgcc-s1 / zlib1g / libatomic1 (amd64)'),
+            _kv('转发层', '引擎 android-*/linux-arm64 → qemu；SDK 工具 .foa-real → qemu'),
+            if (busy) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(
+                minHeight: 6,
+                borderRadius: BorderRadius.all(Radius.circular(3)),
+              ),
+              const SizedBox(height: 6),
+              const Text('apt 装包 / 引擎产物预下载（约 1GB）/ 工具接管均在容器内进行',
+                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
+            if (verifying) ...[
+              const SizedBox(height: 12),
+              const LinearProgressIndicator(
+                minHeight: 6,
+                borderRadius: BorderRadius.all(Radius.circular(3)),
+              ),
+              const SizedBox(height: 6),
+              const Text('正在重新验证…',
+                  style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
+            if (phase == QemuPhase.error && error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SelectableText(error,
+                  style: const TextStyle(
+                      fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+            const SizedBox(height: 12),
+            Text(
+              '解决 Flutter 官方 SDK 只发布 x86_64 宿主工具（gen_snapshot / '
+              'impellerc / aapt2 / zipalign…）导致的 Exec format error：在容器内安装 '
+              'qemu-user-static 与 x86_64 多架构运行库，把引擎产物与 SDK 工具替换为 '
+              '「qemu 转发脚本」。已按 Flutter issue #189724/#168980 核实，'
+              '并内置分步冒烟验证（qemu → 动态链接器 → gen_snapshot --help）。\n'
+              '注意：QEMU 为动态翻译，AOT 编译阶段会比原生慢；此层是官方 SDK 在 '
+              'aarch64 上完成 flutter build apk 的必要补丁。',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                if (phase == QemuPhase.installed) ...[
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: verifying ? null : onVerify,
+                      icon: const Icon(Icons.verified_outlined, size: 18),
+                      label: const Text('重新验证'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: busy || verifying ? null : onUninstall,
+                      icon: const Icon(Icons.delete_outline, size: 18),
+                      label: const Text('卸载'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFFFF7A7A),
+                      ),
+                    ),
+                  ),
+                ] else ...[
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: rootfsReady && !busy ? onApply : null,
+                      icon: const Icon(Icons.memory, size: 18),
+                      label: Text(busy ? '应用中…' : '一键应用'),
                     ),
                   ),
                 ],

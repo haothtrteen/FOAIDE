@@ -13,6 +13,7 @@ void main() {
   // 与 targetSdk 无关，见 android/app/src/main/res/values/colors.xml 注释）上会跳过
   // setStatusBarColor/setNavigationBarColor——运行时设色在这类设备上无效，系统栏
   // 颜色由主题 XML 声明兜底（styles.xml 的 android:statusBarColor/navigationBarColor）。
+  // 主题切换时 AppBarTheme.systemOverlayStyle 负责各版本的图标明暗。
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor: Color(0xFF101418),
@@ -31,13 +32,20 @@ class FoaApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => EnvState()..bootstrap(),
-      child: MaterialApp(
-        title: 'Flutter On Android',
-        debugShowCheckedModeBanner: false,
-        theme: FoaTheme.dark(),
-        home: const HomePage(),
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => EnvState()..bootstrap()),
+        ChangeNotifierProvider(create: (_) => ThemeController()),
+      ],
+      child: Consumer<ThemeController>(
+        builder: (context, tc, _) => MaterialApp(
+          title: 'Flutter On Android',
+          debugShowCheckedModeBanner: false,
+          theme: FoaTheme.light(),
+          darkTheme: FoaTheme.dark(),
+          themeMode: tc.mode,
+          home: const HomePage(),
+        ),
       ),
     );
   }

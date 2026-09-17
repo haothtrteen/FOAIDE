@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-/// 全局主题：暗色 IDE 风格，Android 绿为种子色。
+/// 全局主题：暗色 IDE 风格 + 浅色主题，Android 绿为种子色。
 class FoaTheme {
   static const seed = Color(0xFF3DDC84);
   static const bg = Color(0xFF101418);
@@ -31,5 +31,39 @@ class FoaTheme {
         ),
       ),
     );
+  }
+
+  /// 浅色主题：同一 Android 绿种子，亮色配色；状态栏深色图标。
+  static ThemeData light() {
+    final scheme = ColorScheme.fromSeed(
+      seedColor: seed,
+      brightness: Brightness.light,
+    );
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: scheme,
+      appBarTheme: const AppBarTheme(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        systemOverlayStyle: SystemUiOverlayStyle(
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.dark, // Android：深色图标
+          statusBarBrightness: Brightness.light, // iOS：浅色状态栏背景
+        ),
+      ),
+    );
+  }
+}
+
+/// 主题切换控制器：暗色 / 浅色 / 跟随系统。
+class ThemeController extends ChangeNotifier {
+  ThemeMode _mode = ThemeMode.dark;
+  ThemeMode get mode => _mode;
+
+  set mode(ThemeMode m) {
+    if (_mode == m) return;
+    _mode = m;
+    notifyListeners();
   }
 }

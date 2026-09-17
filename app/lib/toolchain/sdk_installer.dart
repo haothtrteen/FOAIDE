@@ -433,18 +433,19 @@ class AndroidSdkInstaller {
   }
 }
 
-/// Flutter SDK（linux-aarch64）安装编排。
+/// Flutter SDK（官方 x64 + QEMU 兼容层转发）安装编排。
 ///
-/// ⚠️ 关键事实（2026-09-17 沙箱实测）：
+/// ⚠️ 关键事实（2026-09-17 真机核实）：
 /// - Flutter 官方 Linux 仅发布 x64 构建（releases_linux.json 全量检索无
-///   arm64），而本应用目标设备是 aarch64 → 必须用官方 Dart SDK
-///   linux-arm64（与 Flutter 配套的 dart 版本 3.13.3）替换
-///   /opt/flutter/bin/cache/dart-sdk，并写回 version 文件（flutter 工具
-///   启动时校验该文件与 flutter.version.json 的 dartSdkVersion 一致，
-///   不一致会尝试重新下载 x64 dart-sdk 而失败）；
-/// - flutter_tools.snapshot 是架构无关的 Dart 快照，替换 dart-sdk 后
-///   `flutter build apk` 可正常运行（构建产物面向 android 目标架构，
-///   与宿主架构无关）；
+///   arm64），且 bin/cache/flutter_tools.snapshot 是 **app-jit 快照，
+///   含 x64 机器码（架构相关）**——真机用 arm64 dart 运行报
+///   "Snapshot not compatible ... requires x64 linux ... VM has arm64"；
+/// - 因此本安装器**保留官方 x64 dart-sdk 原样**（不再替换 arm64），
+///   x64 工具链由「x64 兼容层(QEMU)」统一转发：qemu-x86_64 模拟执行
+///   dart / dartaotruntime / gen_snapshot / aapt2 等 x64 ELF；
+/// - 安装顺序建议：先应用 x64 兼容层，再装本 SDK（验证阶段依赖 dart
+///   已被 qemu 转发）；顺序反了也能用——兼容层卡片「重新应用」会自动
+///   补上 dart 转发与引擎产物同步；
 /// - 国内分段源：storage.flutter-io.cn 同时镜像 flutter_infra_release 与
 ///   dart-archive 且支持 Range（206）；华为云 dart 镜像不支持 Range、
 ///   TUNA/华为云 flutter 镜像 404，故国内源仅收录 flutter-io.cn；
@@ -452,13 +453,10 @@ class AndroidSdkInstaller {
 ///   [AptTools.ensure]。
 class FlutterSdkInstaller {
   static const String version = '3.47.4';
-  static const String dartVersion = '3.13.3';
   static const String tarFile = 'flutter_linux_$version-stable.tar.xz';
   static const int tarSize = 1576174568; // Content-Length（flutter-io.cn）
   static const String tarSha256 =
       '5b45f0ceda99b9bebdc873e7e69f6450aeb4c30f454b505e2e62fc9255a907d3';
-  static const String dartFile = 'dartsdk-linux-arm64-release.zip';
-  static const int dartSize = 236311244; // Content-Length（google 实测）
   static const String flutterHome = '/opt/flutter';
 
   static List<MirrorSource> domesticMirrors() => const [
@@ -477,35 +475,28 @@ class FlutterSdkInstaller {
         ),
       ];
 
-  static List<MirrorSource> dartDomesticMirrors() => const [
-        MirrorSource(
-          'Flutter 官方中国',
-          'https://storage.flutter-io.cn/dart-archive/channels/stable/'
-          'release/$dartVersion/sdk/$dartFile',
-        ),
-      ];
-
-  static List<MirrorSource> dartForeignMirrors() => const [
-        MirrorSource(
-          'Google 官方',
-          'https://storage.googleapis.com/dart-archive/channels/stable/'
-          'release/$dartVersion/sdk/$dartFile',
-        ),
-      ];
-
-  /// 重新验证：flutter 可执行 + arm64 dart-sdk 在位，输出 `flutter --version`。
+  /// 重新验证：flutter + dart 在位，输出 `flutter --version`。
+  /// 若 x64 dart 尚未被 QEMU 兼容层转发（Exec format error / 快照不兼容），
+  /// 返回「已安装但需启用兼容层」提示而非 null，避免误导为未安装。
   static Future<String?> verify(ProotBridge bridge) async {
     final r = await bridge.exec(
-      'if [ -x $flutterHome/bin/flutter ] '
-      '&& [ -x $flutterHome/bin/cache/dart-sdk/bin/dart ] '
-      '&& [ "\$(cat $flutterHome/bin/cache/dart-sdk/version 2>/dev/null)" = '
-      '"$dartVersion" ]; then '
-      '$flutterHome/bin/flutter --version 2>&1 | head -1; '
-      'else echo __NOT_INSTALLED__; fi',
+      'if [ ! -x $flutterHome/bin/flutter ] '
+      '|| [ ! -x $flutterHome/bin/cache/dart-sdk/bin/dart ]; then '
+      'echo __NOT_INSTALLED__; exit 0; fi; '
+      'out=\$( $flutterHome/bin/flutter --version 2>&1 | head -1 ); '
+      'case "\$out" in '
+      '*"cannot execute"*|*"Exec format"*|*"Snapshot not compatible"*'
+      '|*"error while loading shared libraries"*) '
+      'echo __NEED_QEMU__ ;; '
+      '*) echo "\$out" ;; '
+      'esac',
       timeoutSec: 300,
     );
     if (r.exitCode != 0 || r.stdout.contains('__NOT_INSTALLED__')) {
       return null;
+    }
+    if (r.stdout.contains('__NEED_QEMU__')) {
+      return 'Flutter $version 已安装（x64 工具链需先应用「x64 兼容层(QEMU)」）';
     }
     final v = r.stdout.trim();
     return v.isEmpty ? null : v;
@@ -529,8 +520,8 @@ class FlutterSdkInstaller {
   }
 
   /// 本地安装兜底（2026-09-17）：用户用系统文件选择器指定 Flutter tarball
-  /// （$tarFile）或 Dart arm64 SDK zip（$dartFile）之一；按文件名/大小匹配，
-  /// 校验后拷贝进下载缓存，未提供的部分仍走网络下载。
+  /// （$tarFile）；按文件名/大小匹配，SHA-256 校验后拷贝进下载缓存。
+  /// x64 工具链由 QEMU 兼容层转发，无需单独导入 Dart SDK。
   static Future<String> installFromLocalFile(
     ProotBridge bridge,
     EnvInfo env,
@@ -553,12 +544,10 @@ class FlutterSdkInstaller {
     String? dlName;
     if (name == tarFile || len == tarSize) {
       dlName = tarFile;
-    } else if (name == dartFile || len == dartSize) {
-      dlName = dartFile;
     } else {
       throw DownloadException(
-        '无法识别所选文件：需要 Flutter tarball（$tarFile，$tarSize 字节）'
-        '或 Dart arm64 SDK zip（$dartFile，$dartSize 字节）',
+        '无法识别所选文件：需要 Flutter tarball（$tarFile，$tarSize 字节）。\n'
+        '（x64 工具链由 QEMU 兼容层转发，无需单独导入 Dart SDK）',
       );
     }
     onPhase?.call('importing');
@@ -584,8 +573,8 @@ class FlutterSdkInstaller {
         token: token);
   }
 
-  /// 安装主流程（网络下载 / 本地导入共用）：apt 工具保障 → tarball →
-  /// dart arm64（快路径跳过已就位文件）→ 解压替换 → 验证。
+  /// 安装主流程（网络下载 / 本地导入共用）：apt 工具保障 → tarball
+  /// （快路径跳过已就位文件）→ 解压归位（保留官方 x64 dart-sdk）→ 验证。
   static Future<String> _installCommon(
     ProotBridge bridge,
     EnvInfo env, {
@@ -634,35 +623,7 @@ class FlutterSdkInstaller {
       );
     }
 
-    // 2. Dart SDK linux-arm64（快路径：尺寸校验；官方无该文件 sha 摘要）
-    final dartPath = '${dlDir.path}/$dartFile';
-    var needDart = true;
-    final dz = File(dartPath);
-    if (await dz.exists() && await dz.length() == dartSize) {
-      needDart = false;
-    } else {
-      if (await dz.exists()) await dz.delete();
-    }
-    if (needDart) {
-      onPhase?.call('probing');
-      final ordered = await _pickFastestDomesticFirst(
-        dartDomesticMirrors(),
-        dartForeignMirrors(),
-        token: token,
-      );
-      onPhase?.call('downloading');
-      await SdkDownloader.downloadMultiSource(
-        ordered,
-        dartPath,
-        dartSize,
-        segments: 4,
-        token: token,
-        onMirrorUsed: onMirrorUsed,
-        onProgress: onProgress,
-      );
-    }
-
-    // 3. 解压 tarball → 替换 dart-sdk → 写 version → 验证
+    // 2. 解压 tarball → 归位（保留官方 x64 dart-sdk，由 QEMU 兼容层转发）→ 验证
     // Bug 411（2026-09-17 真机抓到）：原命令 d=$(ls -d /opt/flutter*) 取到的
     // 就是刚解压出的 /opt/flutter 本身，紧接着 rm -rf /opt/flutter 把它删掉，
     // mv "$d" /opt/flutter 必报 "cannot stat"——官方 tarball 顶层目录恰好叫
@@ -676,10 +637,6 @@ class FlutterSdkInstaller {
       'd=\$(ls -d /opt/foa-flutter-stage/* 2>/dev/null | head -1) && '
       'rm -rf $flutterHome && mv "\$d" $flutterHome && '
       'rm -rf /opt/foa-flutter-stage && '
-      'rm -rf $flutterHome/bin/cache/dart-sdk && '
-      'mkdir -p $flutterHome/bin/cache && '
-      'unzip -qo /opt/foa-dl/$dartFile -d $flutterHome/bin/cache/ && '
-      'printf "$dartVersion\n" > $flutterHome/bin/cache/dart-sdk/version && '
       'chmod -R a+rX $flutterHome && '
       'echo FLUTTER_EXTRACT_OK',
       timeoutSec: 900,
@@ -693,13 +650,20 @@ class FlutterSdkInstaller {
 
     onPhase?.call('validating');
     final v = await bridge.exec(
-      '$flutterHome/bin/flutter --version 2>&1 | head -1',
+      'out=\$( $flutterHome/bin/flutter --version 2>&1 | head -1 ); '
+      'echo "\$out"',
       timeoutSec: 600,
     );
-    if (v.exitCode != 0) {
-      throw DownloadException('Flutter 验证失败：${v.stderr}');
+    if (v.exitCode != 0 ||
+        v.stdout.contains('cannot execute') ||
+        v.stdout.contains('Exec format') ||
+        v.stdout.contains('Snapshot not compatible')) {
+      throw DownloadException(
+        'Flutter 验证失败（x64 工具链未就绪）：${v.stdout.trim()}\n'
+        '请先在工具链页应用「x64 兼容层(QEMU)」后重试',
+      );
     }
-    // 清理下载缓存（tarball 1.5GB + dart 225MB）
+    // 清理下载缓存（tarball 约 1.5GB）
     await bridge.exec('rm -rf /opt/foa-dl', timeoutSec: 60);
     return v.stdout.trim();
   }
