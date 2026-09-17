@@ -377,17 +377,23 @@ class _ToolchainPageState extends State<ToolchainPage> {
     setState(() => _asdkVerifying = true);
     try {
       final v = await AndroidSdkInstaller.verify(_bridge);
+      var detail = '';
+      if (v == null) {
+        // 精确到文件的缺失清单（Bug 417）
+        final miss = await AndroidSdkInstaller.diagnose(_bridge);
+        detail = miss.isEmpty ? '' : '缺少 ${miss.join('、')}';
+      }
       if (!mounted) return;
       setState(() {
         _asdkVerifying = false;
         _asdkPhase = v == null ? SdkPhase.idle : SdkPhase.installed;
-        _asdkInfo = v ?? '';
+        _asdkInfo = v ?? (detail.isEmpty ? '' : 'Android SDK 未完整安装：$detail');
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
             v == null
-                ? '验证失败：Android SDK 关键组件缺失'
+                ? '验证失败：Android SDK 关键组件缺失${detail.isEmpty ? '' : '（$detail）'}'
                 : '验证通过：$v',
           ),
           duration: const Duration(seconds: 4),

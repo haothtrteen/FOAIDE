@@ -423,7 +423,7 @@ class _HomePageState extends State<HomePage> {
                         Text('Flutter On Android',
                             style: TextStyle(
                                 fontSize: 15, fontWeight: FontWeight.bold)),
-                        Text('v0.1.0-alpha.25 · 在 Android 上原生构建 APK',
+                        Text('v0.1.0-alpha.26 · 在 Android 上原生构建 APK',
                             style: TextStyle(fontSize: 12)),
                       ],
                     ),

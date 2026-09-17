@@ -11,6 +11,8 @@ class AndroidSdkComponent {
   final int size; // 字节
   final String sha1; // repo2-3.xml checksum（SHA-1）
   final String guestDir; // $ANDROID_HOME 下的目标目录
+  final String keyPath; // 解压后关键文件（相对 $sdkHome），逐组件校验用
+  final String keyTest; // 校验方式：'x' 可执行 / 'f' 普通文件
 
   const AndroidSdkComponent({
     required this.id,
@@ -18,6 +20,8 @@ class AndroidSdkComponent {
     required this.size,
     required this.sha1,
     required this.guestDir,
+    required this.keyPath,
+    required this.keyTest,
   });
 }
 
@@ -175,6 +179,8 @@ class AndroidSdkInstaller {
       size: 9054187,
       sha1: '477254aa5f903c15cf51001717bdf347fb6b53e0',
       guestDir: 'platform-tools',
+      keyPath: 'platform-tools/adb',
+      keyTest: 'x',
     ),
     AndroidSdkComponent(
       id: 'platforms;android-36',
@@ -182,6 +188,8 @@ class AndroidSdkInstaller {
       size: 65878410,
       sha1: '2c1a80dd4d9f7d0e6dd336ec603d9b5c55a6f576',
       guestDir: 'platforms/android-36',
+      keyPath: 'platforms/android-36/android.jar',
+      keyTest: 'f',
     ),
     AndroidSdkComponent(
       id: 'build-tools;36.0.0',
@@ -189,6 +197,11 @@ class AndroidSdkInstaller {
       size: 63737259,
       sha1: 'b0b6376977657e8ad9b969bacf4093601da2c6fb',
       guestDir: 'build-tools/36.0.0',
+      // ⚠️ Google 归档怪癖（2026-09-17 实测）：build-tools_r36_linux.zip
+      // 顶层目录是 android-16（历史命名沿袭），解压后靠「取顶层条目改名归位」
+      // 落到 build-tools/36.0.0；关键文件 aapt2 在 zip 内为 android-16/aapt2。
+      keyPath: 'build-tools/36.0.0/aapt2',
+      keyTest: 'x',
     ),
     AndroidSdkComponent(
       id: 'cmdline-tools;latest',
@@ -196,6 +209,8 @@ class AndroidSdkInstaller {
       size: 181052239,
       sha1: 'e025545c62a8e64c7559119566a569fb1dec5f60',
       guestDir: 'cmdline-tools/latest',
+      keyPath: 'cmdline-tools/latest/bin/sdkmanager',
+      keyTest: 'x',
     ),
   ];
 
@@ -215,22 +230,39 @@ class AndroidSdkInstaller {
         ),
       ];
 
-  /// 重新验证：adb + aapt2 + android.jar + licenses 四查。
-  static Future<String?> verify(ProotBridge bridge) async {
+  /// 诊断：逐项检查 4 个关键文件，返回缺失路径清单（空 = 全部就位）。
+  /// 把「关键组件缺失」从笼统报错升级为精确到文件的缺失列表，
+  /// 便于用户一眼定位缺哪个组件（Bug 417，2026-09-17 真机）。
+  static Future<List<String>> diagnose(ProotBridge bridge) async {
     final r = await bridge.exec(
-      'if [ -x $sdkHome/platform-tools/adb ] '
-      '&& [ -x $sdkHome/build-tools/36.0.0/aapt2 ] '
-      '&& [ -f $sdkHome/platforms/android-36/android.jar ] '
-      '&& [ -f $sdkHome/licenses/android-sdk-license ]; then '
-      '$sdkHome/platform-tools/adb --version 2>&1 | head -1; '
-      'else echo __NOT_INSTALLED__; fi',
+      'for p in '
+      '$sdkHome/platform-tools/adb '
+      '$sdkHome/build-tools/36.0.0/aapt2 '
+      '$sdkHome/platforms/android-36/android.jar '
+      '$sdkHome/licenses/android-sdk-license; do '
+      '[ -e "\$p" ] && echo "OK \$p" || echo "MISS \$p"; done',
       timeoutSec: 60,
     );
-    if (r.exitCode != 0 || r.stdout.contains('__NOT_INSTALLED__')) {
-      return null;
+    final missing = <String>[];
+    for (final line in r.stdout.split('\n')) {
+      final t = line.trim();
+      if (t.startsWith('MISS ')) missing.add(t.substring(5));
     }
+    return missing;
+  }
+
+  /// 重新验证：四查关键文件 + adb 版本冒烟。
+  /// 返回 null 表示未完整安装（缺文件），与相位模型兼容；
+  /// 缺失明细用 [diagnose] 获取。
+  static Future<String?> verify(ProotBridge bridge) async {
+    final miss = await diagnose(bridge);
+    if (miss.isNotEmpty) return null;
+    final r = await bridge.exec(
+      '$sdkHome/platform-tools/adb --version 2>&1 | head -1',
+      timeoutSec: 60,
+    );
     final v = r.stdout.trim();
-    if (v.isEmpty) return null;
+    if (v.isEmpty) return 'Android SDK 已安装（adb 版本未知）';
     // aapt2/adb 为 x64 宿主二进制：兼容层未装/已卸载时 Exec format error，
     // 返回「需兼容层」提示而非把报错当版本号（避免"已安装"假象）。
     if (v.contains('cannot execute') ||
@@ -372,7 +404,10 @@ class AndroidSdkInstaller {
       }
 
       // 解压：先到 /opt/foa-sdk-stage 暂存，再取顶层目录 mv 归位（各 zip
-      // 顶层目录名不一：platform-tools/、android-36/、cmdline-tools/ 等）
+      // 顶层目录名不一：platform-tools/、android-36/、build-tools 的
+      // android-16/、cmdline-tools/ 等——统一「取顶层条目改名归位」）。
+      // 归位后立即校验该组件关键文件，缺失即报错并输出暂存目录结构，
+      // 精确暴露「哪个组件、缺哪个文件」，不再笼统"关键组件缺失"（Bug 417）。
       onPhase?.call('extracting');
       final slash = c.guestDir.lastIndexOf('/');
       final parent =
@@ -384,10 +419,20 @@ class AndroidSdkInstaller {
         'mkdir -p $parent && '
         'rm -rf $sdkHome/${c.guestDir} && '
         'mv "\$d" $sdkHome/${c.guestDir} && '
-        'rm -rf /opt/foa-sdk-stage && echo SDK_COMPONENT_OK',
+        'if [ -${c.keyTest} $sdkHome/${c.keyPath} ]; then '
+        'rm -rf /opt/foa-sdk-stage; echo SDK_COMPONENT_OK; '
+        'else '
+        'echo "KEYFILE_MISSING $sdkHome/${c.keyPath}"; '
+        'echo STAGE_TOP; ls -d /opt/foa-sdk-stage/* 2>/dev/null; '
+        'exit 4; fi',
         timeoutSec: 300,
       );
       if (ex.exitCode != 0 || !ex.stdout.contains('SDK_COMPONENT_OK')) {
+        if (ex.stdout.contains('KEYFILE_MISSING')) {
+          throw DownloadException(
+            '组件 ${c.id} 解压失败：${ex.stdout.trim()}',
+          );
+        }
         throw DownloadException(
           '组件 ${c.id} 解压失败：'
           '${ex.stderr.trim().isEmpty ? ex.stdout.trim() : ex.stderr.trim()}',
@@ -409,13 +454,19 @@ class AndroidSdkInstaller {
     }
 
     onPhase?.call('validating');
-    final v = await verify(bridge);
-    if (v == null) {
-      throw DownloadException('Android SDK 验证失败：关键组件缺失');
+    // 用 diagnose 精确报缺失路径（不再笼统"关键组件缺失"，Bug 417）
+    final miss = await diagnose(bridge);
+    if (miss.isNotEmpty) {
+      throw DownloadException(
+        'Android SDK 验证失败：缺少 ${miss.join('、')}（组件已解压但关键文件未就位）。\n'
+        '可点「下载并安装」重试；仍失败建议先卸载 Android SDK 后重装，'
+        '或用「从本地存储选择安装」逐个导入组件 zip。',
+      );
     }
+    final v = await verify(bridge);
     // 清理下载缓存（4 个 zip 约 320MB）
     await bridge.exec('rm -f /opt/foa-dl/*.zip', timeoutSec: 60);
-    return v;
+    return v ?? 'Android SDK 已安装';
   }
 
   /// 国内优先分级探测：国内全部不可达才回退境外。
