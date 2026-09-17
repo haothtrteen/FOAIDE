@@ -926,6 +926,43 @@ Snapshot not compatible: /opt/flutter/bin/cache/flutter_tools.snapshot
 
 ---
 
+### 10.14 · x64 兼容层卸载"没效果"：`apt-get purge | tail || true` 管道吞掉退出码（Bug 416，2026-09-17）
+
+**症状**：工具链页点「x64 兼容层」卸载，确认后界面恢复"已启用"，qemu 转发层原样残留——卸载看起来完全没生效。Flutter SDK / Android SDK 的卸载则正常。
+
+**原因**：卸载脚本核心行
+```
+DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq qemu-user-static libc6:amd64 ... 2>&1 | tail -n 5 || true
+```
+存在双重吞错：管道 `| tail` 使 `$?` 取 tail 的退出码（0），`|| true` 再把任何失败吞掉；apt purge 失败（如依赖残留、包不存在）时脚本照样走到 `echo UNINSTALL_OK`，Dart 侧只看 `ok`/stdout 即认为卸载成功。随后 `verify()` 发现 qemu 二进制仍在 → 卡片显示"已启用" → 用户看到的就是"卸载没效果"。沙箱对照实测：旧写法失败时输出 `UNINSTALL_OK`（exit 0），新写法输出 `PURGE_FAILED rc=100`（exit 2）。
+
+**解决**（`qemu_compat.dart`）：
+- 卸载脚本改为**逐条捕获状态**：`apt-get purge ... > /tmp/foa_purge.log 2>&1; rc=$?`，非零即 `echo PURGE_FAILED; exit 2`；再补一道 `[ -x qemu-x86_64-static ] && exit 3`（防 purge 半成功残留）；
+- `QemuCompat.uninstall()` 检查 stdout 含 `PURGE_FAILED`/`QEMU_STILL_PRESENT` 或非零退出码即抛 `DownloadException`，UI 显示真实错误而非假装成功；
+- 顺手补 `AndroidSdkInstaller.verify`：兼容层卸载后 `adb --version` 报 Exec format error，此前被当成"版本号"显示（"已安装"假象），现在识别为「需先应用兼容层」提示。
+
+**验证**：沙箱 mock `apt-get` 返回 100——旧写法静默 `UNINSTALL_OK`，新写法 `PURGE_FAILED` + exit 2（逐字核对）；`sh -n` 语法通过；真机复测卸载流程待确认。
+
+**教训**：
+- **管道会吃掉左侧命令的退出码**——shell 里要拿真实状态必须 `cmd > log 2>&1; rc=$?`，再判断 `rc`；`| tail || true` 这类写法只适合"展示输出、无所谓成败"的场景；
+- 卸载这类**破坏性操作必须验后效**（qemu 二进制是否真的消失），不能只信脚本最后一行 echo；
+- 安装/卸载流程结束后要重新 verify 并让状态与真实文件系统一致，否则 UI 状态与磁盘状态脱节会造成"没效果"假象。
+
+---
+
+### 10.15 · 工具链安装顺序 UX：兼容层必须先于 SDK（防小白装反，2026-09-17 优化）
+
+**症状**：新手先装 Flutter SDK 再装兼容层时，SDK 安装末尾验证必报 `Snapshot not compatible`（x64 快照无 QEMU 转发），卡片显示"安装失败"，用户困惑（磁盘上其实已装好）。
+
+**解决**（`toolchain_page.dart`）：
+- 卡片顺序调整为：**x64 兼容层(QEMU) 置顶** → JDK → Android SDK → Flutter SDK → 构建镜像；
+- `_SdkCard` 新增 `orderReady`/`orderHint` 门控：兼容层未应用时，Android SDK / Flutter SDK 的「下载并安装」与「从本地存储选择安装」按钮禁用，并显示黄色门槛提示（含"装反了无需卸载，点兼容层重新应用自动补上"）；
+- `SdkPhase` 新增 `uninstalling`，卸载过程有视觉反馈与错误捕获。
+
+**教训**：有强依赖顺序的安装流程，UI 必须把依赖项放在被依赖项之前并做门控——靠 desc 文案"建议先装"拦不住小白，按钮直接禁用 + 提示最有效。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
