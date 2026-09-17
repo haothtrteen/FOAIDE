@@ -963,6 +963,32 @@ DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq qemu-user-static libc6:amd64
 
 ---
 
+### 10.16 · Android SDK 安装报"关键组件缺失"但不知道缺哪个（Bug 417，2026-09-17）
+
+**症状**：Android SDK 四个组件下载/解压后，安装末尾验证报笼统的「Android SDK 验证失败：关键组件缺失」，卡片停在"安装失败"（"下载并安装"可重试但用户无法定位问题）。真机复现，沙箱无法直接复现（x86_64 宿主跑不了 proot 容器）。
+
+**排查**（沙箱取证，`mirrors.cloud.tencent.com/AndroidSDK/`）：
+- Range 拉取 4 个 zip 末尾 3MB（中央目录区）列顶层条目：`platform-tools/`、`android-36/`、`android-16/`（!）、`cmdline-tools/`——全部**单顶层目录**；
+- **Google 归档怪癖**：`build-tools_r36_linux.zip` 顶层目录是 `android-16`（历史命名沿袭），但内容确实是 build-tools 36.0.0（aapt2/d8/apksigner/zipalind 齐全）；
+- 沙箱完整解压 `build-tools` 走现有「取顶层条目 `ls | head -1` → mv 改名归位」逻辑：`android-16` → `build-tools/36.0.0`，aapt2 落位且可执行——**解压算法本身无问题**；
+- 结论：结构正常，真机失败点未知（proot/unzip/环境），**错误信息必须能自诊断**。
+
+**解决**（`sdk_installer.dart`）：
+- 新增 `AndroidSdkComponent.keyPath/keyTest`（每个组件的关键文件 + 校验方式 x/f）；
+- 解压循环**归位后立即校验关键文件**：缺失输出 `KEYFILE_MISSING <路径>` + 暂存目录结构，exit 4，报错精确到「组件 X 解压失败：缺少 Y」；
+- 新增 `diagnose()`：逐项 `[ -e ]` 检查 4 个关键文件，返回缺失路径清单；
+- `verify()` 改为基于 `diagnose`（缺文件返回 null，兼容相位模型）；`_installCommon` 末尾用 `diagnose` 抛「缺少 …」明细；「重新验证」按钮同样展示缺失清单；
+- 报错附处置建议：重试 / 先卸载后重装 / 「从本地存储选择安装」逐个导入。
+
+**验证**：沙箱 mock 正常/缺失两条路径——正常 `SDK_COMPONENT_OK` exit 0，缺失 `KEYFILE_MISSING /opt/android-sdk/build-tools/36.0.0/aapt2` exit 4；`flutter analyze` 零 error；真机复测待装机确认。
+
+**教训**：
+- **笼统错误信息是排障的最大障碍**——"关键组件缺失"不如"缺少 build-tools/36.0.0/aapt2"一个词有用；安装这类多组件流程，每个环节都要能自证（逐组件校验关键文件）；
+- 沙箱（x86_64）能证伪"算法问题"（解压逻辑正确），但真机环境（proot/权限/存储）的差异只能靠**设备侧自诊断**收敛；
+- Google SDK 归档顶层目录名与版本号无关（`android-16` 装的是 36.0.0），代码必须按「取顶层条目改名归位」而非硬编码目录名。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
