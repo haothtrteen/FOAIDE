@@ -1,25 +1,155 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../toolchain/build_page.dart';
+import '../demo/demo_project_creator.dart';
+import '../demo/demo_templates.dart';
 import '../env/env_installer.dart';
 import '../editor/editor_page.dart';
 import '../filemanager/file_browser_page.dart';
+import '../filemanager/fs_browser_bridge.dart';
+import '../toolchain/build_page.dart';
 import '../toolchain/toolchain_page.dart';
 import 'terminal_page.dart';
 
-/// Step 1 主页：环境状态 + 初始化引导。
-class HomePage extends StatelessWidget {
+/// Step 7 主页：环境状态 + 工具入口宫格 + 工程列表（FusionApp 式卡片 + FAB 创建）。
+class HomePage extends StatefulWidget {
   const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  final FileBrowserBridge _fb = FileBrowserBridge();
+
+  List<FsBrowserEntry> _projects = const [];
+  bool _didLoad = false; // 防重复加载标志
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadProjects());
+  }
+
+  /// 加载容器 /root/projects 工程列表。
+  Future<void> _loadProjects() async {
+    final env = context.read<EnvState>();
+    if (!env.isInstalled) {
+      if (mounted) setState(() => _projects = const []);
+      return;
+    }
+    try {
+      final r = await _fb.browse('/root/projects');
+      if (!mounted) return;
+      setState(() {
+        _projects = r.entries.where((e) => e.isDir).toList()
+          ..sort((a, b) => b.mtime.compareTo(a.mtime));
+      });
+    } catch (_) {
+      // 加载失败静默：下一次下拉/刷新重试
+    }
+  }
+
+  // ============================ 创建 / 删除 ============================
+
+  Future<void> _showCreateSheet() async {
+    final env = context.read<EnvState>();
+    final created = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Theme.of(context).colorScheme.surfaceContainerLow,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => _CreateDemoSheet(ready: env.isInstalled),
+    );
+    if (created == true && mounted) {
+      await _loadProjects();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('工程已创建，点卡片可直接开始构建')),
+        );
+      }
+    }
+  }
+
+  Future<void> _showProjectMenu(FsBrowserEntry p) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Theme.of(context).colorScheme.surfaceContainerLow,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text(p.name,
+                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text('/root/projects/${p.name}',
+                  style: const TextStyle(fontSize: 12)),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: Color(0xFFFF7A7A)),
+              title: const Text('删除工程', style: TextStyle(color: Color(0xFFFF7A7A))),
+              onTap: () => Navigator.of(ctx).pop('delete'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.close),
+              title: const Text('取消'),
+              onTap: () => Navigator.of(ctx).pop(),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (action != 'delete' || !mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除工程'),
+        content: Text('删除 /root/projects/${p.name} 及其全部文件？\n（外部工作区同步的副本不受影响）'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: const Color(0xFFFF7A7A)),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    final r = await DemoProjectCreator().delete(p.name);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(r.ok ? '已删除 ${p.name}' : '删除失败：${r.error}'),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+    _loadProjects();
+  }
+
+  // ============================ 构建 ============================
 
   @override
   Widget build(BuildContext context) {
     final env = context.watch<EnvState>();
+    // rootfs 就绪后自动补一次工程列表（环境由未装 → 已装）
+    if (env.isInstalled && !_didLoad) {
+      _didLoad = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadProjects());
+    }
     return Scaffold(
       appBar: AppBar(
-        title: const SafeArea(
-          child: Text('Flutter On Android · Step 1'),
-        ),
+        title: const SafeArea(child: Text('Flutter On Android')),
         actions: [
           IconButton(
             tooltip: '重新检测',
@@ -28,13 +158,352 @@ class HomePage extends StatelessWidget {
           ),
         ],
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          _StatusCard(env: env),
-          const SizedBox(height: 12),
-          _ActionCard(env: env),
-        ],
+      floatingActionButton: FloatingActionButton(
+        onPressed: _showCreateSheet,
+        tooltip: '创建 Demo 工程',
+        child: const Icon(Icons.add),
+      ),
+      body: RefreshIndicator(
+        onRefresh: _loadProjects,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
+          children: [
+            _StatusCard(env: env),
+            const SizedBox(height: 12),
+            _ActionCard(env: env),
+            const SizedBox(height: 16),
+            _buildProjectsSection(env),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProjectsSection(EnvState env) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Text('工程',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(width: 8),
+            Text('${_projects.length} 个',
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+            const Spacer(),
+            IconButton(
+              tooltip: '刷新工程列表',
+              onPressed: _loadProjects,
+              icon: const Icon(Icons.refresh, size: 20),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        if (!env.isInstalled)
+          Card(
+            child: const Padding(
+              padding: EdgeInsets.all(16),
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline, color: Colors.orangeAccent),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text('rootfs 未安装，请先初始化环境后再创建工程。'),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else if (_projects.isEmpty)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  Icon(Icons.folder_open_outlined,
+                      size: 40, color: Colors.grey.shade600),
+                  const SizedBox(height: 8),
+                  const Text('暂无工程',
+                      style: TextStyle(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  Text(
+                    '点击右下角「+」选择模板，创建内置 Flutter 官方 Demo 工程。',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else
+          Card(
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              children: [
+                for (final (i, p) in _projects.indexed) ...[
+                  if (i > 0) const Divider(height: 1, indent: 72),
+                  _ProjectTile(
+                    project: p,
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => BuildPage(initialProject: p.name),
+                      ),
+                    ),
+                    onLongPress: () => _showProjectMenu(p),
+                  ),
+                ],
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// 工程卡片：圆形首字母图标 + 名称 + 路径（FusionApp 应用卡片风格改良）。
+class _ProjectTile extends StatelessWidget {
+  final FsBrowserEntry project;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  const _ProjectTile({
+    required this.project,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return ListTile(
+      leading: CircleAvatar(
+        radius: 20,
+        backgroundColor: cs.primaryContainer,
+        child: Text(
+          project.name[0].toUpperCase(),
+          style: TextStyle(
+            color: cs.onPrimaryContainer,
+            fontWeight: FontWeight.bold,
+            fontSize: 16,
+          ),
+        ),
+      ),
+      title: Text(project.name,
+          style: const TextStyle(fontWeight: FontWeight.w600)),
+      subtitle: Text(
+        '/root/projects/${project.name} · Flutter Demo',
+        style: const TextStyle(fontSize: 12),
+      ),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: onTap,
+      onLongPress: onLongPress,
+    );
+  }
+}
+
+/// 创建 Demo 工程 Bottom Sheet：项目名 + 模板 2 列网格 + 创建。
+class _CreateDemoSheet extends StatefulWidget {
+  final bool ready;
+  const _CreateDemoSheet({required this.ready});
+
+  @override
+  State<_CreateDemoSheet> createState() => _CreateDemoSheetState();
+}
+
+class _CreateDemoSheetState extends State<_CreateDemoSheet> {
+  final TextEditingController _ctrl = TextEditingController();
+  String _name = '';
+  DemoTemplate? _selected;
+  bool _creating = false;
+  String _error = '';
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _create() async {
+    final err = DemoProjectCreator.validateName(_name);
+    if (err != null) {
+      setState(() => _error = err);
+      return;
+    }
+    if (_selected == null) {
+      setState(() => _error = '请先选择一个模板');
+      return;
+    }
+    setState(() {
+      _creating = true;
+      _error = '';
+    });
+    final result = await DemoProjectCreator().create(_name, _selected!);
+    if (!mounted) return;
+    if (result != null) {
+      setState(() {
+        _creating = false;
+        _error = result;
+      });
+      return;
+    }
+    Navigator.of(context).pop(true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
+      child: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  CircleAvatar(
+                    radius: 14,
+                    backgroundColor: cs.primary,
+                    child: Icon(Icons.add, size: 18, color: cs.onPrimary),
+                  ),
+                  const SizedBox(width: 10),
+                  const Text('创建 Demo 工程',
+                      style: TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.bold)),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: _creating ? null : () => Navigator.pop(context),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+              if (!widget.ready) ...[
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0x33FF7A7A),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.warning_amber, size: 16, color: Color(0xFFFF7A7A)),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'rootfs / 工具链未就绪，创建可能失败（需先初始化环境并在工具链页安装 Flutter SDK）',
+                          style: TextStyle(fontSize: 12, color: Color(0xFFFF7A7A)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              TextField(
+                controller: _ctrl,
+                enabled: !_creating,
+                onChanged: (v) => setState(() => _name = v.trim()),
+                decoration: const InputDecoration(
+                  labelText: '项目名（目录名 / 包名）',
+                  hintText: '如 my_demo',
+                  helperText: '小写字母、数字、下划线，首字符为字母',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+              const SizedBox(height: 14),
+              const Text('选择模板',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              GridView.count(
+                crossAxisCount: 2,
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 10,
+                childAspectRatio: 2.1,
+                children: [
+                  for (final t in kDemoTemplates) _templateCard(t),
+                ],
+              ),
+              if (_error.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                SelectableText(
+                  _error,
+                  style: const TextStyle(fontSize: 12, color: Color(0xFFFF7A7A)),
+                ),
+              ],
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: _creating ? null : _create,
+                  icon: _creating
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.rocket_launch_outlined, size: 18),
+                  label: Text(_creating ? '正在创建…' : '创建工程'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _templateCard(DemoTemplate t) {
+    final cs = Theme.of(context).colorScheme;
+    final sel = _selected?.id == t.id;
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: _creating ? null : () => setState(() => _selected = t),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: sel ? cs.primaryContainer.withValues(alpha: 0.35) : cs.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: sel ? cs.primary : Colors.transparent,
+            width: 1.6,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(t.icon, size: 26, color: sel ? cs.primary : cs.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(t.name,
+                      style: const TextStyle(
+                          fontSize: 13, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 2),
+                  Text(
+                    t.description,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: 10, color: Colors.grey.shade500, height: 1.3),
+                  ),
+                ],
+              ),
+            ),
+            if (sel)
+              Icon(Icons.check_circle, size: 18, color: cs.primary),
+          ],
+        ),
       ),
     );
   }

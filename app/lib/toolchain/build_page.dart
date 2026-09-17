@@ -16,7 +16,10 @@ import '../filemanager/fs_browser_bridge.dart';
 ///   安装时用真实宿主路径（rootfsPath + 容器路径）走 FileProvider 拉起系统安装器；
 /// - 离开本页即中止构建（防 gradle daemon 管道泄漏）。
 class BuildPage extends StatefulWidget {
-  const BuildPage({super.key});
+  /// 传入后加载完成即自动开始构建该项目（主页工程卡片直达）。
+  final String? initialProject;
+
+  const BuildPage({super.key, this.initialProject});
 
   @override
   State<BuildPage> createState() => _BuildPageState();
@@ -79,6 +82,12 @@ class _BuildPageState extends State<BuildPage> {
         _projects = (list?.entries ?? const []).where((e) => e.isDir).toList();
         _loading = false;
       });
+      // 直达构建：主页卡片点入时，列表就绪后自动开始
+      final init = widget.initialProject;
+      if (init != null && env.rootfsInstalled &&
+          _projects.any((p) => p.name == init)) {
+        _startBuild(init);
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
