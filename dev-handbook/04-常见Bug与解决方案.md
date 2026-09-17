@@ -85,6 +85,35 @@ Android 10 起，`targetSdkVersion ≥ 29` 的应用被禁止 `execve()` 自身�
 
 ---
 
+### Bug 105 · 容器内 tar 找不到下载文件：`Cannot open: No such file or directory`（v0.1.0-alpha.14 抓到）
+
+**症状**：
+```
+tar (child): /tmp/OpenJDK17U-jdk_aarch64_linux_hotspot_17.0.20.1_1.tar.gz: Cannot open: No such file or directory
+tar: Error is not recoverable: exiting now
+```
+JDK 下载"已完成"（SHA-256 校验通过）后解压必败；再次点击「下载并安装」又从零开始下载 183MB。
+
+**原因**（两层）：
+1. **proot `-R` 把宿主 `/tmp` 绑进容器**。`-R` = `-r` + 推荐绑定列表，官方文档明确包含 `/tmp`、`/etc/*`、`/dev`、`/proc`、`/sys`、`$HOME`、`/run` 等宿主路径。Dart 侧把安装包下载到 `rootfs/tmp/`（容器真实 /tmp），但容器内看到的 `/tmp` 是宿主目录（Android 上为空）→ tar 必然找不到。`/opt` 不在绑定列表内，是可靠的容器内落盘点。
+2. **下载器只有单文件 `.part` 续传**：解压失败后安装包还在，但重试时 `.part` 已不存在 → 从头重下。
+
+**解决**：
+1. 下载落盘从 `rootfs/tmp/` 改为 `rootfs/opt/foa-dl/`（guest 视角 `/opt/foa-dl`），解压路径同步改为 `/opt/foa-dl/...`；
+2. 下载器重构为**多线程分段 + 多镜像并行**（`SdkDownloader.downloadMultiSource`）：文件按 4 个 Range 分片并发下载，分片 i 轮流从镜像 i%n 起步（TUNA/GitHub/Adoptium 同时传），分片失败/15s 卡住自动换下一个镜像；
+3. **分片级断点续传**：每个分片独立落盘 `<save>.p<i>`，长度即进度，重开应用/换镜像按长度续传；
+4. **快路径**：目标文件已存在且尺寸/SHA-256 校验通过 → 跳过下载直接解压（解压失败重试不再重复下载）。
+
+**验证**：安装失败后再次点击「下载并安装」，直接进入"正在解压"阶段（无下载进度条）；下载中页面镜像栏显示"TUNA 清华 + GitHub 官方"等多个镜像并行。
+
+**教训**：**proot 容器内"能写"不等于"能看到"**——`-R` 绑定目录（/tmp、/etc、$HOME…）里宿主与容器的内容互相遮蔽。容器内文件操作一律避开绑定列表；下载大文件配合"快路径复用 + 分片续传"避免重复拉取。此绑定同样影响终端里用户对 /tmp 的使用（写入会落到宿主），后续如需容器原生 /tmp 语义，应把 `-R` 换成 `-r` + 显式 `-b`（排除 /tmp）。
+
+**补充（2026-09-17，国内源分级 + 本地安装兜底）**：
+- 国内镜像实测（`curl -r 0-0`）：TUNA 清华（206 ✓）、南大 NJU（206 ✓）支持 Range 分片；华为云同路径返回 HTML 页（非文件）、阿里云/USTC/交大/腾讯/网易均 404 → 国内源仅收录 TUNA + NJU。全部不可达才回退 GitHub 官方 + Adoptium API（`JdkInstaller._pickFastestDomesticFirst`）。
+- 网络全挂时兜底：工具链页底部「从本地存储选择安装」→ `ACTION_OPEN_DOCUMENT` 系统选择器（MainActivity `onActivityResult`，原生层拷贝到 `filesDir/imports/` 再回传真实路径，规避 SAF content:// 在 proot 子进程不可读）→ 大小 + SHA-256 双重校验 → 复用解压流程（`JdkInstaller.installFromLocalFile`）。
+
+---
+
 ## 二、Flutter SDK 相关
 
 ### Bug 201 · `flutter` 命令直接 `Killed` / 闪退
@@ -591,7 +620,235 @@ Termux 构建 proot 时把 `P_tmpdir` 硬编码为 `/data/data/com.termux/files/
 
 ---
 
-## 十、提交 Bug 记录模板
+## 十、工具链 SDK 安装与构建镜像配置（2026-09-17，Step 3 扩展）
+
+> 在 JDK 之外新增：Android SDK / Flutter SDK(arm64) / 构建镜像一键配置 三张卡片（`toolchain_page.dart` 四卡片布局）。
+> 实现文件：`lib/toolchain/sdk_installer.dart`（安装编排）、`lib/toolchain/sdk_downloader.dart`（多源分段下载 + SHA-256/SHA-1 双校验）。
+
+### 10.1 · Android SDK 安装（`AndroidSdkInstaller`）
+
+**组件清单**（版本与 Flutter 3.47.4 的 compileSdk 36 对齐，清单与大小/SHA-1 来自 `repo2-3.xml`，2026-09-17 抓取）：
+
+| 组件 | 文件 | 大小 | 目标目录 |
+|---|---|---|---|
+| platform-tools r37.0.1 | `platform-tools_r37.0.1-linux.zip` | 9MB | `platform-tools` |
+| platforms;android-36 | `platform-36_r02.zip` | 66MB | `platforms/android-36` |
+| build-tools;36.0.0 | `build-tools_r36_linux.zip` | 64MB | `build-tools/36.0.0` |
+| cmdline-tools;latest | `commandlinetools-linux-16111833_latest.zip` | 181MB | `cmdline-tools/latest` |
+
+**关键决策**：
+- **国内源仅收录腾讯云**（`mirrors.cloud.tencent.com/AndroidSDK/`）：实测四个文件均支持 Range（206）；TUNA AndroidSDK 404、华为云 android_repository 401（存疑）→ 排除；
+- **SHA-1 校验**：repo2-3.xml 的 checksum 是 SHA-1（40 位十六进制），`SdkDownloader.verifySha1` 流式计算比对；
+- **解压暂存 + 顶层目录归位**：各 zip 顶层目录名不一（`platform-tools/`、`android-36/`、`cmdline-tools/`），先 unzip 到 `/opt/foa-sdk-stage` 再 `ls | head -1` 取顶层 mv 到 `guestDir`；
+- **预置 licenses**：写 `android-sdk-license`（含 8933bad1.../d56f5187.../24333f8a... 三行哈希），flutter/gradle 检查到即不再要求接受许可。
+
+### 10.2 · Flutter SDK arm64 方案（`FlutterSdkInstaller`，核心坑）
+
+**铁的事实（2026-09-17 沙箱实测）**：Flutter 官方 Linux 仅发布 x64 构建——`releases_linux.json` 全量检索无任何 arm64 条目。目标设备是 aarch64，直接跑官方包必挂。
+
+**破解思路**：
+1. 下载官方 x64 tarball（`flutter_linux_3.47.4-stable.tar.xz`，1.5GB，SHA-256 校验）；
+2. 下载**官方 Dart SDK linux-arm64**（`dartsdk-linux-arm64-release.zip`，225MB，与 Flutter 配套的 dart 3.13.3）替换 `/opt/flutter/bin/cache/dart-sdk`；
+3. **写回 version 文件**：`printf "3.13.3\n" > bin/cache/dart-sdk/version`——flutter 工具启动时校验该文件与 `flutter.version.json` 的 `dartSdkVersion` 一致，不一致会尝试重新下载 x64 dart-sdk 而失败（这是最隐蔽的坑）；
+4. `flutter_tools.snapshot` 是架构无关的 Dart 快照，替换 dart-sdk 后 `flutter build apk` 可正常运行（构建产物面向 Android 目标架构，与宿主架构无关）。
+
+**国内源**：`storage.flutter-io.cn` 同时镜像 `flutter_infra_release` 与 `dart-archive` 且支持 Range（206）；华为云 dart 镜像不支持 Range、TUNA/华为云 flutter 镜像 404 → 仅收录 flutter-io.cn。
+
+### 10.3 · 构建镜像一键配置（`MirrorConfigurator`）
+
+一键完成四步（对应需求文档的「提前下载 Gradle + 配置国内镜像源」）：
+1. **环境变量** → host 侧直接写 rootfs 真实文件 `/etc/profile.d/foa-env.sh` + `~/.bashrc`（PUB_HOSTED_URL / FLUTTER_STORAGE_BASE_URL / ANDROID_HOME / JAVA_HOME / GRADLE_USER_HOME / PATH 追加 /opt/flutter/bin）；
+2. **Maven 镜像** → `~/.gradle/init.gradle` 写入阿里云三仓（public/google/gradle-plugin），`allprojects` + `settingsEvaluated` 双保险（settings 的 pluginManagement 和 dependencyResolutionManagement 也要覆盖，单写 allprojects 对 AGP 9 不够）；
+3. **wrapper 镜像** → 递归改写 `/root/projects` 下所有项目的 `gradle-wrapper.properties` distributionUrl 为腾讯云镜像；
+4. **Gradle 预下载** → `gradle-9.3.1-all.zip`（224MB）下载到 wrapper 缓存目录，首次构建不再访问国外源。
+
+**Gradle wrapper 缓存目录名（实测确认）**：`base36(MD5(distributionUrl))` 去前导零（Gradle 9.3.1 `PathAssembler` 源码确认）。腾讯云 URL 实测为 `5wooodlkfwsm42ictrailuf0e`，目录结构 `~/.gradle/wrapper/dists/gradle-9.3.1-all/<hash>/`。wrapper 发现 zip 在位即跳过下载、自动解压并写 `.ok` 标记后删除 zip。
+
+### 10.4 · exec 注入环境变量（MainActivity）
+
+`exec()` 的 `/bin/sh -c` 前置注入 `[ -f /etc/profile.d/foa-env.sh ] && . /etc/profile.d/foa-env.sh; `——即使 `env -i` 清空了环境，构建命令（`flutter build apk`、`./gradlew`）也能自动带上国内镜像变量。
+
+### 10.5 · 镜像实测结论汇总（curl -r 0-0，2026-09-17）
+
+| 用途 | 可用国内源 | 实测不可用 |
+|---|---|---|
+| JDK 17 (Adoptium aarch64) | TUNA 清华、南大 NJU（206 ✓） | 华为云（返回 HTML）、阿里云/USTC/交大/腾讯/网易（404） |
+| Android SDK 组件 | 腾讯云 AndroidSDK（206 ✓） | TUNA（404）、华为云 android_repository（401） |
+| Flutter tarball / Dart arm64 | flutter-io.cn（206 ✓） | TUNA/华为云 flutter（404）、华为云 dart（不支持 Range） |
+| Gradle 分发包 | 腾讯云 gradle（206 ✓） | — |
+| Maven 依赖 | 阿里云三仓（69ms 实测） | — |
+| pub.dev | pub.flutter-io.cn | — |
+
+---
+
+## 十一、APK 体积优化实战（2026-09-17，103.9MB → 87.3MB，-16%）
+
+> 目标：把"先分析 → 再配置 → 后清理"的方法论落成本项目可复用经验。
+> 改动文件：`android/app/build.gradle.kts`（abiFilters + 显式 R8）、`android/app/proguard-rules.pro`（新建）。
+
+### 11.1 · 现状摸底（先分析再动手）
+
+`unzip -l app-release.apk` 拆解（优化前 103,945,959 B）：
+
+| 组成部分 | 体积（未压缩） | 说明 |
+|---|---|---|
+| rootfs tarball | 78.9MB | **运行时必需**（proot 容器），90% 大头 |
+| libflutter.so × 3 ABI | 33.4MB | arm64 + **armeabi-v7a + x86_64 冗余** |
+| libapp.so × 3 ABI | 23.6MB | 同上，Dart AOT 机器码随 ABI 翻倍 |
+| classes.dex（R8 后） | 0.55MB | 已压缩，Java/Kotlin 面很小 |
+| libproot.so + assets/tools | 0.6MB | proot 双路径 + 动态库（必需） |
+
+**结论**：Flutter APK 的代码面（dex）极小，R8 收益有限；**多 ABI 冗余才是纯代码可省的最大头**。
+
+### 11.2 · 关键事实：Flutter 3.47 默认已开 R8
+
+`FlutterPlugin.kt` 的 `shouldShrinkResources()` **默认返回 true**（除非 `--no-shrink` / `-Pshrink=false`），自动给 release 追加：proguard-android-optimize.txt + flutter_proguard_rules.pro + 项目 proguard-rules.pro（**文件存在时**）。证据：`build/app/intermediates/dex/release/minifyReleaseWithR8/` 任务与 `mapping.txt` 一直在生成。
+→ 显式写在 build.gradle.kts 只是**确定性保证**（防 `--no-shrink` 或插件默认变更），不会带来额外压缩。
+
+### 11.3 · 核心改动：只保留 arm64-v8a（本次 -16.6MB 全部来源）
+
+```kotlin
+defaultConfig {
+    ndk {
+        abiFilters += listOf("arm64-v8a")
+    }
+}
+```
+
+- 目标设备全为 64 位，proot 本体也只分发 arm64（jniLibs 仅有 arm64-v8a/libproot.so）；
+- 移除 armeabi-v7a + x86_64 两套 libapp.so/libflutter.so（未压缩约 37MB，zip 压缩后实际省 16.6MB——so 已是压缩格式，deflate 增益很小）；
+- 效果等同 `--split-per-abi` 的单 ABI 结果；本项目分发渠道是 GitHub Releases / F-Droid 直发 APK，比 .aab 更合适（.aab 只在 Google Play 有意义）。
+
+### 11.4 · R8 头号大坑：`-keep class io.flutter.** { *; }` 必炸（Bug 402 补充）
+
+**症状**：启用 minify 后 R8 报 `Compilation failed to complete` + `Missing class com.google.android.play.core.*`（splitinstall / splitcompat 一整套）。
+
+**原因**：网上教程普遍推荐的 `-keep class io.flutter.** { *; }` 会把引擎的可选类 `FlutterPlayStoreSplitApplication` / `PlayStoreDeferredComponentManager` 强制保留，它们引用 Play Store 拆分安装 API（`com.google.android.play.core.*`），本项目不依赖 play-core → R8 缺类。**AGP 9.1 下"缺类被 kept 代码引用" = 硬错误，`-dontwarn` 压不住**（-dontwarn 只压 warning）。
+
+**解决**：proguard-rules.pro 只保留应用自身包，引擎交给 Flutter 自带规则按需保留：
+
+```proguard
+-keep class dev.foa.flutter_on_android.** { *; }
+```
+
+### 11.5 · 资源/依赖清理结论（本项目）
+
+- **无图片资产**：assets/ 只有 proot 工具与 rootfs，无 PNG/JPEG 可转 WebP；
+- **依赖全在用**：provider / code_text_field / highlight / dart_style / url_launcher / crypto 均有引用，无冗余；
+- **Tree shaking 已生效**：MaterialIcons-Regular.otf 1645184 → 6572 B（99.6%）；
+- **proot 双路径保留**：assets/tools/proot-arm64（244KB）是 jniLibs 的兜底拷贝（Bug 210 教训），不删。
+
+### 11.6 · 验证三件套（每次体积优化后必跑）
+
+1. `aapt2 dump badging <apk>` → 断言 `native-code: 'arm64-v8a'`；
+2. `unzip -l <apk>` → 断言 lib/ 只剩目标 ABI、rootfs tarball / 动态库就位；
+3. `apksigner verify --print-certs <apk>` → 签名有效。
+
+### 11.7 · 遗留大头与后续方向（未做，风险需单列任务）
+
+- rootfs tarball 78.9MB 占 90%，压缩收益最大但牵一发动全身：gzip→xz 约可再省 30-40MB，但首次解压路径（MainActivity 原生 tar）需同步改造、真机验证首装耗时，**单列任务再动**；
+- Debian minbase 裁剪（清 apt lists / man / 多语言 locale）可再省数 MB，同样需回归容器内 apt 可用性。
+
+### 10.6 · apt 安装 xz-utils/unzip 失败：resolv.conf 烤入构建机内网 DNS（2026-09-17 真机抓到）
+
+**症状**：工具链页「Android SDK / Flutter SDK」两张卡片都报 `apt 安装 xz-utils/unzip 失败（请确认容器内网络可用，apt 源为 TUNA 清华）`，错误详情为空。
+
+**原因**（双层）：
+1. **根因**：`fetch_assets.sh` 自建 rootfs 走 debootstrap，debootstrap 会把**构建机**的 `/etc/resolv.conf` 拷进目标 rootfs。本沙箱构建出的 tarball 里是内网 DNS `nameserver 10.96.205.180`——用户真机上该地址不可达 → 容器内 glibc 解析 mirrors.tuna.tsinghua.edu.cn 失败 → `apt-get update` 失败 → 安装 xz-utils/unzip 必然失败。**任何构建机打包的 rootfs 都带这个隐患**；
+2. **错误详情为空**：`AptTools.ensure()` 把 apt 输出全部重定向到 `/dev/null`，失败时异常里拿不到任何日志，用户无从排查。
+
+**解决**（三层，缺一不可）：
+1. **运行时引导（修存量设备）**：MainActivity `exec()` 的 boot 注入在每次执行前幂等修正 `/etc/resolv.conf`——无公共 DNS 则写入 `nameserver 223.5.5.5 / 119.29.29.29 / 8.8.8.8`（阿里/腾讯/谷歌），已有则不动。对所有容器命令生效（apt/pub/gradle 全受益）；
+2. **错误可见**：`AptTools.ensure()` 去掉 `/dev/null`，改为 `2>&1 | tail` 捕获 apt 输出透传给异常详情，并加 `-o Acquire::Retries=3`；
+3. **源头中立化**：`fetch_assets.sh` 新增 `normalize_resolvconf()`，打包时把 tarball 内 resolv.conf 改写为公共 DNS（幂等，已有公共 DNS 则跳过）。
+
+**验证**：
+- 沙箱模拟 boot 逻辑三场景（坏/好/空 resolv.conf）均符合预期；
+- 真机复测：工具链卡片安装不再报 apt 失败（xz-utils/unzip 装好后继续下载 SDK）。
+
+**教训**：rootfs 是"在构建机生成、在用户设备运行"的产物，一切**构建机私有的环境信息**（DNS、代理、hosts、路径）都不能烤进去；凡涉网操作都要有幂等的运行时自愈 + 打包时中立化的双保险。
+
+### 10.7 · apt 安装 xz-utils/unzip 失败：proot `-R` 绑定宿主系统文件 + rootfs 缺 /etc/passwd（Bug 404，2026-09-17 真机抓到）
+
+**症状**：工具链页「Android SDK」卡片报 `apt 安装 xz-utils/unzip 失败`，详情含三条连锁错误：
+```
+W: No sandbox user '_apt' on the system, can not drop privileges
+W: GPG error: http://mirrors.tuna.tsinghua.edu.cn/debian bookworm InRelease: Couldn't create temporary file /tmp/apt.conf.yWMfQJ for passing config to apt-key
+E: The repository 'http://mirrors.tuna.tsinghua.edu.cn/debian bookworm InRelease' is not signed.
+E: Package 'xz-utils' has no installation candidate
+E: Unable to locate package unzip
+```
+（注意：DNS 已正常——上一轮 Bug 402 修复生效，本次错误链与网络无关。）
+
+**原因**（双层叠加）：
+1. **proot 参数 `-R` 会绑定宿主系统文件**：proot 官方文档明确 `-R` 自动绑定一组"推荐路径"（含 `/etc/passwd`、`/etc/group` 等），且**不推荐装包时用 -R**（包管理会更新这些绑定文件）。Android 宿主根本没有 `/etc/passwd`、`/etc/group`、可写的 `/tmp` → 容器内这几个路径失效：apt 找不到 `_apt` 用户无法降权、apt-key 写 `/tmp` 临时配置失败 → 源签名验证失败 → 找不到包；
+2. **rootfs 打包缺陷**：源 rootfs 打包时 `/etc/passwd`、`/etc/group` 处于 dpkg 重写中间态（tarball 内只剩 `passwd-/+`、`group-/+` 备份），即使换掉 `-R` 容器内也没有用户数据库。
+
+**解决**（三层，缺一不可）：
+1. **换 proot 参数（根治）**：MainActivity `exec()` 弃用 `-R`，改用 `-0 -r rootfs -b /dev -b /proc -b /sys`——容器内全部使用 rootfs 自身文件，不绑定任何宿主系统文件（`android/app/.../MainActivity.kt` 与 `platform/android/MainActivity.kt` 同步修改）；
+2. **rootfs 资产补账户文件（源头）**：`fetch_assets.sh` 新增 `fix_rootfs_accounts()`，幂等检测 `/etc/passwd`、`/etc/group` 缺失或缺 `_apt` 时补标准 Debian bookworm 骨架（含 `_apt`/`messagebus` 用户）+ `/etc/hosts`，按 Android 友好格式重打包；当前 assets tarball 已重打包（76MB）；
+3. **运行时兜底（修存量设备）**：`AptTools.ensure()` 在 apt 前注入 `_fixAccounts` 脚本——补 passwd/group（含 `_apt`）、确保 `/tmp` 1777、建 apt lists/archives partial 目录、补 `/etc/hosts`；对已装旧 rootfs 的用户升级 APK 即生效，无需重装 rootfs。
+
+**验证**：
+- 沙箱解包新 tarball：`/etc/passwd` 含 `root`/`_apt`，`/etc/group` 含 `_apt`，`/etc/hosts`、公共 DNS resolv.conf、`/tmp` 1777 全部就位；
+- 真机复测：工具链卡片 apt 阶段不再报 `_apt`/签名错误（待用户装机确认）。
+
+**教训**：proot 的 `-R` 是给"浏览/调试"用的便利选项，**装包场景必须用 `-0 -r` + 显式白名单绑定**；rootfs 这类"随 APK 分发的系统镜像"要按"可运行的最小完整系统"验收（passwd/group/hosts 齐备），不能只看关键二进制在位。
+
+### 10.8 · 网络安装失败后没有"从本地存储安装"兜底入口（Bug 408，2026-09-17）
+
+**症状**：工具链页网络全挂（镜像不可达/超时）时，用户无法离线安装——只有「下载并安装」，点击后反复报下载失败；JDK 卡此前已接本地导入，但 Android SDK / Flutter SDK 卡没有对应按钮。
+
+**原因**：本地安装兜底只实现了 JDK 一条链路（`JdkInstaller.installFromLocalFile` + `LocalInstallPicker` + 原生 `pickInstallFile`）；`AndroidSdkInstaller` / `FlutterSdkInstaller` 没有本地导入方法，`_SdkCard` 也没有按钮位，且平台模板 `platform/android/MainActivity.kt` 缺 `pickInstallFile`（只在生成目录里改了，Bug 206 教训）。
+
+**解决**：
+1. **SDK 本地导入**：`sdk_installer.dart` 的 `install` 拆出共用 `_installCommon`，新增 `installFromLocalFile`——按文件名/大小匹配组件（Android SDK 4 组件、Flutter tarball 或 Dart arm64 zip），拷贝进 `/opt/foa-dl` 下载缓存并做 SHA-1/SHA-256 校验，然后并入共用流程：**已本地提供的组件走快路径跳过下载，其余组件仍走网络**（可逐个导入，断网时有多少传多少）；
+2. **UI 按钮**：`_SdkCard` 增加 `onInstallLocal`，未安装且非忙碌态时显示整宽「从本地存储选择安装」按钮（与 JDK 卡一致）；`SdkPhase` 增加 `importing` 阶段态；
+3. **原生模板同步**：`platform/android/MainActivity.kt` 补齐 `pickInstallFile` 处理器 + `onActivityResult` 拷贝逻辑 + `queryDisplayName`（与生成目录一致，防重新生成时复活）。
+
+**验证**：`flutter analyze` 本项目 `lib/` 零问题；release APK（arm64，87.2MB）构建成功，badging 断言 `arm64-v8a`、资产齐备、签名有效；本地导入路径由真机按序验证（选文件 → importing → 校验 → 解压）。
+
+**教训**：凡新增跨层能力（Dart UI + 原生通道），必须一次性打通"全部卡片入口 + 生成目录与平台模板双写"，并保持模板与生成目录逐字节一致（Bug 206 门禁）。
+
+### 10.9 · apt 安装 xz-utils/unzip 失败：dpkg 数据库半安装中间态（Bug 409，2026-09-17 真机抓到）
+
+**症状**：工具链页「Android SDK」/「Flutter SDK」卡片仍报 `apt 安装 xz-utils/unzip 失败`，详情首行：
+```
+E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem
+```
+（DNS 正常、passwd/_apt 已补齐——Bug 402/404 修复均生效，错误链换了主角。）
+
+**原因**：此前失败的安装尝试（Bug 402/404 时期的报错、超时、用户取消杀进程）把 dpkg 数据库留在**半安装中间态**（包解包未配置），apt 检测到后拒绝执行任何操作；同时被杀的 apt/dpkg 进程会残留 lock 文件。也就是说：**修好上一个根因 ≠ 数据库干净**，每轮失败都会留下新的状态污染。
+
+**解决**（`AptTools.ensure()` 在 apt 前的恢复三步，幂等、失败不阻断后续命令）：
+1. 清陈旧锁文件：`rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock /var/lib/apt/lists/lock`（proot 单线程执行无并发风险，锁只可能来自上次被杀进程）；
+2. `DEBIAN_FRONTEND=noninteractive dpkg --configure -a` 补完未完成的解包/配置；
+3. `DEBIAN_FRONTEND=noninteractive apt-get -f install` 修复破损依赖。
+之后才走 `apt-get update` → `apt-get install xz-utils unzip`。各步 `2>&1 | tail` 吞掉非零退出码，恢复失败也继续尝试后续命令；报错文案同时提示用户可先在终端跑 `dpkg --configure -a` 或改走「从本地存储选择安装」。
+
+**验证**：release APK 的 `libapp.so` 中 `strings` 可见 `dpkg --configure -a` / `apt-get -f install` / `APT_TOOLS_OK`（恢复链已编进 AOT 快照）；真机复测待装机确认（升级覆盖安装即生效，无需重装 rootfs）。
+
+**教训**：包管理器的**状态自愈必须成为安装前置步骤**——任何一次失败安装都会污染 dpkg 状态，下次安装前先恢复；错误详情透传（不丢 /dev/null）是连续三轮 apt 报错能被逐一击破的前提（402 DNS → 404 passwd → 409 dpkg 状态）。
+
+### 10.10 · Android 15+ 真机状态栏纯黑/导航栏纯白：引擎静默跳过运行时设色（Bug 410，2026-09-17 真机确认）
+
+**症状**：顶栏（AppBar）为深色 `#101418`，状态栏却是纯黑、导航栏纯白（浅色模式下尤刺眼）；`SystemChrome.setSystemUIOverlayStyle`（main.dart）与 `AppBarTheme.systemOverlayStyle`（theme.dart）完全无效，且**无任何报错**。
+
+**原因**：反编译 Flutter 3.47.4 引擎 `PlatformPlugin.java` 字节码确认——Android 15+ 设备（`Build.VERSION.SDK_INT >= 35`）上**无条件跳过** `Window.setStatusBarColor` / `setNavigationBarColor`（与 app 的 targetSdk 无关）。运行时设色在这类设备上彻底失效，系统栏回落主题默认值（`Theme.Light.NoTitleBar` → 黑状态栏 + 白导航条）。
+
+**解决**：系统栏初始颜色改走**主题 XML 声明**（OS 在窗口创建时直接应用，不经过 Flutter 引擎）：
+1. 新建 `res/values/colors.xml`：`foa_bg = #FF101418`（与 `FoaTheme.bg` 同色）；
+2. `values/styles.xml` 与 `values-night/styles.xml` 的 `LaunchTheme`/`NormalTheme` 均加 `android:statusBarColor` / `android:navigationBarColor` = `@color/foa_bg`——targetSdk 28 的应用在**所有** Android 版本生效（edge-to-edge 强制仅限 targetSdk 35+）；
+3. 顺带修复：`NormalTheme` 的 `windowBackground` 与启动屏 `launch_background`（drawable + drawable-v21）改 `@color/foa_bg`，消除暗色应用冷启动白闪；
+4. main.dart / theme.dart 的运行时设色保留（对 Android < 15 设备仍生效，图标明暗在所有版本生效），注释标注两者分工。
+
+**验证**：`aapt2 dump resources` 断言 APK 内 `color/foa_bg #ff101418` 在位、styles 四处引用（statusBarColor/navigationBarColor 属性）；badging 断言 targetSdk 28；真机复测待装机确认。
+
+**教训**：框架运行时 API 在新版 OS 上可能存在**静默失效**路径（不报错、不生效、无日志）——根因要靠反编译引擎字节码坐实，不能停留在"API 用法不对"的假设；系统级 UI 的**初始态永远优先用平台声明式配置**（主题 XML）兜底，运行时 API 只做增量调整。
+
+---
+
+## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
 
