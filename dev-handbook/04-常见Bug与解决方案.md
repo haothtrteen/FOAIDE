@@ -519,7 +519,79 @@ Termux 构建 proot 时把 `P_tmpdir` 硬编码为 `/data/data/com.termux/files/
 
 ---
 
-## 九、提交 Bug 记录模板
+## 九、编辑器（Step 2）相关（2026-09-17，v0.1.0-alpha.6 → alpha.13）
+
+> Step 2 编辑器（代码浏览/编辑/保存/补全/检查/顶栏操作）全链路踩坑记录。
+> 技术栈：`code_text_field` + `flutter_highlight`（vendored 到 `app/third_party/`）+ 自研补全/语法检查 + `dart_style` 格式化。
+
+### Bug 212 · 文件树点击文件夹不显示内容
+
+**症状**：文件树侧边栏点击任意文件夹，内容区空白，无法浏览子目录。
+**原因**：初始实现只渲染当前一层，点击文件夹后没有递归展开子目录（空状态也区分不了"未加载"与"真空"）。
+**解决**：`_buildSubtree` 懒加载递归渲染——点击目录节点才展开其子节点，目录/文件图标区分，空目录显示"（空文件夹）"占位。
+**验证**：真机点击多层目录能逐级展开浏览。
+**教训**：树形 UI 的"展开"必须显式实现，不能指望 ListView 自动递归；空态占位是 UX 必需（明确"已进入但无内容"）。
+
+### Bug 213 · 空文件夹无法浏览 + 缺"../"返回 + 顶部被状态栏遮挡
+
+**症状**：1) 空文件夹进入后无任何入口返回；2) 文件树顶部与系统状态栏重叠显示不清。
+**原因**：1) 空目录无子项，天然没有可点击项，缺少显式"返回上级"入口；2) 嵌入侧边栏未处理系统安全区（SafeArea）。
+**解决**：1) 顶部导航条加".."按钮（根目录置灰）+ 面包屑路径，点击任一级可跳回；2) 侧边栏整体包 `SafeArea`。
+**验证**：真机进入空文件夹可用".."返回；顶部文字与状态栏不再重叠。
+**教训**：任何"上下级导航"UI 都必须自带返回入口，不能依赖内容区天然存在可点击元素；Android 沉浸式布局第一件事是 SafeArea。
+
+### Bug 214 · 语法高亮不生效
+
+**症状**：编辑器打开 Dart 文件全是纯色文本，无关键字/字符串/注释高亮。
+**原因**：`CodeField` 本身不渲染颜色，必须由父级 `CodeTheme` 提供高亮主题——漏包一层 `CodeTheme`。
+**解决**：`CodeTheme(data: monokaiSublimeTheme, child: CodeField(...))`（`flutter_highlight/themes/monokai-sublime.dart`）。
+**验证**：打开 `.dart` 文件关键字高亮，中文注释正常着色。
+**教训**：code_text_field 的高亮依赖 `CodeTheme` 包裹，这是包的使用前提而非可选优化。
+
+### Bug 215 · 保存写入的是打开时的旧内容
+
+**症状**：编辑文件后点保存，重新打开发现改动丢失，保存的是初始内容。
+**原因**：`onContentChanged` 回调只置 dirty 标记，没有把最新文本写回 `EditorPage._content`，保存时用的是打开文件时缓存的旧 `_content`。
+**解决**：回调首行 `_content = t;`（把最新文本写回 State），再判 dirty。
+**验证**：真机编辑→保存→重开，改动保留。
+**教训**：State 持有"编辑中内容"时，内容变更回调必须同时更新该缓存——"只标脏不更新数据"是经典状态同步漏点。
+
+### Bug 216 · 编辑器弹系统安全键盘（其他 App 正常，本 App 才触发）
+
+**症状**：荣耀/华为等 ROM 上，编辑器聚焦时弹"安全键盘"（输入法界面受限、无法使用第三方输入法），其他 App 输入正常。
+**原因**：`code_text_field` 硬编码 `enableSuggestions: false`。Flutter engine 在 `enableSuggestions: false` 时把 inputType 设为 `TYPE_TEXT_VARIATION_VISIBLE_PASSWORD`（可见密码变体，见 engine 源码 `inputTypeFromTextInputType` 注释：Some devices ignore TYPE_TEXT_FLAG_NO_SUGGESTIONS）。厂商 ROM 的安全键盘检测逻辑识别到"密码变体"→ 强制弹安全键盘。**这是本 App 独有**（普通输入框不设该属性），与用户表述"其它 App 正常键盘"完全吻合。
+**解决（三层）**：
+1. **vendored 包**：把 `code_text_field` 拷到 `app/third_party/code_text_field`，pubspec 改 `path:` 依赖；删除 `enableSuggestions: false`（保持默认 true），改动处注释 `FOA 修改（Bug 216）`；
+2. **显式非密码**：`obscureText: false`（方案 1：明确告知系统非密码输入）；
+3. **多行类型**：`CodeField(keyboardType: TextInputType.multiline)`。`autocorrect: false` 不触发密码变体，保留以阻止英文自动纠正干扰代码输入。
+**验证**：真机覆盖安装，编辑器聚焦弹普通键盘。
+**教训**：Android 上"禁止输入法联想/纠错"不能靠 `enableSuggestions: false`——它会被映射成密码变体并触发厂商安全键盘。要禁纠错用 `autocorrect: false` 即可；vendor 第三方包是修改其行为的正路（pubspec path 依赖 + 注释标记）。
+
+### Bug 217 · 键盘上方符号栏不显示
+
+**症状**：点击符号栏所在版本，键盘弹出后编辑区底部（状态栏下方）没有出现符号快捷栏；截图显示键盘上方是输入法自带的工具栏。
+**原因**：首版用 `MediaQuery.of(context).viewInsets.bottom > 0` 检测键盘弹出再显示。但带自身工具栏的中文输入法（百度/搜狗类）在部分 ROM 上**不把 insets 变化传给 Flutter**（厂商 IME 行为），检测恒为 0，符号栏从未渲染。
+**解决**：放弃 insets 检测，符号栏**常驻显示**——Column 底部布局，键盘弹出时被顶起天然位于键盘正上方，收起时贴在编辑区底部；高度压缩至 36px 减少占用。
+**验证**：真机键盘弹出/收起两种状态符号栏均可见。
+**教训**：**"键盘上方 UI"不要依赖 viewInsets 检测**（厂商输入法行为不可靠，真机才暴露），优先常驻布局；想省空间再提供手动折叠。
+
+### Bug 218 · 顶栏改造：文件名 + 撤销/应用/搜索/跳转/格式化/帮助
+
+**症状/需求**：顶栏完整路径过长挤占按钮空间；需要撤销更改、应用更改、搜索、转到行、代码格式化、帮助（Dart 手册 / Flutter API）入口。
+**原因/方案**（均为实现要点）：
+1. **标题改文件名**：`path.split('/').last` + Tooltip 显示完整路径；
+2. **撤销更改**：公开 `CodeEditorState`（原 `_CodeEditorState` 去下划线），EditorPage 用 `GlobalKey<CodeEditorState>` 调用 `reset(_initialContent)`；打开文件时记录初始内容 `_initialContent`；
+3. **应用更改**：保存按钮复用，dirty 时图标变绿；
+4. **搜索**：`_SearchDialog` 内 `RegExp(RegExp.escape(kw), caseSensitive: false)` 收集匹配，改 selection 选中匹配 → EditableText 自动滚动（零侵入 vendored 包）；
+5. **转到行**：算行首 offset，selection 置该处，同上自动滚动；
+6. **格式化**：`dart_style` 3.x，`compute(_formatDartSource, text)` 隔离线程防卡 UI。**坑：3.x 构造器必填 `languageVersion`**，用 `DartFormatter(languageVersion: DartFormatter.latestLanguageVersion)`；格式失败（语法错误）捕获返回提示；
+7. **帮助**：`url_launcher` 调系统浏览器（`LaunchMode.externalApplication`），INTERNET 权限已有。
+**验证**：`flutter analyze` 零问题；真机打开 Dart 文件：撤销恢复、搜索跳转、转到行、格式化、打开官方文档链接均正常。
+**教训**：1) 子组件能力对父级开放 = 公开 State + GlobalKey（比回调/继承更直接）；2) 编辑器的"滚动到目标"用 selection 驱动最省事（EditableText 自带 ensureVisible），别去改滚动控制器；3) 第三方 Dart 库 API 变动大（dart_style 3.x 构造签名变化），升级后先看构造器/方法签名再写调用。
+
+---
+
+## 十、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
 
