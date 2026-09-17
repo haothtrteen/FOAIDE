@@ -625,6 +625,21 @@ Termux 构建 proot 时把 `P_tmpdir` 硬编码为 `/data/data/com.termux/files/
 > 在 JDK 之外新增：Android SDK / Flutter SDK(arm64) / 构建镜像一键配置 三张卡片（`toolchain_page.dart` 四卡片布局）。
 > 实现文件：`lib/toolchain/sdk_installer.dart`（安装编排）、`lib/toolchain/sdk_downloader.dart`（多源分段下载 + SHA-256/SHA-1 双校验）。
 
+### 10.0 · 总览：容器内 apt 链路四层自愈（全链路真机验证通过，2026-09-17）
+
+工具链安装的前置依赖是容器内 apt 装 xz-utils/unzip（rootfs 是 minbase，无这两个 CLI）。这条失败链共四层、经三轮真机报错逐层击破（详记见对应小节）：
+
+| 层 | 症状 | 根因 | 修复 | 详记 |
+|---|---|---|---|---|
+| DNS | apt/pub/gradle 全部网络失败 | rootfs 烤入构建机内网 resolv.conf | 打包中立化 + exec boot 幂等修正 | 10.6 |
+| 账户/签名 | `No sandbox user '_apt'`、源 not signed | proot `-R` 绑定宿主文件 + rootfs 缺 passwd/group | `-0 -r` 显式绑定 + 补 Debian 骨架 + 运行时兜底 | 10.7 |
+| 文件系统 | dpkg 解压 `Permission denied` | Android 禁 `link()`，Debian 包内硬链接 | proot `--link2symlink` | 10.11 |
+| dpkg 状态 | `E: dpkg was interrupted` | 前次失败留半安装中间态 + 残留锁 | apt 前置恢复三步（清锁 / --configure -a / -f install） | 10.9 |
+
+**2026-09-17 真机复测通过**：工具链卡片（Android SDK / Flutter SDK）下载安装全流程跑通——apt 阶段零报错、组件下载/SHA 校验/解压成功、`verify()` 输出版本号。
+
+**总教训**：多层失败链要靠「报错透传 + 逐层修复 + 每层修完真机回归」推进（402 DNS → 404 passwd → 407 link → 409 dpkg 状态，每修一层才暴露下一层）；包管理器状态自愈必须是安装前置步骤；rootfs 类"构建机生成、用户设备运行"的资产，生成侧中立化与运行时幂等自愈缺一不可。
+
 ### 10.1 · Android SDK 安装（`AndroidSdkInstaller`）
 
 **组件清单**（版本与 Flutter 3.47.4 的 compileSdk 36 对齐，清单与大小/SHA-1 来自 `repo2-3.xml`，2026-09-17 抓取）：
@@ -791,7 +806,7 @@ E: Unable to locate package unzip
 
 **验证**：
 - 沙箱解包新 tarball：`/etc/passwd` 含 `root`/`_apt`，`/etc/group` 含 `_apt`，`/etc/hosts`、公共 DNS resolv.conf、`/tmp` 1777 全部就位；
-- 真机复测：工具链卡片 apt 阶段不再报 `_apt`/签名错误（待用户装机确认）。
+- 真机复测：工具链卡片 apt 阶段不再报 `_apt`/签名错误（2026-09-17 装机确认，工具链下载安装全流程通过，见 10.0 总览）。
 
 **教训**：proot 的 `-R` 是给"浏览/调试"用的便利选项，**装包场景必须用 `-0 -r` + 显式白名单绑定**；rootfs 这类"随 APK 分发的系统镜像"要按"可运行的最小完整系统"验收（passwd/group/hosts 齐备），不能只看关键二进制在位。
 
@@ -826,7 +841,7 @@ E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct 
 3. `DEBIAN_FRONTEND=noninteractive apt-get -f install` 修复破损依赖。
 之后才走 `apt-get update` → `apt-get install xz-utils unzip`。各步 `2>&1 | tail` 吞掉非零退出码，恢复失败也继续尝试后续命令；报错文案同时提示用户可先在终端跑 `dpkg --configure -a` 或改走「从本地存储选择安装」。
 
-**验证**：release APK 的 `libapp.so` 中 `strings` 可见 `dpkg --configure -a` / `apt-get -f install` / `APT_TOOLS_OK`（恢复链已编进 AOT 快照）；真机复测待装机确认（升级覆盖安装即生效，无需重装 rootfs）。
+**验证**：release APK 的 `libapp.so` 中 `strings` 可见 `dpkg --configure -a` / `apt-get -f install` / `APT_TOOLS_OK`（恢复链已编进 AOT 快照）；**真机复测通过（2026-09-17）**：dpkg 中断态恢复生效，工具链 apt 阶段零报错；升级覆盖安装即生效，无需重装 rootfs。
 
 **教训**：包管理器的**状态自愈必须成为安装前置步骤**——任何一次失败安装都会污染 dpkg 状态，下次安装前先恢复；错误详情透传（不丢 /dev/null）是连续三轮 apt 报错能被逐一击破的前提（402 DNS → 404 passwd → 409 dpkg 状态）。
 
@@ -845,6 +860,18 @@ E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct 
 **验证**：`aapt2 dump resources` 断言 APK 内 `color/foa_bg #ff101418` 在位、styles 四处引用（statusBarColor/navigationBarColor 属性）；badging 断言 targetSdk 28；真机复测待装机确认。
 
 **教训**：框架运行时 API 在新版 OS 上可能存在**静默失效**路径（不报错、不生效、无日志）——根因要靠反编译引擎字节码坐实，不能停留在"API 用法不对"的假设；系统级 UI 的**初始态永远优先用平台声明式配置**（主题 XML）兜底，运行时 API 只做增量调整。
+
+### 10.11 · dpkg 解压报 `Permission denied`：Android 禁 `link()` 与 Debian 包内硬链接（Bug 407，2026-09-17）
+
+**症状**：apt 链路修好 DNS/账户后，dpkg 解压 unzip 等包时报 `Permission denied`（`status-old` 备份文件也失败），安装仍走不通。
+
+**原因**：Android 沙箱对应用私有目录禁 `link()`（与 Bug 209 同一类限制）；而 Debian 包大量使用硬链接（如 unzip 的 `zipinfo`→`unzip`，dpkg 的 `status`→`status-old` 备份），dpkg 解包/备份时调用 `link()` 直接被拒。
+
+**解决**：proot 启动参数加 `--link2symlink`——把容器内的硬链接语义转为符号链接实现，apt/dpkg 全流程正常（MainActivity `exec()` 已固化，平台模板同步修改）。
+
+**验证**：2026-09-17 真机：apt 安装 xz-utils/unzip 成功（dpkg 解压含硬链接的 unzip 包零报错），工具链下载安装全流程通过（见 10.0 总览）。
+
+**教训**：与 Bug 209（rootfs tar 解压的 mknod/link 限制，**生成侧重打包**治本）对照——运行时才发生的包管理操作没法靠生成侧预处理，要靠 proot 参数（`--link2symlink`）在容器层抹平文件系统语义差异；rootfs 容器的验收清单必须包含「apt 装一个含硬链接的包」。
 
 ---
 
