@@ -284,6 +284,34 @@ class TermuxRepo {
   }
 }
 
+/// Termux 社区 bionic Flutter 的版本快照（2026-09-18 供应链核实）。
+///
+/// Flutter 官方不支持 bionic host → **Termux 主仓没有 flutter 包**，社区分发
+/// 走 GitHub releases：ImL1s/termux-flutter-wsl（fork 自 mumumusuc/
+/// termux-flutter），WSL 交叉编译 engine + dart，deb 内含配套 gen_snapshot。
+/// 版本/SHA256/大小在此锁定防漂移；代理源时效性强，pickFastest 竞速会
+/// 自动剔除死源，全部失败 → 回退「本地导入」路线。
+class TermuxFlutterRelease {
+  static const String repo = 'ImL1s/termux-flutter-wsl';
+  static const String version = 'v3.44.0'; // Flutter 3.44.0 / Dart 3.12.1
+  static const String asset = 'flutter_3.44.0_aarch64.deb';
+  static const String sha256 =
+      'b8af08d26ee4ae4b3dcf1aab4ee6b05965529587ddf1bc9b936b48b5f01f9846';
+  static const int size = 666366556;
+
+  static String githubUrl() =>
+      'https://github.com/$repo/releases/download/$version/$asset';
+
+  /// 下载源：GitHub 直链 + gh 加速代理（前缀式代理，拼接规则为
+  /// `<proxy><github-url>`）。谁快用谁，分片轮流起步自然分散到多源。
+  static List<MirrorSource> mirrors() => const [
+        MirrorSource('GitHub 直链', 'https://github.com/$repo/releases/download/$version/$asset'),
+        MirrorSource('gh-proxy', 'https://gh-proxy.com/https://github.com/$repo/releases/download/$version/$asset'),
+        MirrorSource('ghfast', 'https://ghfast.top/https://github.com/$repo/releases/download/$version/$asset'),
+        MirrorSource('ghproxy.net', 'https://ghproxy.net/https://github.com/$repo/releases/download/$version/$asset'),
+      ];
+}
+
 // ---------------- 安装器 ----------------
 
 /// Termux 组件安装阶段。
@@ -429,23 +457,80 @@ echo COMMIT_OK
     onPhase?.call('importing');
     final f = File(hostFilePath);
     if (!await f.exists()) throw DownloadException('文件不存在：$hostFilePath');
-    final name = f.path.split('/').last.toLowerCase();
-    final bool isDeb = name.endsWith('.deb');
-    final bool isTarXz = name.endsWith('.tar.xz') || name.endsWith('.txz');
-    final bool isTarGz = name.endsWith('.tar.gz') || name.endsWith('.tgz');
-    if (!isDeb && !isTarXz && !isTarGz) {
+    final name = f.path.split('/').last;
+    if (!_isFlutterArchive(name.toLowerCase())) {
       throw DownloadException('仅支持 .deb / .tar.xz / .tar.gz（当前：$name）');
     }
-
     final dl = Directory(TermuxPaths.dlDir(env));
     await dl.create(recursive: true);
-    final copied = '${dl.path}/${f.path.split('/').last}';
+    final copied = '${dl.path}/$name';
     if (copied != hostFilePath) {
       await f.copy(copied);
     }
-    final containerFile =
-        '${TermuxPaths.containerDlDir()}/${f.path.split('/').last}';
+    return _unpackAndCommitFlutter(bridge, env, name, onPhase: onPhase);
+  }
+
+  /// Flutter（bionic）在线下载：ImL1s/termux-flutter-wsl 的 GitHub release
+  ///（2026-09 快照锁定于 [TermuxFlutterRelease]，SHA256 校验防漂移）。
+  ///
+  /// GitHub 直链 + gh 加速代理多源竞速（pickFastest 剔除死源），666MB 用
+  /// 8 分片并行；慢速/卡死熔断自动换源续传。下载完与本地导入走同一套
+  /// 容器解包落位。全部源失败 → 提示回退本地导入。
+  static Future<String> installFlutterOnline(
+    ProotBridge bridge,
+    EnvInfo env, {
+    void Function(String phase)? onPhase,
+    void Function(String mirror)? onMirror,
+    void Function(DownloadProgress)? onProgress,
+    DownloadCancelToken? token,
+  }) async {
+    if (!env.rootfsInstalled) {
+      throw DownloadException('rootfs 未安装：解包借用容器的 dpkg-deb，请先初始化环境');
+    }
+    onPhase?.call('indexing');
+    final dl = Directory(TermuxPaths.dlDir(env));
+    await dl.create(recursive: true);
+    final save = '${dl.path}/${TermuxFlutterRelease.asset}';
+    onPhase?.call('downloading');
+    final ordered = await SdkDownloader.pickFastest(
+      TermuxFlutterRelease.mirrors(),
+      token: token,
+    );
+    await SdkDownloader.downloadMultiSource(
+      ordered,
+      save,
+      TermuxFlutterRelease.size,
+      sha256: TermuxFlutterRelease.sha256,
+      segments: 8,
+      onProgress: onProgress,
+      onMirrorUsed: (m) => onMirror?.call(m.name),
+      token: token,
+    );
+    return _unpackAndCommitFlutter(
+        bridge, env, TermuxFlutterRelease.asset, onPhase: onPhase);
+  }
+
+  static bool _isFlutterArchive(String lower) =>
+      lower.endsWith('.deb') ||
+      lower.endsWith('.tar.xz') ||
+      lower.endsWith('.txz') ||
+      lower.endsWith('.tar.gz') ||
+      lower.endsWith('.tgz');
+
+  /// 共享解包落位：下载区（rootfs 树内）里的 [fileName] → 容器解包 →
+  /// com.termux 绝对路径改写 → cp 到 /opt/foa-termux/usr/opt/flutter。
+  static Future<String> _unpackAndCommitFlutter(
+    ProotBridge bridge,
+    EnvInfo env,
+    String fileName, {
+    void Function(String phase)? onPhase,
+  }) async {
+    onPhase?.call('importing');
+    final containerFile = '${TermuxPaths.containerDlDir()}/$fileName';
     final stage = TermuxPaths.containerStageDir();
+    final lower = fileName.toLowerCase();
+    final bool isDeb = lower.endsWith('.deb');
+    final bool isTarXz = lower.endsWith('.tar.xz') || lower.endsWith('.txz');
 
     // 注意：脚本里 shell 的 $ 变量一律 \$… 转义，$stage 才是 Dart 插值
     final unpack = isDeb

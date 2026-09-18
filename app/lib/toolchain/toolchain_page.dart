@@ -959,6 +959,67 @@ class _ToolchainPageState extends State<ToolchainPage> {
     }
   }
 
+  /// 在线下载 bionic Flutter（ImL1s release，GitHub + 代理竞速）。
+  Future<void> _termuxDownloadFlutter() async {
+    final ok = await _confirm(
+      '在线下载 Termux 版 Flutter（bionic）',
+      '源：ImL1s/termux-flutter-wsl release（快照 ${TermuxFlutterRelease.version}，'
+          '${(TermuxFlutterRelease.size / 1048576).toStringAsFixed(0)} MB）。\n\n'
+          '  · GitHub 直链 + 多个加速代理竞速，慢源/死源自动切换；\n'
+          '  · 全部源失败时回退「本地导入」（你自备 deb）；\n'
+          '  · 下载完 SHA256 校验后解包到 /opt/foa-termux/usr/opt/flutter，'
+          '自动改写 Termux 前缀路径。\n\n'
+          '⚠️ 版本 ${TermuxFlutterRelease.version.replaceFirst('v', '')} 与容器官方 SDK（3.47.4）'
+          '不同——Termux 模式构建用的是这套（dart 与 gen_snapshot 配套）。',
+    );
+    if (!ok) return;
+    setState(() {
+      _termuxPhase = TermuxPhase.indexing;
+      _termuxError = '';
+      _termuxInfo = '';
+      _termuxToken = DownloadCancelToken();
+    });
+    try {
+      final env = await _bridge.envInfo();
+      final msg = await TermuxInstaller.installFlutterOnline(
+        _bridge,
+        env,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _termuxPhase = switch (p) {
+                'indexing' => TermuxPhase.indexing,
+                'downloading' => TermuxPhase.downloading,
+                'unpacking' => TermuxPhase.unpacking,
+                'importing' => TermuxPhase.importing,
+                _ => TermuxPhase.importing,
+              });
+        },
+        onMirror: (m) {
+          if (!mounted) return;
+          setState(() => _termuxMirrors..clear()..add(m));
+        },
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _termuxProgress = p);
+        },
+        token: _termuxToken,
+      );
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.ready;
+        _termuxInfo = msg;
+      });
+      await _termuxRunSmoke();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.error;
+        _termuxError = '$e\n\n提示：在线下载失败时可改用「本地导入」（自备 '
+            '${TermuxFlutterRelease.asset}）。';
+      });
+    }
+  }
+
   Future<void> _termuxCancel() async {
     _termuxToken?.cancel();
     setState(() => _termuxPhase = TermuxPhase.idle);
@@ -1411,6 +1472,7 @@ class _ToolchainPageState extends State<ToolchainPage> {
                     onInstallJdk: () => _termuxInstallPackage(TermuxRepo.jdkPackage),
                     onInstallBuildTools: () =>
                         _termuxInstallPackage(TermuxRepo.buildToolsPackage),
+                    onDownloadFlutter: _termuxDownloadFlutter,
                     onImportFlutter: _termuxImportFlutter,
                     onSmoke: _termuxRunSmoke,
                     onCancel: _termuxCancel,
@@ -1638,8 +1700,9 @@ class _BackendSwitcher extends StatelessWidget {
 /// Termux 裸原生后端卡：三件套安装 + bare 冒烟 + 卸载。
 ///
 /// 三件套 = ① Termux openjdk-17（bionic JVM）② aapt 包（aapt2/aidl/zipalign
-/// bionic 四件套）③ Flutter bionic 移植版（本地导入，dart 与 gen_snapshot 配套）。
-/// Gradle/d8/R8/kotlinc 纯 JVM 随 JDK 走；Android SDK 组件卡片共享。
+/// bionic 四件套）③ Flutter bionic 移植版（在线下载 ImL1s release 或本地导入，
+/// dart 与 gen_snapshot 配套）。Gradle/d8/R8/kotlinc 纯 JVM 随 JDK 走；
+/// Android SDK 组件卡片共享。
 class _TermuxCard extends StatelessWidget {
   final TermuxPhase phase;
   final String info;
@@ -1655,6 +1718,7 @@ class _TermuxCard extends StatelessWidget {
   final bool hasFlutter;
   final VoidCallback onInstallJdk;
   final VoidCallback onInstallBuildTools;
+  final VoidCallback onDownloadFlutter;
   final VoidCallback onImportFlutter;
   final VoidCallback onSmoke;
   final VoidCallback onCancel;
@@ -1675,6 +1739,7 @@ class _TermuxCard extends StatelessWidget {
     required this.hasFlutter,
     required this.onInstallJdk,
     required this.onInstallBuildTools,
+    required this.onDownloadFlutter,
     required this.onImportFlutter,
     required this.onSmoke,
     required this.onCancel,
@@ -1694,7 +1759,8 @@ class _TermuxCard extends StatelessWidget {
       };
 
   Widget _compRow(BuildContext context, String name, String desc, bool installed,
-      {VoidCallback? onInstall, required String action}) {
+      {VoidCallback? onInstall, required String action,
+      VoidCallback? secondaryOnInstall, String secondaryAction = ''}) {
     final cs = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -1715,8 +1781,15 @@ class _TermuxCard extends StatelessWidget {
               ],
             ),
           ),
-          if (!installed && onInstall != null)
-            TextButton(onPressed: onInstall, child: Text(action)),
+          if (!installed) ...[
+            if (secondaryOnInstall != null)
+              TextButton(
+                onPressed: secondaryOnInstall,
+                child: Text(secondaryAction),
+              ),
+            if (onInstall != null)
+              TextButton(onPressed: onInstall, child: Text(action)),
+          ],
           if (installed)
             Text('已装', style: TextStyle(fontSize: 12, color: cs.primary)),
         ],
@@ -1781,13 +1854,17 @@ class _TermuxCard extends StatelessWidget {
                     : null,
                 action: '安装'),
             _compRow(context, 'Flutter（bionic 移植版）',
-                '本地导入 ImL1s 系 deb/tar.xz；dart 与 gen_snapshot 配套，'
-                '版本可能与官方 SDK 不同',
+                '在线下载 ImL1s release（GitHub+代理竞速）或本地导入；'
+                'dart 与 gen_snapshot 配套，版本可能与官方 SDK 不同',
                 hasFlutter,
                 onInstall: rootfsReady && !installing && !busy
                     ? onImportFlutter
                     : null,
-                action: '导入'),
+                action: '导入',
+                secondaryOnInstall: rootfsReady && !installing && !busy
+                    ? onDownloadFlutter
+                    : null,
+                secondaryAction: '在线下载'),
             if (installing && progress != null) ...[
               const SizedBox(height: 8),
               LinearProgressIndicator(

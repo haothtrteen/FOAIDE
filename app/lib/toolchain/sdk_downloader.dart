@@ -59,6 +59,14 @@ class SdkDownloader {
   static const Duration stallTimeout = Duration(seconds: 15);
   static const int defaultSegments = 4;
 
+  /// 慢速熔断：有数据但涓流（如 16KB/s 涓流不死流）——stallTimeout 抓不到，
+  /// 只能靠窗口均速判定。窗口 ≥ [slowSpeedWindow] 时算一次均速，
+  /// 低于 [slowSpeedFloor] 判定该镜像限速 → 抛出换源（.p<i> 保留，续传代价低）。
+  /// 阈值取 64KB/s：教育网镜像正常 ≥5MB/s，GitHub 直链国内一般 ≥200KB/s，
+  /// 明显低于一切"健康源"下限，误杀率低。
+  static const Duration slowSpeedWindow = Duration(seconds: 10);
+  static const int slowSpeedFloor = 64 * 1024;
+
   /// 并发竞速选源：返回按"探测耗时升序"排序的镜像列表（最快在前）。
   /// 全部探测失败抛 [DownloadException]。
   static Future<List<MirrorSource>> pickFastest(
@@ -303,6 +311,9 @@ class SdkDownloader {
               throw DownloadException('下载被拒绝（HTTP ${resp.statusCode}）');
             }
             var lastByteAt = DateTime.now();
+            // 慢速熔断滑动窗口（见 slowSpeedWindow 注释）
+            var slowAt = DateTime.now();
+            var slowBytes = 0;
             await for (final chunk in resp) {
               if (token?.isCancelled ?? false) throw DownloadException('已取消');
               await raf.writeFrom(chunk);
@@ -312,6 +323,19 @@ class SdkDownloader {
               // 卡住熔断：15s 无数据 → 换下一个镜像续传
               if (DateTime.now().difference(lastByteAt) >= stallTimeout) {
                 throw DownloadException('镜像无进展（${stallTimeout.inSeconds}s 无数据）');
+              }
+              // 慢速熔断：窗口均速过低（涓流）→ 换镜像续传
+              slowBytes += chunk.length;
+              final slowDt = DateTime.now().difference(slowAt);
+              if (slowDt >= slowSpeedWindow) {
+                final bps = slowBytes / slowDt.inMilliseconds * 1000;
+                if (bps < slowSpeedFloor) {
+                  throw DownloadException(
+                      '镜像限速（${(bps / 1024).toStringAsFixed(0)}KB/s '
+                      '< ${(slowSpeedFloor / 1024)}KB/s）');
+                }
+                slowAt = DateTime.now();
+                slowBytes = 0;
               }
             }
             await raf.flush();
