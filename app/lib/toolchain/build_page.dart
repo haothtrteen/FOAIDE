@@ -245,6 +245,21 @@ class _BuildPageState extends State<BuildPage> {
     _lines.add('  后端：${bare ? 'Termux 裸原生（不经 proot）' : 'Proot 容器'}');
     _lines.add('');
 
+    // 前置清理（Bug 420）：上次构建被强杀的孤儿 dart 进程仍持有 flutter
+    // 启动锁时，新构建会永远卡在 "Waiting for another flutter command..."。
+    // proot 清容器 SDK 锁；termux 清 prefix 锁（dart 路径两后端都匹配）。
+    final flutterDir = bare ? TermuxPaths.flutterHome(env) : '/opt/flutter';
+    final killed = await ToolchainEnsure().flutterUnlock(
+      _bridge,
+      flutterDir,
+      bare: bare,
+    );
+    if (!mounted) return;
+    _lines.add(killed > 0
+        ? '🧹 已清理残留 flutter 进程 $killed 个（启动锁已释放）'
+        : '🧹 无残留 flutter 进程，锁干净');
+    _lines.add('');
+
     // flutter 工具硬依赖 git，缺失时先自动安装（幂等；已装秒过）。
     // termux 后端跳过：前置检查已确保 bionic git 就位。
     if (!bare) {
@@ -287,20 +302,20 @@ class _BuildPageState extends State<BuildPage> {
       }
     }
 
-    final String cmd;
-    if (bare) {
-      final flutterBin = '${TermuxPaths.flutterHome(env)}/bin/flutter';
-      // 环境双保险：Kotlin bareEnvironment 已注入 PREFIX/JAVA_HOME/
-      // GRADLE_USER_HOME/镜像等；这里再按 Dart 口径 export 一遍
-      //（envPrefix 含 PUB/FLUTTER 镜像），flutter 用全路径不依赖 PATH。
-      cmd = "cd $proj && ${TermuxPaths.envPrefix(env)}"
-          "FLUTTER_ALLOW_ROOT=true '$flutterBin' build apk --release "
-          '--target-platform=android-arm64$aapt2Override';
-    } else {
-      cmd =
-          'cd $proj && FLUTTER_ALLOW_ROOT=true '
-          'flutter build apk --release --target-platform=android-arm64';
-    }
+    // pub get 三次重试（Bug 420 第二层）：弱网下 pub 的 TLS 瞬断会让
+    // flutter build 内部的自动 pub get 直接 exit 69。提前独立 pub get
+    // 并重试，成功后 build 内部的自动 pub get 秒过（pubspec 未变）。
+    final flutterCmd =
+        bare ? "'${TermuxPaths.flutterHome(env)}/bin/flutter'" : 'flutter';
+    final envPart = bare ? TermuxPaths.envPrefix(env) : '';
+    final cmd = "cd $proj && $envPart"
+        'FLUTTER_ALLOW_ROOT=true '
+        'ok=0; for i in 1 2 3; do '
+        'if $flutterCmd pub get; then ok=1; break; fi; '
+        'sleep 3; done; '
+        '[ "\$ok" = 1 ] || exit 69; '
+        '$flutterCmd build apk --release '
+        '--target-platform=android-arm64$aapt2Override';
     final start = await _bridge.execStream(cmd, bare: bare);
     if (!mounted) return;
     if (!start.ok || start.id <= 0) {
@@ -397,6 +412,12 @@ class _BuildPageState extends State<BuildPage> {
       tip = '磁盘空间不足：清理 build/ 与 .gradle 缓存后重试';
     } else if (l.contains('could not resolve') || l.contains('sslhandshake')) {
       tip = '依赖下载失败：检查镜像源（工具链页 → Gradle 镜像）';
+    } else if (l.contains('tls error') || l.contains('failed to update packages')) {
+      tip = 'pub 拉取 TLS 失败（多为弱网瞬断）：构建已自动重试 3 次，'
+          '仍失败请切换网络后重试；若反复出现，检查「Gradle 镜像」页的源配置';
+    } else if (l.contains('waiting for another flutter command')) {
+      tip = 'Flutter 启动锁被占用：残留进程未清干净——完全杀掉 App 重开再试'
+          '（alpha.30 起构建前会自动清理）';
     } else if (l.contains('snapshot not compatible')) {
       tip = 'flutter_tools.snapshot 架构不匹配：x64 兼容层未接管 dart-sdk';
     }

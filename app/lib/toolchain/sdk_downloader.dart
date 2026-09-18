@@ -57,6 +57,10 @@ class SdkDownloader {
   static const int probeBytes = 65536;
   static const int maxRetriesPerMirror = 2;
   static const Duration stallTimeout = Duration(seconds: 15);
+
+  /// 响应头超时：TCP 连上后服务器 hang 住不回 Range 响应头的场景
+  ///（connectionTimeout 只管三次握手，管不了请求发出后的等待）。
+  static const Duration respHeaderTimeout = Duration(seconds: 20);
   static const int defaultSegments = 4;
 
   /// 慢速熔断：有数据但涓流（如 16KB/s 涓流不死流）——stallTimeout 抓不到，
@@ -302,7 +306,9 @@ class SdkDownloader {
               HttpHeaders.rangeHeader,
               'bytes=${seg.start + done}-${seg.end - 1}',
             );
-            final resp = await req.close();
+            // 响应头超时（Bug 421）：服务器 hang 住不回头的场景，
+            // 超时抛 TimeoutException → 重试/换镜像
+            final resp = await req.close().timeout(respHeaderTimeout);
             if (resp.statusCode == 200) {
               // 不支持 Range：该镜像无法分段，直接换镜像
               throw DownloadException('服务器不支持 Range（HTTP 200）');
@@ -310,21 +316,21 @@ class SdkDownloader {
             if (resp.statusCode != 206) {
               throw DownloadException('下载被拒绝（HTTP ${resp.statusCode}）');
             }
-            var lastByteAt = DateTime.now();
             // 慢速熔断滑动窗口（见 slowSpeedWindow 注释）
             var slowAt = DateTime.now();
             var slowBytes = 0;
-            await for (final chunk in resp) {
+            // 卡住熔断（Bug 421 修正）：必须由 Stream.timeout 驱动——
+            // 原实现把"15s 无数据"检查写在读流循环体内，只在数据到达时
+            // 执行；服务端 hang 住（连接在、不吐数据）时循环挂起，检查
+            // 永远不运行，熔断形同虚设（真机实测卡死在 80.2/91.8MB）。
+            // Stream.timeout 在事件间隔超 stallTimeout 时抛
+            // TimeoutException → 走重试/换镜像，分片续传。
+            await for (final chunk in resp.timeout(stallTimeout)) {
               if (token?.isCancelled ?? false) throw DownloadException('已取消');
               await raf.writeFrom(chunk);
               done += chunk.length;
-              lastByteAt = DateTime.now();
               onChunk(chunk.length);
-              // 卡住熔断：15s 无数据 → 换下一个镜像续传
-              if (DateTime.now().difference(lastByteAt) >= stallTimeout) {
-                throw DownloadException('镜像无进展（${stallTimeout.inSeconds}s 无数据）');
-              }
-              // 慢速熔断：窗口均速过低（涓流）→ 换镜像续传
+              // 慢速熔断：窗口均速过低（涓流，有数据但 <64KB/s）→ 换镜像
               slowBytes += chunk.length;
               final slowDt = DateTime.now().difference(slowAt);
               if (slowDt >= slowSpeedWindow) {

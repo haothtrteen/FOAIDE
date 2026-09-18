@@ -70,6 +70,40 @@ class ToolchainEnsure {
     return null;
   }
 
+  /// 构建前清理 Flutter 启动锁与孤儿进程（Bug 420，2026-09-18 真机）。
+  ///
+  /// 场景：上次构建被强杀（App 被杀/取消）后，容器内的 dart 孤儿进程
+  /// 仍持有 flutter 启动锁（flock，进程活着锁就在），新构建永远停在
+  /// `Waiting for another flutter command to release the startup lock...`
+  /// ——真机实测干等 9 分钟直到 pub 超时。proot 不隔离 PID、minbase 里
+  /// 没有 ps/pkill，用 /proc 遍历 + shell builtin kill。
+  ///
+  /// 匹配串故意拆写（'dart-sdk/bin/''dart'）：脚本文本自身（sh -c 的
+  /// cmdline）不含完整串，不会自杀；只杀 dart 解释器进程（flutter_tools/
+  /// pub 的宿主），gradle daemon（java）不受影响、可复用。
+  ///
+  /// [flutterDir]：proot 模式传 /opt/flutter；termux 模式传宿主 prefix 的
+  /// flutter 路径。返回杀掉的进程数。
+  Future<int> flutterUnlock(
+    ProotBridge bridge,
+    String flutterDir, {
+    bool bare = false,
+  }) async {
+    final r = await _bridge.exec('''
+PAT='dart-sdk/bin/''dart'
+n=0
+for d in /proc/[0-9]*; do
+  if grep -qa "\$PAT" "\$d/cmdline" 2>/dev/null; then
+    kill -9 "\${d#/proc/}" 2>/dev/null && n=\$((n+1))
+  fi
+done
+rm -f "$flutterDir/bin/cache/lockfile" 2>/dev/null
+echo "UNLOCK:\$n"
+''', timeoutSec: 30, bare: bare);
+    final m = RegExp(r'UNLOCK:(\d+)').firstMatch(r.stdout);
+    return m != null ? int.parse(m.group(1)!) : 0;
+  }
+
   static String _tail(String s) {
     final t = s.trim();
     return t.length <= 400 ? t : '…${t.substring(t.length - 400)}';
