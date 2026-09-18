@@ -15,7 +15,15 @@ import 'fs_bridge.dart';
 /// 本页负责打开文件、编辑、保存。
 class EditorPage extends StatefulWidget {
   final FsBridge bridge;
-  EditorPage({super.key, FsBridge? bridge}) : bridge = bridge ?? FsBridge();
+
+  /// 初始浏览目录（alpha.33 项目工作台传入项目根）；缺省 = projects 根。
+  final String? initialDir;
+
+  /// 初始打开的文件（容器内路径）；缺省不打开。
+  final String? initialPath;
+
+  EditorPage({super.key, FsBridge? bridge, this.initialDir, this.initialPath})
+      : bridge = bridge ?? FsBridge();
 
   @override
   State<EditorPage> createState() => _EditorPageState();
@@ -29,6 +37,17 @@ class _EditorPageState extends State<EditorPage> {
   String _content = '';
   String _initialContent = ''; // 打开时的初始内容（撤销更改恢复点）
   bool _dirty = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // alpha.33 项目工作台：从指定文件直接进入编辑（首帧后打开，避免
+    // build 前改状态；失败静默——编辑器照常空态展示）
+    final p = widget.initialPath;
+    if (p != null && p.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _openFile(p));
+    }
+  }
 
   // ---------------- 文件操作 ----------------
 
@@ -288,6 +307,7 @@ class _EditorPageState extends State<EditorPage> {
       key: _treeKey,
       bridge: widget.bridge,
       onOpenFile: _openFile,
+      initialDir: widget.initialDir,
     );
   }
 

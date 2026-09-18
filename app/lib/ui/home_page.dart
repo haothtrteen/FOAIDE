@@ -9,6 +9,7 @@ import '../editor/editor_page.dart';
 import '../filemanager/file_browser_page.dart';
 import '../filemanager/fs_browser_bridge.dart';
 import '../toolchain/build_page.dart';
+import '../project/project_page.dart';
 import '../toolchain/toolchain_page.dart';
 import 'terminal_page.dart';
 
@@ -510,9 +511,12 @@ class _HomePageState extends State<HomePage> {
                   if (i > 0) const Divider(height: 1, indent: 72),
                   _ProjectTile(
                     project: p,
+                    // alpha.33：点工程先入项目工作台（概览/代码/清单/打包），
+                    // 构建改为工作台内的一个入口；直达构建页保留给
+                    // 通知回跳与长按菜单
                     onTap: () => Navigator.of(context).push(
                       MaterialPageRoute(
-                        builder: (_) => BuildPage(initialProject: p.name),
+                        builder: (_) => ProjectPage(projectName: p.name),
                       ),
                     ),
                     onLongPress: () => _showProjectMenu(p),

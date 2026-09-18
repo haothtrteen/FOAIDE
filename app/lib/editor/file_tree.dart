@@ -18,7 +18,15 @@ class FileTree extends StatefulWidget {
   /// 点击文件（叶子）回调，参数为文件完整路径。
   final void Function(String path) onOpenFile;
 
-  const FileTree({super.key, required this.bridge, required this.onOpenFile});
+  /// 初始浏览目录（alpha.33 项目工作台传入项目根）；缺省 = projects 根。
+  final String? initialDir;
+
+  const FileTree({
+    super.key,
+    required this.bridge,
+    required this.onOpenFile,
+    this.initialDir,
+  });
 
   @override
   State<FileTree> createState() => FileTreeState();
@@ -33,6 +41,8 @@ class FileTreeState extends State<FileTree> {
   @override
   void initState() {
     super.initState();
+    final init = widget.initialDir;
+    if (init != null && init.isNotEmpty) _dir = init;
     _load();
   }
 
