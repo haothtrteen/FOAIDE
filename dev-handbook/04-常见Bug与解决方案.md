@@ -2056,6 +2056,133 @@ install 用 `&&` 串联、成功判定用哨兵、失败文案包含 `dpkg --con
 
 ---
 
+### Bug 436：构建卡在「准备构建环境」并报 `fetch --tags` / HTTP 504
+
+**症状**（2026-09-19 真机）：构建长时间停在 4%，日志出现
+
+```
+Command exited with code 128: fetch --tags
+Standard error: error: RPC failed; HTTP 504 curl 22
+fatal: the remote end hung up unexpectedly
+```
+
+用户追问："为什么之前的版本不会卡在这里，而且比以前慢好多，是不是
+没设定国内镜像源？"
+
+**第一件事：先排除最像的嫌疑人。** 直觉上这是镜像配置问题，实测**不是**：
+
+- `git ls-remote --get-url origin` 确认 URL 重写**已生效**，指向 gitclone 镜像；
+- 直接 curl 该镜像的 `info/refs`：**HTTP 200 / 1.6s**，服务正常。
+
+**真因是 flutter 工具自身的版本新鲜度检查**：
+
+```dart
+// packages/flutter_tools/lib/src/version.dart
+static const checkAgeConsideredUpToDate = Duration(days: 3);
+```
+
+距 `flutter_version_check.stamp` 里记录的上次检查超过 **3 天**，就会重新
+`_fetchRemoteFrameworkCommitDate()`——内部即 `git fetch --tags`。该请求
+在真机网络下 504，flutter 捕获 `VersionCheckError` 后**继续构建**
+（源码注释明确写了 best-effort），**但用户要先等满超时**。
+
+**"为什么以前不卡"的确切答案**：stamp 写于 9-17，用户 9-19 构建时
+**刚好超过 3 天阈值**。而更早的版本根本没走到这一步（卡在 54% 崩溃、
+或 pub 装不上）。**不是步骤变了，是一个按时间触发的缓存到期了。**
+
+**复现实验（本机实测）**：
+
+| stamp 状态 | `flutter pub get` 输出 |
+|---|---|
+| 设为 9 天前 | **出现** 504 / `remote end hung up` |
+| 刷新为当前时间 | **消失**，正常输出 `Got dependencies!` |
+
+**修复**：构建前把 stamp 刷新为当前时间（JSON 字段
+`lastTimeVersionWasChecked`，与 `VersionCheckStamp.fromJson` 对齐）。
+属官方缓存协议内的用法，不改 SDK 源码、不伪造远端版本号
+（写 `lastKnownRemoteVersion` 会让 flutter 误判本地落后而提示升级）。
+
+**附带修复（同一区域的隐藏 bug）**：proot 构建路径的 `envPart`
+**只设了 `SSL_CERT_FILE`**，没有 `FLUTTER_STORAGE_BASE_URL`。
+`pub get` 那行自己内联了 `PUB_HOSTED_URL`（多源轮换），所以 pub 没事；
+但 `flutter build` 那段是裸奔的，引擎/资产下载会回落到官方地址。
+
+`foa-env.sh` 里其实写了这些变量——**但它放在 `/etc/profile.d/`，
+而 proot 用 `sh -c` 直接执行命令，根本不读 profile.d**。
+等于那份配置文件对构建路径**完全无效**。
+
+> **教训**：`/etc/profile.d/*.sh` 只对**登录 shell** 生效。
+> 凡是以 `sh -c` / `execve` 直接拉起的方式跑命令，
+> 都必须把环境变量**显式写进命令**。别指望 profile.d。
+
+---
+
+### Bug 437：`REASSERT=0` 却仍在 AOT 52% 崩溃——verify 从未测过 impellerc
+
+**症状**（2026-09-19 真机，alpha.44）：
+
+```
+REASSERT=0                    ← 转发层完好，没什么需要修的
+...
+Dart snapshot generator failed with exit code -4
+impellerc failure:
+ShaderCompilerException: Shader compilation of ".../ink_sparkle.frag" failed
+```
+
+**`REASSERT=0` 是本条最有价值的信息。**
+
+- `REASSERT=<n>` 的 n 是「本次修复的文件数」。n=0 说明**转发层全部就位**，
+  Bug 433 的修复**正常工作**了——但构建**依然崩**。
+- 这直接推翻了「转发层被 pub get 覆盖」的假设：**转发脚本在、且完好**，
+  7 个文件都确认是指向 qemu 的 `#!/bin/sh` 脚本。
+
+于是问题转为：**既然转发层是好的，为什么 impellerc 还是跑不起来？**
+
+**根因：`verify` 从来没有测过 `impellerc`。**
+
+原 `_verifyScript` 只冒烟了**一个**工具：
+
+```sh
+gs=@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot
+```
+
+而真机 AOT 阶段实际崩的是 **`impellerc`**（shader 编译），它在
+**顶层 `linux-arm64/`**，**不在 `android-arm64-release/` 里**。
+
+> 「工具链已验证就绪」这个结论，**只对被测过的那个工具有效**。
+> 被测集合 ⊊ 被使用集合时，验证通过是一种**假安全感**。
+
+**修复**：
+
+1. `verify` 逐个冒烟 **gen_snapshot / impellerc / font-subset**，
+   抽成统一的 `smoke()` 函数；
+2. **失败时必须输出具体原因**——原先只输出 `yes/no`，而四种失败形态
+   （脚本缺失 / 转发层被覆盖 / 依赖库缺失 / SIGILL）**修法完全不同**，
+   只有 `no` 等于没给信息；
+3. 新增 `TARGET_BAD=` 检查：**转发脚本指向的目标是否仍是 x86_64 ELF**
+   （magic `7f454c46...3e`）。这能抓到最难查的组合——
+   「脚本在、`REASSERT=0`、但一跑就崩」：脚本是好的，它指向的
+   `linux-x64/` 原件却被换掉了；
+4. Dart 侧收集诊断续行，在工具链页一并展示。
+
+**教训（与 Bug 429/433/435 同源的第四次）**：
+- Bug 429：要检查**全称**而非点名；
+- Bug 433 ①：检查点与使用点之间**时序**上还有别的动作；
+- Bug 435：**"我在某处修过"≠"所有执行路径都被修复"**；
+- Bug 437：**"我验证过"≠"所有被使用的对象都被验证过"**。
+
+四次都是同一个错误换了个维度：**悄悄把"存在"当成了"全称"**。
+
+**沙箱限制（诚实记录）**：本修复**无法在沙箱端到端验证**。
+沙箱是 x86_64 原生环境，`qemu-x86_64-static` 根本不需要也不存在，
+`_verifyScript` 直接返回 `__NO_QEMU__`；arm64 容器又因网络受限
+装不上 `qemu-user-static`。**能做的只有**：脚本语法检查
+（dash/bash）、结构断言（单测 13 项）、以及在 x86_64 上复现 Bug 436
+的 504 机制。**真机 `impellerc` 为何 SIGILL，仍需真机诊断数据定夺**
+——这正是本次把诊断信息做详细的原因。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
