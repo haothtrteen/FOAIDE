@@ -233,6 +233,47 @@ Android SDK 自带的 cmake 是 x86_64 版。
 
 ---
 
+### Bug 304 · `configureCMakeRelease[arm64-v8a]` 报 CMake '3.22.1' was not found
+
+**症状**：
+
+```
+Execution failed for task ':app:configureCMakeRelease[arm64-v8a]'.
+> [CXX1300] CMake '3.22.1' was not found in SDK, PATH, or by cmake.dir property.
+```
+
+**注意**：本项目**没有任何 native 代码**（无 `.c/.cpp/CMakeLists.txt`，见环境搭建记录 §3），
+但 AGP 9.1 仍会为每个 variant × ABI 无条件创建 `configureCMake*` / `buildCMake*` 任务，
+并把它们放进 `assembleRelease` 的依赖图（空跑也要先定位到 cmake 可执行文件）。
+所以**这是"没有 native 代码也会踩"的坑**，别再按"纯 Dart 项目不需要 cmake"跳过。
+
+**根因**：SDK 目录里没有 cmake（精简安装的 SDK 常缺），且 AGP 只认 SDK 内指定版本 /
+`cmake.dir` / PATH 三条路。本沙箱 `/usr/bin/cmake` 是 3.28.3，AGP 要 3.22.1，
+单独走 PATH 那条路它不认。
+
+**解决**：造一个符合 AGP 期望布局（`<dir>/bin/cmake`）的 shim，再指过去：
+
+```bash
+mkdir -p /opt/cmake-shim/bin
+ln -sf /usr/bin/cmake /opt/cmake-shim/bin/cmake
+ln -sf /usr/bin/ctest /opt/cmake-shim/bin/ctest
+
+# android/local.properties（机器本地文件，不入库）
+cmake.dir=/opt/cmake-shim
+```
+
+验证：
+
+```bash
+./gradlew ":app:configureCMakeRelease[arm64-v8a]"
+# → BUILD SUCCESSFUL（任务空跑，因为没有 CMakeLists.txt）
+```
+
+> 更稳的做法是把官方 `cmake-3.22.1-linux-x86_64.zip` 解到 `sdk/cmake/3.22.1/`，
+> 但 `dl.google.com` 在国内/沙箱常被 TLS 阻断，shim 是更省事的路径。
+
+---
+
 ## 四、APK 构建产物相关
 
 ### Bug 401 · Release 包安装后启动崩溃：`Flag dedup_instructions is false in snapshot`
@@ -986,6 +1027,114 @@ DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq qemu-user-static libc6:amd64
 - **笼统错误信息是排障的最大障碍**——"关键组件缺失"不如"缺少 build-tools/36.0.0/aapt2"一个词有用；安装这类多组件流程，每个环节都要能自证（逐组件校验关键文件）；
 - 沙箱（x86_64）能证伪"算法问题"（解压逻辑正确），但真机环境（proot/权限/存储）的差异只能靠**设备侧自诊断**收敛；
 - Google SDK 归档顶层目录名与版本号无关（`android-16` 装的是 36.0.0），代码必须按「取顶层条目改名归位」而非硬编码目录名。
+
+---
+
+## 十一之二、原生 arm64 后端相关（2026-09-18）
+
+### 11-2.1 · bionic 链接的原生二进制在 glibc 容器里跑不起来（Bug 418，2026-09-18）
+
+**症状**：把 Termux 系移植的 aarch64 二进制（如 gen_snapshot）放进 Debian rootfs
+后执行，报：
+
+```
+/system/bin/linker64: No such file or directory
+```
+或
+```
+CANNOT LINK EXECUTABLE "/opt/foa-native/gen_snapshot": library "libc.so" not found
+```
+
+注意这两条**都不是**"架构不对"——`readelf -h` 明明是 AArch64，容易误判成
+"又是一个 Exec format error"，实际是**动态链接器找不到**。
+
+**原因**：Termux 的编译目标是 Android bionic，ELF 的 INTERP 是
+`/system/bin/linker64`，libc 来自 `/apex/com.android.runtime/lib64/bionic`。
+而容器 rootfs 是 glibc 的 Debian，压根没有 `/system` 与 `/apex`——
+proot 只做路径重定向，不会凭空变出这两个目录。
+
+**解决**（`MainActivity.kt`）：
+- `buildProotCmd()` 里按**落位标记**（`rootfs/opt/foa-native/gen_snapshot` 是否存在）
+  追加 `-b /system -b /apex -b /linkerconfig`（逐项判存在再加）；
+- `libraryPath()` 在原有 `filesDir/tools`（proot 自己的 libtalloc/libandroid-shmem）
+  之后追加 bionic 搜索路径：`/apex/com.android.runtime/lib64/bionic`、
+  `/apex/com.android.art/lib64`、`/system/lib64`、`/vendor/lib64`；
+- 未落位时两条分支都是 false，行为与以前**逐字节一致**（不引入回归）。
+
+**验证**：`flutter analyze` 零 error；真机侧靠导入流程里的 `--help` 冒烟验证——
+冒烟不过会**当场删除落位文件**，挂载与库路径随之自动失效，不留半吊子状态。
+
+**教训**：
+- 判断"能不能跑"要看 **ELF Machine + INTERP + DT_NEEDED** 三件事，只看 Machine
+  会把"链接器缺失"误诊成"架构错误"；
+- 判定 bionic / glibc 的廉价指纹：DT_NEEDED 里出现**无版本号**的 `libc.so`
+  → bionic；出现 `libc.so.6` → glibc。不用装 binutils 也能从 `grep -a` 粗扫看出来；
+- proot 的 `-b` 是"新增挂载点"，不是"替换"——挂 `/system` 不会影响 Debian 程序
+  （它们不会去 `/system` 找库），副作用为零。
+
+### 11-2.2 · minbase rootfs 没有 readelf（体检脚本不能依赖 binutils）
+
+**症状**：想用 `readelf -d` 取 DT_NEEDED 判断链接类型，Debian minbase 里
+`readelf: not found`（binutils 不在 required 级，minbase 不装）。
+
+**解决**（`native_arm64.dart` 的体检脚本）：
+- Machine 判定**不依赖任何工具**：`od -An -tx1 -j 18 -N 2 <file>` 读 e_machine
+  （`b700`=aarch64 / `3e00`=x86-64 / `2800`=arm32 / `0300`=i386）；
+- 先校验 ELF 魔数 `7f454c46`，非 ELF 归为 data（快照、jar），避免把随机二进制
+  误判成"unknown 架构的 ELF"；
+- DT_NEEDED 有 readelf 就用 `readelf -d`，没有就退化为 `grep -a` 字符串粗扫，
+  并在结果里标记 `approx=yes`，UI 上如实显示"粗扫"。
+
+**教训**：容器内脚本要按"minbase 只有 coreutils + apt"来写；能用 `dd`/`od`
+读字节解决的事，不要引入新包（装 binutils 要多几十 MB，为一次体检不值）。
+
+### 11-2.3 · Bug 419：Gradle 解析 `io.flutter:flutter_embedding_release` 失败——引擎 Maven 仓库地址藏在 `FLUTTER_STORAGE_BASE_URL` 里
+
+**症状**（2026-09-18 沙箱实测，出包必踩）：
+```
+> Could not resolve io.flutter:flutter_embedding_release:1.0.0-<engine-hash>.
+  > Could not HEAD 'https://storage.googleapis.com/download.flutter.io/...'
+    > Remote host terminated the handshake
+```
+阿里云镜像齐全、`~/.gradle/init.gradle` 就位，唯独 io.flutter 全挂；
+甚至把 jar/pom 提前放进 Gradle 缓存 `files-2.1/`，离线模式仍报
+`No cached version available for offline mode`。
+
+**原因**：
+- `flutter_embedding_release` / `arm64_v8a_release` 等引擎构件**只发布在
+  Flutter 官方 Maven 仓**（`{FLUTTER_STORAGE_BASE_URL}/download.flutter.io`），
+  阿里云/腾讯镜像**均不代理**；
+- `FlutterPlugin.kt`（flutter_tools/gradle，L91-97）构建期读环境变量
+  `FLUTTER_STORAGE_BASE_URL` 拼仓库地址，**缺省值是 storage.googleapis.com**——
+  沙箱对 dl.google.com / repo.maven.apache.org / storage.googleapis.com
+  都是 TLS 握手层阻断（`SSL_ERROR_SYSCALL`），Gradle 逐仓重试全灭；
+- Gradle 缓存条目按"仓库 id"索引，手动塞文件或强开 offline
+  （`gradle.startParameter.offline = true` 的 init 脚本）都会因
+  仓库 id 不匹配解析不到，且 init 脚本给 allprojects 塞仓库还会顶撞
+  settings 的 `repositoriesMode` 报 `prefer settings repositories`——
+  **缓存侧怎么绕都绕不过去，必须让构建走可达镜像**。
+
+**解决**（固化进 `.trae/skills/foa-sandbox-build` 固定流程）：
+```bash
+export FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn   # 引擎 Maven 仓跟着切到镜像
+export PUB_HOSTED_URL=https://pub.flutter-io.cn
+flutter build apk --release --target-platform=android-arm64     # 573s 全绿
+```
+构建日志开头出现 `Flutter assets will be downloaded from
+https://storage.flutter-io.cn` 即为生效标志。
+
+**验证**：同条件下复跑构建成功出包；产物验证三件套 +
+`classes.dex` 的 kadb 残留 = 0 全部通过（alpha.27）。
+
+**教训**：
+- **网络排障先分清"哪个依赖走哪个仓"**：Maven 镜像配得再全，
+  引擎构件的仓库地址是 Flutter Gradle 插件在运行时按环境变量拼的，
+  这是独立于 init.gradle / settings.gradle 的第三条仓库注入路径；
+- 不要用 init 脚本强开 offline 硬闯——失败信息（"No cached version"）
+  会把人引向"缓存坏了"的错误方向，实际是仓库 id 不匹配；
+- 前置连通性自检只需 4 个 curl：`storage.flutter-io.cn` /
+  `maven.aliyun.com` / `dl.google.com` / `storage.googleapis.com`，
+  前两个必须通、后两个通不通都行（有镜像就行）。
 
 ---
 
