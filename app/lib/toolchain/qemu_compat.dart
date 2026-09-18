@@ -344,12 +344,32 @@ done
 # 卸载核心：apt purge 失败会残留 qemu → 出现"卸载没效果"。此前
 # `purge ... | tail || true` 管道吞掉 apt 退出码，失败也报成功。
 # 现在逐条捕获状态：purge 非零 → 报错退出；qemu 仍在 → 报错退出。
-DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq qemu-user-static libc6:amd64 libstdc++6:amd64 libgcc-s1:amd64 zlib1g:amd64 libatomic1:amd64 > /tmp/foa_purge.log 2>&1
+#
+# Bug 434（真机 rc=100 "Essential packages were removed"）：
+# 一条命令里同时 purge qemu-user-static **和** libc6:amd64 等运行库时，
+# apt 会把这些运行库当成"随 qemu 一起装的无主依赖"级联删除；而本机是
+# arm64 宿主 + amd64 外来架构，删 libc6:amd64 会被判定为移除 essential
+# 包，`-y` 下直接拒绝 → rc=100，整个卸载失败（qemu 反而一个都没删）。
+# 因此改成分步：① 只 purge qemu 本体（不带 :amd64 运行库）；
+# ② 运行库**逐个**删，单个失败不影响其它，也不触发 essential 拒绝；
+# ③ 最后清 amd64 外来架构，让宿主回到纯净单架构状态。
+DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq qemu-user-static > /tmp/foa_purge.log 2>&1
 rc=$?
 if [ "$rc" != 0 ]; then
   echo "PURGE_FAILED rc=$rc"
   tail -n 15 /tmp/foa_purge.log
   exit 2
+fi
+# 运行库逐个删：任一失败只记录，不中断（它们可能被别的包依赖）
+libs_fail=""
+for p in libatomic1:amd64 zlib1g:amd64 libgcc-s1:amd64 libstdc++6:amd64 libc6:amd64; do
+  dpkg -l "$p" 2>/dev/null | grep -q '^ii' || continue
+  if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$p" >> /tmp/foa_purge.log 2>&1; then
+    libs_fail="$libs_fail $p"
+  fi
+done
+if [ -n "$libs_fail" ]; then
+  echo "PURGE_LIBS_PARTIAL:$libs_fail"
 fi
 [ -x @QEMU@ ] && { echo QEMU_STILL_PRESENT; exit 3; }
 dpkg --remove-architecture amd64 2>/dev/null || true
@@ -534,6 +554,14 @@ echo UNINSTALL_OK
       throw DownloadException(
         'x64 兼容层卸载失败：${out.isEmpty ? r.stderr.trim() : out}',
       );
+    }
+    // Bug 434：多架构运行库可能被其它包依赖，删不掉不算致命——兼容层的
+    // 判定标准是「qemu 本体已移除且转发层已还原」，上面已经保证了这一点。
+    // 这里只提示，不抛异常，否则"卸不干净"会被误报成"卸载失败"。
+    if (out.contains('PURGE_LIBS_PARTIAL:')) {
+      final libs =
+          out.split('PURGE_LIBS_PARTIAL:').last.split('\n').first.trim();
+      stderr.writeln('[QemuCompat] 兼容层已卸载，以下多架构库被其它包依赖、保留：$libs');
     }
     await _removeGradleOverride(env.rootfsPath);
   }
