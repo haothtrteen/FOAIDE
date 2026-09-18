@@ -82,6 +82,8 @@ for f in "$F"/*; do
   [ -f "$f" ] || continue
   [ -x "$f" ] || continue
   case "$f" in *.foa-real) continue ;; esac
+  # Bug 428：已是转发脚本（#! 开头）则跳过——重应用时不再误动已包装项
+  if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
   m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$m" in 7f454c46*3e) ;; *) continue ;; esac
   mv "$f" "$f.foa-real"
@@ -93,7 +95,10 @@ echo "FLUTTER_WRAPPED=$n"
 
   /// 引擎产物同步：若尚未下载 → flutter precache --android（走 flutter-io.cn），
   /// 再为每个 android-*/linux-x64 生成 linux-arm64/ 转发脚本。
-  static const String _engineSyncScript = r'''
+  ///
+  /// 公开（原 `_engineSyncScript`）供 [ToolchainEnsure.qemuCompatEnsure]
+  /// 在构建前幂等重建转发层（Bug 428：precache 会覆写 linux-arm64/）。
+  static const String engineWrapScript = r'''
 E=@ENGINE@
 [ -d "$E" ] || { echo ENGINE_MISSING; exit 0; }
 if ! ls -d "$E"/android-*/linux-x64 >/dev/null 2>&1; then
@@ -127,9 +132,17 @@ for d in "$E"/android-*/linux-x64; do
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     w="$a/${f##*/}"
-    [ -f "$w" ] || gen "$w" "$f"
+    # Bug 428 关键修复：判定"是否已是转发脚本"，而非"文件是否存在"。
+    # flutter precache 在 arm64 宿主上会往 linux-arm64/ 写它下载的
+    # **真 x64 二进制**（上游 artifacts.dart 未对 linux_arm64 做 x64
+    # 回退，见 flutter/flutter#152281），覆盖掉我们先前放的包装脚本。
+    # 旧逻辑 [ -f "$w" ] 见文件存在就跳过 → 永久卡在错误状态 → SIGILL。
+    if [ -f "$w" ] && head -c 2 "$w" 2>/dev/null | grep -q '#!'; then
+      continue   # 已是转发脚本，幂等跳过
+    fi
+    gen "$w" "$f"
+    n=$((n+1))
   done
-  n=$((n+1))
 done
 echo "ENGINE_DIRS=$n"
 ''';
@@ -159,6 +172,8 @@ for d in "$S"/build-tools/* "$S"/platform-tools; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
     case "$f" in *.foa-real) continue ;; esac
+    # Bug 428：已是转发脚本则跳过（同 flutter/engine 层修复）
+    if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     mv "$f" "$f.foa-real"
@@ -179,11 +194,25 @@ echo "LOADER=$loader"
 # 引擎转发层 + 分步验证 3：包装后的 gen_snapshot 可跑通 --help
 gs=@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot
 if [ -x "$gs" ]; then
-  out=$( "$gs" --help 2>&1 | head -3 )
-  case "$out" in
-    *'cannot execute'*|*'Exec format'*|*'error while loading shared libraries'*) echo "GEN_SNAPSHOT=no" ;;
-    *) echo "GEN_SNAPSHOT=yes" ;;
-  esac
+  # Bug 428：先确认是转发脚本（#! 开头）——若是真 x64 二进制，在 arm64
+  # 上会 SIGILL（崩溃无输出），旧逻辑只查错误字样会把静默崩溃误判为通过
+  if head -c 2 "$gs" 2>/dev/null | grep -q '#!'; then
+    out=$( "$gs" --help 2>&1 | head -3 )
+    rc=$?
+    case "$out" in
+      *'cannot execute'*|*'Exec format'*|*'error while loading shared libraries'*) echo "GEN_SNAPSHOT=no" ;;
+      *)
+        # SIGILL 时进程被信号杀死（rc=132/-4 或输出为空）：判为未就位
+        if [ -z "$out" ] || [ "$rc" -ge 128 ] 2>/dev/null; then
+          echo "GEN_SNAPSHOT=no"
+        else
+          echo "GEN_SNAPSHOT=yes"
+        fi
+        ;;
+    esac
+  else
+    echo "GEN_SNAPSHOT=no"
+  fi
 else
   echo "GEN_SNAPSHOT=no"
 fi
@@ -326,7 +355,7 @@ echo UNINSTALL_OK
         throw DownloadException('Flutter 工具链转发失败：${fw.stderr}');
       }
       final en = await bridge.exec(
-        _engineSyncScript
+        engineWrapScript
             .replaceAll('@ENGINE@', engineDir)
             .replaceAll('@FLUTTER@', flutterHome)
             .replaceAll('@QEMU@', qemuBin),
@@ -441,7 +470,7 @@ echo UNINSTALL_OK
         timeoutSec: 300,
       );
       await bridge.exec(
-        _engineSyncScript
+        engineWrapScript
             .replaceAll('@ENGINE@', engineDir)
             .replaceAll('@FLUTTER@', flutterHome)
             .replaceAll('@QEMU@', qemuBin),

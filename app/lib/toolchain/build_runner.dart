@@ -187,6 +187,19 @@ class BuildRunner {
       // 崩）。构建前写入最小 NDK 占位使插件判定"已装"直接跳过。
       final nErr = await ToolchainEnsure().ndkStub();
       if (nErr != null) lines.add('⚠ $nErr（不阻断构建）');
+
+      // Bug 428 根因修复：flutter precache 会往 linux-arm64/ 写真 x64
+      // gen_snapshot/impellerc，覆盖兼容层先前放的 qemu 转发脚本
+      // （上游 artifacts.dart 未对 linux_arm64 做 x64 回退）。
+      // 「先应用兼容层、后装 Flutter」必踩。构建前幂等重建转发层。
+      final qErr = await ToolchainEnsure().qemuCompatEnsure(env: env);
+      if (qErr != null) {
+        lines.add('✗ $qErr');
+        lines.add('  到「工具链」页 → x64 兼容层 → 重新应用后重试');
+        status = BuildStatus.error;
+        _ui();
+        return;
+      }
     }
 
     lines.add('▶ flutter build apk --no-shrink --release'
@@ -442,6 +455,15 @@ class BuildRunner {
       tip = '多架构运行库缺失：x64 兼容层 → 重新应用';
     } else if (l.contains('no space left')) {
       tip = '磁盘空间不足：清理 build/ 与 .gradle 缓存后重试';
+    } else if (l.contains('snapshot generator failed') ||
+        l.contains('aot snapshotter exited') ||
+        l.contains('impellerc failure') ||
+        l.contains('shadercompilerexception') ||
+        l.contains('failed with exit code -4')) {
+      tip = 'AOT/shader 编译崩溃（exit -4 = SIGILL）：Flutter 只发 x86_64 '
+          '宿主版 gen_snapshot/impellerc，arm64 真机需 qemu 转发；'
+          'flutter precache 会覆写转发脚本（Bug 428）。alpha.39 起构建前'
+          '自动重建转发层。若本条仍出现：到「工具链」页重新应用 x64 兼容层';
     } else if (l.contains('exit value 132') ||
         l.contains('sigill') ||
         l.contains('sdkmanager')) {

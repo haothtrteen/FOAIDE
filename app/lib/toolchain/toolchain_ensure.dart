@@ -4,6 +4,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
+import 'qemu_compat.dart';
 import 'sdk_installer.dart';
 
 /// 工具链前置确保（Step 7 修复：容器内 flutter create/build 依赖 git；
@@ -93,6 +94,78 @@ class ToolchainEnsure {
       return null;
     } catch (e) {
       return 'NDK 占位检查失败：$e';
+    }
+  }
+
+  /// x64 兼容层构建前重新确保（Bug 428 根因修复，2026-09-18 真机 47%）。
+  ///
+  /// 症状：AOT 编译段 `Dart snapshot generator failed with exit code -4`
+  /// （SIGILL），同时 `impellerc`（shader 编译器）也 -4。
+  ///
+  /// 根因：Flutter 官方 Android gen_snapshot/impellerc **只发布 x86_64
+  /// 宿主版**（路径 `android-arm64-release/linux-x64/`），arm64 真机必须
+  /// 靠 qemu 转发。而 `artifacts.dart` L510-521 只对 darwin_arm64 做了
+  /// x64 回退、**linux_arm64 没做**（flutter/flutter#152281），于是 arm64
+  /// 宿主上 Flutter 会去找 `linux-arm64/gen_snapshot`——上游 bug 的表现是
+  /// `flutter precache` 往该目录写**真 x64 二进制**，**覆盖掉兼容层先前
+  /// 放的 qemu 转发脚本**。旧包装逻辑用 `[ -f "$w" ] || gen ...` 判定，
+  /// 「文件存在」即跳过 → 永久卡在错误状态 → 每次构建必 SIGILL。
+  ///
+  /// 触发条件极常见：**先应用兼容层、后装/升级 Flutter SDK**（precache
+  /// 冲掉包装）。真机实证：用户"先应用补丁后下载 SDK"。
+  ///
+  /// 修复：① 包装判定改为「是否已是转发脚本（`#!` 开头）」而非「是否存在」；
+  /// ② 新增本方法在**每次构建前**重新确保（幂等，包装齐备时秒过）——
+  /// 与 caCerts / gradleInitSanitize / ndkStub 同一模式：**环境会被后续
+  /// 操作覆写，必须在构建前重新确保**。
+  ///
+  /// [bare]（termux 后端）不经 qemu，直接返回 null。
+  /// 返回 null=就位/无需处理，非 null=错误文案（记录但不阻断构建）。
+  Future<String?> qemuCompatEnsure({EnvInfo? env, bool bare = false}) async {
+    if (bare) return null;
+    try {
+      // 未启用兼容层则跳过（用户可能用原生 arm64 后端）
+      final probe = await _bridge.exec(
+        'test -x ${QemuCompat.qemuBin} && echo QEMU_YES || echo QEMU_NO',
+        timeoutSec: 30,
+      );
+      if (!probe.stdout.contains('QEMU_YES')) return null;
+
+      // 检查引擎目录的转发脚本是否仍是脚本形态（被 precache 覆写则重包装）
+      final chk = await _bridge.exec(
+        'gs=${QemuCompat.engineDir}/android-arm64-release/linux-arm64/gen_snapshot; '
+        'if [ -e "\$gs" ] && head -c 2 "\$gs" 2>/dev/null | grep -q "#!"; then '
+        'echo WRAP_OK; '
+        'elif [ -e "\$gs" ]; then echo WRAP_STALE; '
+        'else echo WRAP_MISSING; fi',
+        timeoutSec: 30,
+      );
+      if (chk.stdout.contains('WRAP_OK')) return null;
+
+      // 转发脚本缺失或被覆写 → 重跑引擎包装（幂等，只补缺/纠错）
+      final r = await _bridge.exec(
+        QemuCompat.engineWrapScript
+            .replaceAll('@ENGINE@', QemuCompat.engineDir)
+            .replaceAll('@FLUTTER@', QemuCompat.flutterHome)
+            .replaceAll('@QEMU@', QemuCompat.qemuBin),
+        timeoutSec: 2400,
+      );
+      if (r.stdout.contains('PRECACHE_FAILED')) {
+        return 'x64 兼容层引擎转发重建失败（precache 失败），'
+            '请到「工具链」页重新应用 x64 兼容层';
+      }
+      // 复核
+      final v = await _bridge.exec(
+        'gs=${QemuCompat.engineDir}/android-arm64-release/linux-arm64/gen_snapshot; '
+        'head -c 2 "\$gs" 2>/dev/null | grep -q "#!" '
+        '&& echo FIXED || echo STILL_BAD',
+        timeoutSec: 30,
+      );
+      if (v.stdout.contains('FIXED')) return null;
+      return 'x64 兼容层引擎转发重建后仍异常（gen_snapshot 非转发脚本），'
+          '请到「工具链」页重新应用 x64 兼容层';
+    } catch (e) {
+      return 'x64 兼容层构建前检查失败：$e';
     }
   }
 
