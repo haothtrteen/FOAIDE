@@ -352,9 +352,7 @@ exit 0
     // 注意：不能用 `{ script ; }` 分组——脚本末尾带换行，`\n ; }` 在
     // dash/bash 下都是语法错误。改用 `sh -c '...'` 独立执行，既避开
     // 分组问题，也把它的输出隔离（只留最后 2 行，避免刷屏）。
-    final reassert = QemuCompat.wrapReassertScript
-        .replaceAll('@ENGINE@', QemuCompat.engineDir)
-        .replaceAll('@QEMU@', QemuCompat.qemuBin);
+    final reassert = QemuCompat.fill(QemuCompat.wrapReassertScript);
     // Bug 436：跳过 flutter 内部的 git fetch --tags 版本检查
     final stampFix = refreshVersionCheckStamp
         .replaceAll('@CACHE@', '${QemuCompat.flutterHome}/bin/cache');
@@ -363,9 +361,7 @@ exit 0
     // （flutter 打印 `impellerc failure: ` 后面什么都没有），说明进程被
     // 信号杀死、来不及输出。这种静默崩溃无法从 flutter 的日志反推原因，
     // 必须在构建前**主动**测一遍 qemu 链路并记录结果。
-    final diag = QemuCompat.buildPreflightScript
-        .replaceAll('@ENGINE@', QemuCompat.engineDir)
-        .replaceAll('@QEMU@', QemuCompat.qemuBin);
+    final diag = QemuCompat.fill(QemuCompat.buildPreflightScript);
     return "cd $proj && $envPart"
         'FLUTTER_ALLOW_ROOT=true '
         // Bug 436：proot 路径原先没设该变量（只有 pub get 那行内联了

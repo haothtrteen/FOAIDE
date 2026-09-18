@@ -48,6 +48,81 @@ class QemuCompat {
   static const String aapt2Override = '$sdkHome/build-tools/36.0.0/aapt2';
   static const String gradleProps = '/root/.gradle/gradle.properties';
 
+  /// Bug 439：x86_64 动态链接器的容器内路径（Debian multiarch 布局）。
+  ///
+  /// 为什么需要它：转发脚本原先写成 `qemu -L / <真实二进制>`，让 **qemu 自己**
+  /// 去查找并加载 guest 的 ld.so。实测这条路径会让所有 x64 glibc 程序崩在
+  /// `__stack_chk_fail`（`*** stack smashing detected ***`）——qemu 的地址空间
+  /// 布局与 glibc 的 TLS/栈保护初始化冲突，进程在 `main` 之前就被信号杀死，
+  /// **stderr 一个字都没有**。
+  ///
+  /// 这正是真机 `impellerc failure: ` 后面空白、`exit code -4` 的来源。
+  /// 复现矩阵（沙箱 x64 + Debian amd64 libc 2.36，四个程序全测）：
+  ///
+  /// | 程序 | `-L / <bin>`（旧） | `-L / <ld.so> <bin>`（新） |
+  /// |---|---|---|
+  /// | dart | 崩 | Dart SDK version: 3.13.3 |
+  /// | impellerc | 崩 | ImpellerC ... |
+  /// | gen_snapshot | 崩 | Usage: gen_snapshot ... |
+  /// | font-subset | 崩 | Usage: ... |
+  ///
+  /// 显式把 ld.so 当程序交给 qemu 执行，动态链接就全部由 guest 自己的 ld.so
+  /// 完成，qemu 只做指令翻译 → 正常。
+  static const String x64Loader = '/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2';
+
+  /// Bug 439：转发脚本的统一生成片段（`gen()` 的实现）。
+  ///
+  /// `@QEMU@` / `@LOADER@` 由 Dart 侧替换。生成出来的脚本带**运行时自愈**：
+  /// - 若 `@LOADER@` 存在 → 用它显式加载（正确路径）；
+  /// - 否则回退旧的 `-L / <bin>` 形式——保底不回归（万一某 rootfs 没有
+  ///   multiarch 布局，宁可回到"以前能过"的行为，也不要直接不可用）。
+  ///
+  /// 运行时探测而不是生成期写死，是因为 rootfs 是**先解压、后装兼容层**的，
+  /// 生成脚本的时刻 `@LOADER@` 可能还没被 apt 装进来。
+  static const String _wrapGenFunc = r'''
+gen() {
+  # 注意分隔符写成 <<'FOAWRAP'（**带单引号**）：这样 heredoc 体是完全字面量，
+  # 反引号、$(...) 都不会被展开。原先是不带引号的 <<FOAWRAP，body 里每个 $
+  # 都得手写 \$ 转义；一旦有人在注释里写了反引号（如 -L / 的说明），
+  # shell 会把它当命令替换，**吞掉后面所有行** → "end of file unexpected"，
+  # 而报错指向脚本第 1 行，极难定位（Bug 439 实际踩到）。
+  # 加引号后 body 里写 $ 不用转义，也不会再出这类问题。
+  cat > "$1" <<'FOAWRAP'
+#!/bin/sh
+# FOA x86_64 -> qemu-user wrapper (auto-generated, Bug 439)
+d=$(dirname "$0")
+if [ -d "$d/lib64" ]; then
+  LD_LIBRARY_PATH="$d/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH
+fi
+# Bug 439: let the guest ld.so do the dynamic linking itself.
+# Passing -L / and letting qemu find ld.so breaks glibc stack-protector
+# init (__stack_chk_fail): no stderr, process killed by a signal.
+if [ -x "@LOADER@" ]; then
+  exec @QEMU@ -L / "@LOADER@" "$2" "$@"
+fi
+exec @QEMU@ -L / "$2" "$@"
+FOAWRAP
+  chmod 755 "$1"
+}
+''';
+
+  /// Bug 439：`.so` 不能包装。
+  ///
+  /// 原先只看 ELF magic 的 `e_machine`（`7f454c46*3e`），但 `.so` 的
+  /// `e_machine` 同样是 x86_64、`e_type` 也同样是 `ET_DYN`(3)，与 PIE 可执行
+  /// 文件**完全无法区分**。于是 `libpath_ops.so` / `libtessellator.so` /
+  /// `libflutter_linux_gtk.so` 会被一起替换成 `#!/bin/sh` 转发脚本
+  /// ——共享库变成 shell 脚本，任何 `dlopen` 都会失败。
+  ///
+  /// 这里显式排除 `*.so*` 名字。用名字而不是 `e_type` 是因为
+  /// `e_type` 在 PIE 与共享库之间没有区别位；`.so`/`.so.N` 命名是
+  /// ELF 生态的硬约定，可靠且简单。
+  ///
+  /// 各遍历点直接内联 `case "$f" in *.so|*.so.*) continue ;; esac`，
+  /// 不做成共享片段——那样会引入一层 `__FOA_SO__` 占位符替换，
+  /// 比重复一行更容易出错。
+
   // ---------------- 容器内 shell 脚本（@TOKEN@ 由 Dart 侧替换）---------------
 
   static const String _installScript = r'''
@@ -64,24 +139,14 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends -o
   static const String _flutterWrapScript = r'''
 F=@FLUTTER@/bin/cache/dart-sdk/bin
 [ -d "$F" ] || { echo FLUTTER_MISSING; exit 0; }
-gen() {
-  cat > "$1" <<FOAWRAP
-#!/bin/sh
-# FOA x86_64 -> qemu-user wrapper (auto-generated)
-d=\$(dirname "\$0")
-if [ -d "\$d/lib64" ]; then
-  LD_LIBRARY_PATH="\$d/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-  export LD_LIBRARY_PATH
-fi
-exec @QEMU@ -L / "$2" "\$@"
-FOAWRAP
-  chmod 755 "$1"
-}
+__FOA_GEN__
 n=0
 for f in "$F"/*; do
   [ -f "$f" ] || continue
   [ -x "$f" ] || continue
   case "$f" in *.foa-real) continue ;; esac
+  # Bug 439：共享库不包装
+  case "$f" in *.so|*.so.*) continue ;; esac
   # Bug 428：已是转发脚本（#! 开头）则跳过——重应用时不再误动已包装项
   if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
   m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
@@ -112,22 +177,12 @@ echo "FLUTTER_WRAPPED=$n"
   static const String wrapReassertScript = r'''
 E=@ENGINE@
 [ -d "$E" ] || exit 0
-gen() {
-  cat > "$1" <<FOAWRAP
-#!/bin/sh
-# FOA x86_64 -> qemu-user wrapper (auto-generated)
-d=\$(dirname "\$0")
-if [ -d "\$d/lib64" ]; then
-  LD_LIBRARY_PATH="\$d/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-  export LD_LIBRARY_PATH
-fi
-exec @QEMU@ -L / "$2" "\$@"
-FOAWRAP
-  chmod 755 "$1"
-}
+__FOA_GEN__
 put() {
   [ -f "$1" ] || return 0
   [ -x "$1" ] || return 0
+  # Bug 439：共享库不能包装（e_machine/e_type 与 PIE 可执行文件相同）
+  case "$1" in *.so|*.so.*) return 0 ;; esac
   m=$(dd if="$1" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$m" in 7f454c46*3e) ;; *) return 0 ;; esac
   if [ -f "$2" ] && head -c 2 "$2" 2>/dev/null | grep -q '#!'; then
@@ -165,23 +220,24 @@ echo "REASSERT=$n"
   ///   2. qemu 能否跑 x64 动态链接器
   ///   3. qemu 能否跑一个 x64 真二进制（用 gen_snapshot --help）
   ///   4. 转发脚本链是否完整（脚本 → 目标 ELF 架构）
+  ///   5. **Bug 439：两种加载方式对照**——显式 ld.so（正确）vs `-L /`
+  ///      让 qemu 代劳（会 `__stack_chk_fail`）
   ///
   /// 输出前缀 `QEMU_CHAIN_` 便于在日志里定位。
   static const String buildPreflightScript = r'''
 [ -x @QEMU@ ] || { echo "QEMU_CHAIN_NONE=1"; exit 0; }
 echo "QEMU_CHAIN_VER=$(  @QEMU@ --version 2>&1 | head -1 )"
-ld=/lib64/ld-linux-x86-64.so.2
-if [ -f "$ld" ]; then
+# Bug 439：x86_64 动态链接器。Debian multiarch 真身在 /lib/x86_64-linux-gnu/，
+# /lib64/ld-linux-x86-64.so.2 只是符号链接（且指向绝对路径，跨 root 时会错）。
+ld=@LOADER@
+if [ -x "$ld" ]; then
+  # 正确方式：把 ld.so 当程序交给 qemu，动态链接由 guest 自己完成
   @QEMU@ -L / "$ld" --version > /dev/null 2>&1
   lrc=$?
-  if [ "$lrc" = 0 ]; then
-    echo "QEMU_CHAIN_LOADER=ok"
-  else
-    # 132=128+4 即 SIGILL；139=128+11 即 SIGSEGV
-    echo "QEMU_CHAIN_LOADER=fail rc=$lrc"
-  fi
+  if [ "$lrc" = 0 ]; then echo "QEMU_CHAIN_LOADER=ok（ld.so 显式加载方式可用）"
+  else echo "QEMU_CHAIN_LOADER=fail rc=$lrc"; fi
 else
-  echo "QEMU_CHAIN_LOADER=missing"
+  echo "QEMU_CHAIN_LOADER=missing 路径 $ld 不存在（libc6:amd64 没装上？）"
 fi
 # 跑一个真实的 x64 二进制：优先用 impellerc（真机实际崩的那个）
 for tool in @ENGINE@/linux-arm64/impellerc @ENGINE@/android-arm64-release/linux-arm64/gen_snapshot; do
@@ -204,12 +260,27 @@ for tool in @ENGINE@/linux-arm64/impellerc @ENGINE@/android-arm64-release/linux-
     case "$rc" in
       132) s=SIGILL ;;
       139) s=SIGSEGV ;;
+      134) s=SIGABRT ;;
       126) s=CANNOT_EXEC ;;
       127) s=NOT_FOUND ;;
       0)   s=EMPTY_OUTPUT ;;
       *)   s="rc=$rc" ;;
     esac
     echo "QEMU_CHAIN_PROBE=$(basename "$tool")=FAIL:$s out=EMPTY"
+  fi
+  # Bug 439 关键对照：直接用 -L / 让 qemu 自己找 ld.so（旧转发脚本的形式）。
+  # 若这一路崩、而上一路正常，就精确命中 Bug 439 —— 转发脚本需要重新生成。
+  if [ -x "$src" ] && [ -x "$ld" ]; then
+    : > "$tf"
+    @QEMU@ -L / "$src" --help > "$tf" 2>&1
+    arc=$?
+    aout=$(head -2 "$tf" 2>/dev/null)
+    rm -f "$tf"
+    if [ -z "$aout" ]; then
+      echo "QEMU_CHAIN_OLDSTYLE=$(basename "$src")=FAIL rc=$arc（旧 -L / 形式崩，需重建转发脚本）"
+    else
+      echo "QEMU_CHAIN_OLDSTYLE=$(basename "$src")=ok rc=$arc"
+    fi
   fi
   if [ -f "$src" ]; then
     m=$(dd if="$src" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
@@ -235,19 +306,7 @@ if ! ls -d "$E"/android-*/linux-x64 >/dev/null 2>&1; then
   tail -n 40 /tmp/foa_precache.log
   if [ "$rc" != 0 ]; then echo PRECACHE_FAILED; exit 3; fi
 fi
-gen() {
-  cat > "$1" <<FOAWRAP
-#!/bin/sh
-# FOA x86_64 -> qemu-user wrapper (auto-generated)
-d=\$(dirname "\$0")
-if [ -d "\$d/lib64" ]; then
-  LD_LIBRARY_PATH="\$d/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-  export LD_LIBRARY_PATH
-fi
-exec @QEMU@ -L / "$2" "\$@"
-FOAWRAP
-  chmod 755 "$1"
-}
+__FOA_GEN__
 n=0
 for d in "$E"/android-*/linux-x64; do
   [ -d "$d" ] || continue
@@ -256,6 +315,7 @@ for d in "$E"/android-*/linux-x64; do
   for f in "$d"/*; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
+    case "$f" in *.so|*.so.*) continue ;; esac
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     w="$a/${f##*/}"
@@ -286,6 +346,7 @@ for hd in "$E"/linux-*/; do
   for f in "$hd"/*; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
+    case "$f" in *.so|*.so.*) continue ;; esac
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     w="$ha/${f##*/}"
@@ -304,19 +365,7 @@ echo "ENGINE_DIRS=$n"
   static const String sdkWrapScript = r'''
 S=@SDK@
 [ -d "$S" ] || { echo SDK_MISSING; exit 0; }
-gen() {
-  cat > "$1" <<FOAWRAP
-#!/bin/sh
-# FOA x86_64 -> qemu-user wrapper (auto-generated)
-d=\$(dirname "\$0")
-if [ -d "\$d/lib64" ]; then
-  LD_LIBRARY_PATH="\$d/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-  export LD_LIBRARY_PATH
-fi
-exec @QEMU@ -L / "$2" "\$@"
-FOAWRAP
-  chmod 755 "$1"
-}
+__FOA_GEN__
 n=0
 for d in "$S"/build-tools/* "$S"/platform-tools; do
   [ -d "$d" ] || continue
@@ -324,6 +373,8 @@ for d in "$S"/build-tools/* "$S"/platform-tools; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
     case "$f" in *.foa-real) continue ;; esac
+    # Bug 439：共享库不包装
+    case "$f" in *.so|*.so.*) continue ;; esac
     # Bug 428：已是转发脚本则跳过（同 flutter/engine 层修复）
     if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
@@ -476,16 +527,32 @@ dpkg --remove-architecture amd64 2>/dev/null || true
 echo UNINSTALL_OK
 ''';
 
+  // ---------------- 占位符替换（统一收口）----------------
+
+  /// 统一替换脚本里的所有占位符。
+  ///
+  /// Bug 439：新增 `@LOADER@`（x86_64 动态链接器的容器内路径）。**所有**
+  /// 生成转发脚本的调用点都必须走这里——散落的 `replaceAll('@QEMU@', ...)`
+  /// 会漏掉新占位符，把字面量 `@LOADER@` 留在脚本里，于是
+  /// `[ -x "@LOADER@" ]` 恒假 → 静默回退到旧的错误形式
+  /// （正是 Bug 439 要修的东西）。
+  ///
+  /// 预防的是"我在某处修过 ≠ 所有执行路径都被修复"这个老陷阱：
+  /// **占位符替换必须收口在一个函数**。
+  static String fill(String script, {String sdk = sdkHome}) => script
+      .replaceAll('__FOA_GEN__', _wrapGenFunc.trim())
+      .replaceAll('@QEMU@', qemuBin)
+      .replaceAll('@LOADER@', x64Loader)
+      .replaceAll('@ENGINE@', engineDir)
+      .replaceAll('@FLUTTER@', flutterHome)
+      .replaceAll('@SDK@', sdk);
+
   // ---------------- 验证 ----------------
 
   /// 重新验证：qemu 在位 + 分步冒烟测试 + 各接管点状态。
   static Future<String?> verify(ProotBridge bridge) async {
     final r = await bridge.exec(
-      _verifyScript
-          .replaceAll('@QEMU@', qemuBin)
-          .replaceAll('@ENGINE@', engineDir)
-          .replaceAll('@SDK@', sdkHome)
-          .replaceAll('@FLUTTER@', flutterHome),
+      fill(_verifyScript),
       timeoutSec: 120,
     );
     if (!r.ok || r.stdout.contains('__NO_QEMU__')) return null;
@@ -571,19 +638,14 @@ echo UNINSTALL_OK
       onPhase?.call('engine');
       // 先转发 x64 dart（flutter precache 依赖 qemu 可执行），再同步引擎产物
       final fw = await bridge.exec(
-        _flutterWrapScript
-            .replaceAll('@FLUTTER@', flutterHome)
-            .replaceAll('@QEMU@', qemuBin),
+        fill(_flutterWrapScript),
         timeoutSec: 300,
       );
       if (!fw.ok || fw.stdout.contains('FLUTTER_MISSING')) {
         throw DownloadException('Flutter 工具链转发失败：${fw.stderr}');
       }
       final en = await bridge.exec(
-        engineWrapScript
-            .replaceAll('@ENGINE@', engineDir)
-            .replaceAll('@FLUTTER@', flutterHome)
-            .replaceAll('@QEMU@', qemuBin),
+        fill(engineWrapScript),
         timeoutSec: 2400,
       );
       if (!en.ok || en.stdout.contains('PRECACHE_FAILED')) {
@@ -601,7 +663,7 @@ echo UNINSTALL_OK
     if (se.ok && se.stdout.contains('YES')) {
       onPhase?.call('sdk');
       final sn = await bridge.exec(
-        sdkWrapScript.replaceAll('@SDK@', sdkHome).replaceAll('@QEMU@', qemuBin),
+        fill(sdkWrapScript),
         timeoutSec: 300,
       );
       if (!sn.ok) {
@@ -697,16 +759,11 @@ echo UNINSTALL_OK
       final c = await bridge.exec('[ -x $qemuBin ] && echo YES', timeoutSec: 30);
       if (!c.ok || !c.stdout.contains('YES')) return;
       await bridge.exec(
-        _flutterWrapScript
-            .replaceAll('@FLUTTER@', flutterHome)
-            .replaceAll('@QEMU@', qemuBin),
+        fill(_flutterWrapScript),
         timeoutSec: 300,
       );
       await bridge.exec(
-        engineWrapScript
-            .replaceAll('@ENGINE@', engineDir)
-            .replaceAll('@FLUTTER@', flutterHome)
-            .replaceAll('@QEMU@', qemuBin),
+        fill(engineWrapScript),
         timeoutSec: 2400,
       );
     } catch (_) {
@@ -721,7 +778,7 @@ echo UNINSTALL_OK
       final c = await bridge.exec('[ -x $qemuBin ] && echo YES', timeoutSec: 30);
       if (!c.ok || !c.stdout.contains('YES')) return;
       await bridge.exec(
-        sdkWrapScript.replaceAll('@SDK@', sdkHome).replaceAll('@QEMU@', qemuBin),
+        fill(sdkWrapScript),
         timeoutSec: 300,
       );
       await _writeGradleOverride(env.rootfsPath);

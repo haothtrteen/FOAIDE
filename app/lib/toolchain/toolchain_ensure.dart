@@ -222,10 +222,7 @@ class ToolchainEnsure {
 
       // 有不就位的 → 全量重建（engineWrapScript 本身遍历全量、幂等）
       final r = await _bridge.exec(
-        QemuCompat.engineWrapScript
-            .replaceAll('@ENGINE@', E)
-            .replaceAll('@FLUTTER@', QemuCompat.flutterHome)
-            .replaceAll('@QEMU@', QemuCompat.qemuBin),
+        QemuCompat.fill(QemuCompat.engineWrapScript),
         timeoutSec: 2400,
       );
       if (r.stdout.contains('PRECACHE_FAILED')) {
@@ -234,9 +231,7 @@ class ToolchainEnsure {
       }
       // SDK 侧重建
       await _bridge.exec(
-        QemuCompat.sdkWrapScript
-            .replaceAll('@SDK@', S)
-            .replaceAll('@QEMU@', QemuCompat.qemuBin),
+        QemuCompat.fill(QemuCompat.sdkWrapScript, sdk: S),
         timeoutSec: 600,
       );
 

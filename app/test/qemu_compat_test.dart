@@ -36,11 +36,17 @@ void main() {
     test('仍保留 x64 → linux-arm64 目录映射（宿主回退缺失的补偿）', () {
       expect(s.contains('android-*/linux-x64'), isTrue);
       expect(s.contains('linux-arm64'), isTrue);
-      expect(s.contains(r'exec @QEMU@ -L /'), isTrue);
+      // Bug 439：转发脚本正文在 gen() 片段里，一律用 fill() 后的文本断言。
+      final f = QemuCompat.fill(s);
+      // fill() 会把 @QEMU@ 也展开，所以这里断言的是已替换后的真实命令行。
+      expect(f.contains('exec ${QemuCompat.qemuBin} -L /'), isTrue);
+      expect(f.contains('ld-linux-x86-64'), isTrue,
+          reason: 'Bug 439：必须显式加载 guest ld.so，否则所有 x64 工具静默崩溃');
     });
 
     test('包装脚本必须可执行（chmod 755）', () {
-      expect(s.contains('chmod 755'), isTrue);
+      // Bug 439：chmod 落在了提取出的 gen() 片段里，断言要用 fill() 后的文本。
+      expect(QemuCompat.fill(s).contains('chmod 755'), isTrue);
     });
   });
 

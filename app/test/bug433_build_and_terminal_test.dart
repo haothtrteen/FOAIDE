@@ -94,18 +94,27 @@ void main() {
     });
 
     test('生成的转发脚本含 shebang 与 qemu exec', () {
-      expect(s.contains('#!/bin/sh'), isTrue);
-      expect(s.contains('exec @QEMU@ -L /'), isTrue);
+      // Bug 439：转发脚本正文已抽到 gen() 片段（由 fill() 展开），
+      // 所以断言必须落在 fill() 之后的文本上（@QEMU@ 也会被一并替换）。
+      final f = QemuCompat.fill(s);
+      expect(f.contains('#!/bin/sh'), isTrue);
+      expect(f.contains('exec ${QemuCompat.qemuBin} -L /'), isTrue);
+      expect(f.contains('ld-linux-x86-64'), isTrue,
+          reason: 'Bug 439：必须显式把 ld.so 交给 qemu，否则静默崩溃');
     });
 
     test(r'外层变量用裸 $（Dart 原始字符串里 \$ 会残留反斜杠给 shell）', () {
       // Dart r'''...''' 中 \$ 是两个字面字符，会原样传给 shell。
-      // 外层脚本变量必须写裸 $，只有 heredoc 内（要写进转发脚本的）
-      // 才用 \$ 让 shell 求值。
+      // Bug 439：heredoc 分隔符已改为 <<'FOAWRAP'（带引号），body 是
+      // **完全字面量**，因此里面的 $ 不再需要转义 —— 反而写 \$ 会留下
+      // 字面反斜杠，把脚本写坏。这条测试随之反转。
       expect(s.contains(r'm=$(dd if="$1"'),
           isTrue, reason: r'外层变量必须是裸 $，否则 shell 收到 \$ 报语法错');
-      expect(s.contains(r'd=\$(dirname "\$0")'), isTrue,
-          reason: r'heredoc 内必须用 \$ 才会在写入时还原为 $');
+      final f = QemuCompat.fill(s);
+      expect(f.contains(r'd=$(dirname "$0")'), isTrue,
+          reason: '带引号 heredoc 下应写裸美元符，写入后即为 dirname 调用形式');
+      expect(f.contains(r'd=\$(dirname'), isFalse,
+          reason: '带引号 heredoc 下写反斜杠美元符会残留字面反斜杠，脚本不可用');
     });
   });
 
@@ -113,12 +122,18 @@ void main() {
     test('engineWrapScript 与 reassert 的转义风格一致', () {
       const e = QemuCompat.engineWrapScript;
       const r = QemuCompat.wrapReassertScript;
-      // 两者都必须出现 heredoc 形式的 \$（写入转发脚本用）
-      expect(e.contains(r'\$(dirname'), isTrue);
-      expect(r.contains(r'\$(dirname'), isTrue);
-      // 两者都必须出现裸 $ 形式的 $E（外层变量）
-      expect(e.contains(r'E=@ENGINE@'), isTrue);
-      expect(r.contains(r'E=@ENGINE@'), isTrue);
+      // Bug 439：两者都由 fill() 展开同一个 gen() 片段，
+      // 因此"裸 $ + 带引号 heredoc"的风格天然一致。
+      final fe = QemuCompat.fill(e);
+      final fr = QemuCompat.fill(r);
+      for (final f in [fe, fr]) {
+        expect(f.contains(r'd=$(dirname "$0")'), isTrue);
+        expect(f.contains(r'\$(dirname'), isFalse,
+            reason: '带引号 heredoc 下不应出现转义形式');
+        // @ENGINE@ 同样被 fill() 展开为真实引擎目录。
+        expect(f.contains('E=${QemuCompat.engineDir}'), isTrue);
+        expect(f.contains('@ENGINE@'), isFalse);
+      }
     });
   });
 
