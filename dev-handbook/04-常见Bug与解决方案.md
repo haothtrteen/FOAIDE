@@ -1818,23 +1818,32 @@ flutter build apk ← 后跑
 `pub get` 之后、`flutter build` 之前，**同一条 shell 命令里**：
 
 ```dart
-'{ $reassert ; } 2>&1 | tail -n 2; '
+'sh -c ' + _shq(reassert) + ' 2>&1 | tail -n 2; '
 '$flutterCmd build apk --no-shrink --release ...'
 ```
 
 输出 `REASSERT=<n>`（n=本次修复的文件数），便于构建日志确认生效。
 
-**踩坑**：写这个脚本时外层变量误用了 `\$`。Dart 原始字符串
+**踩坑一（转义）**：写这个脚本时外层变量误用了 `\$`。Dart 原始字符串
 `r'''...'''` 里 `\$` 是**两个字符**（反斜杠 + 美元），会原样传给
 shell → dash 报 `Syntax error: "(" unexpected`。规则：
 **外层脚本变量用裸 `$`；只有 heredoc 内（要写进转发脚本的）才用
 `\$`** 让 shell 在写入时还原。已由单测固化（对比两个脚本的转义风格）。
 
+**踩坑二（分组）**：最初用 `{ $reassert ; } 2>&1 | tail -n 2;` 想只保留
+尾部输出，结果脚本末尾带换行时 `\n ; }` 在 dash 和 bash 下**都**报
+语法错（`syntax error near unexpected token ';'`）。改用
+`sh -c '<脚本>'` 独立执行，并加 `_shq()` 把内部单引号转义成 `'\''`。
+教训：**shell 里 `{ ... ; }` 不是"把这段括起来"，它对结尾分隔符有
+硬要求**；要复用一段完整脚本，`sh -c` 才是稳的。
+
 **验证**：`test/bug433_build_and_terminal_test.dart` —— 断言再断言
 出现在 pub get 之后 / build 之前、不引入新的 pub get、覆盖两个目录层、
-按 `#!` 幂等、转义语义正确。另用仿真引擎目录实跑：把三个
-`linux-arm64/` 文件替换成真 x64 二进制后跑脚本 → `REASSERT=5`，
-五个文件全部恢复为转发脚本，且重跑 `REASSERT=0`（幂等）。
+按 `#!` 幂等、转义语义正确、用 `sh -c` 而非 `{ ... ; }` 分组。
+另用仿真引擎目录实跑：把三个 `linux-arm64/` 文件替换成真 x64 二进制后
+跑脚本 → `REASSERT=5`，五个文件全部恢复为转发脚本，且重跑
+`REASSERT=0`（幂等）。**真实引擎上跑出 `REASSERT=13`**（13 个 x64
+宿主工具全部被正确包装），重跑 `REASSERT=0` 再次确认幂等。
 
 ---
 
