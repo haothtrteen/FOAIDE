@@ -172,6 +172,12 @@ class BuildRunner {
         _ui();
         return;
       }
+
+      // Bug 426 根因修复：容器 init.gradle 旧版仓库注入与 Flutter 新模板
+      // PREFER_SETTINGS 冲突 → 22% 配置 Gradle 报 "repository 'maven'
+      // was added"。检测到旧版则覆写为 beforeSettings 前插形态。
+      final gErr = await ToolchainEnsure().gradleInitSanitize(env: env);
+      if (gErr != null) lines.add('⚠ $gErr（不阻断构建）');
     }
 
     lines.add('▶ flutter build apk --no-shrink --release'
@@ -420,6 +426,12 @@ class BuildRunner {
       tip = '多架构运行库缺失：x64 兼容层 → 重新应用';
     } else if (l.contains('no space left')) {
       tip = '磁盘空间不足：清理 build/ 与 .gradle 缓存后重试';
+    } else if (l.contains('prefer settings repositories') ||
+        l.contains('was added by settings file')) {
+      tip = 'Gradle 仓库注入与 Flutter 新模板 PREFER_SETTINGS 冲突：'
+          'alpha.37 起构建前会自动把旧版 init.gradle 覆写为无注入形态'
+          '（Bug 426）。若本条仍出现：到「工具链」页 → Gradle 镜像 → '
+          '重新「一键应用」后重试';
     } else if (l.contains('could not resolve') || l.contains('sslhandshake')) {
       tip = '依赖下载失败：检查镜像源（工具链页 → Gradle 镜像）';
     } else if (l.contains('tls error') || l.contains('failed to update packages')) {

@@ -2,6 +2,10 @@
 
     <!-- 预留：后续步骤下载 JDK / Flutter SDK 需要 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- alpha.31 构建前台服务：退到桌面/锁屏构建继续（保活 proot/gradle/dart 进程树） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 通知栏构建进度（Android 13+ 运行时权限；targetSdk<33 由系统自动授予） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name="${applicationName}"
@@ -28,6 +32,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- alpha.31 构建前台服务：构建期间保活 + 通知栏进度（Dart notifyStart/notifyStop 控制） -->
+        <service
+            android:name=".BuildService"
+            android:exported="false" />
 
         <meta-data
             android:name="flutterEmbedding"

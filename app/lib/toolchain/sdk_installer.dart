@@ -789,16 +789,24 @@ export PATH=${FlutterSdkInstaller.flutterHome}/bin:\$PATH
 ''';
 
   /// ~/.gradle/init.gradle（阿里云 Maven 镜像，全局生效）。
-  static String _initGradleContent() => '''
-// FOA 一键生成：阿里云 Maven 镜像（2026-09-17）
-allprojects {
-    repositories {
-        maven { url 'https://maven.aliyun.com/repository/public' }
-        maven { url 'https://maven.aliyun.com/repository/google' }
-        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
-    }
-}
-settingsEvaluated { settings ->
+  ///
+  /// Bug 426（2026-09-18 真机 22% 配置 Gradle 报错）重写：旧版用
+  /// `allprojects{repositories{maven}}` + `settingsEvaluated` 注入仓库，
+  /// 与 Flutter 新模板 settings.gradle.kts（flutter-plugin-loader 走
+  /// PREFER_SETTINGS 仓库模式）冲突——PREFER_SETTINGS 拒绝任何 project
+  /// 仓库，报 `prefer settings repositories ... repository 'maven' was
+  /// added`，plugin-loader 解析直接失败。新版改为 **beforeSettings 在
+  /// settings 仓库前插镜像**：settings 仓库正是被 prefer 的对象、加仓库
+  /// 合法；镜像排最前命中即停，官方源（模板自带 google()/mavenCentral()）
+  /// 自动成为兜底。形态与沙箱构建机一致（沙箱构建正常的实证）。
+  ///
+  /// 注意：Groovy 闭包内不引用外部 def 变量（作用域不跨越
+  /// beforeSettings 边界，沙箱踩过）。
+  static String initGradleContent() => '''
+// FOA 一键生成：阿里云 Maven 镜像（beforeSettings 前插版，2026-09-18）
+// 无旧版注入——Flutter 新模板 settings.gradle.kts 走 PREFER_SETTINGS
+// 模式，project 级仓库注入会被拒绝（真机 alpha.36 的 22% 报错根因）。
+beforeSettings { settings ->
     settings.pluginManagement.repositories {
         maven { url 'https://maven.aliyun.com/repository/public' }
         maven { url 'https://maven.aliyun.com/repository/google' }
@@ -857,11 +865,11 @@ settingsEvaluated { settings ->
       await bashrc.writeAsString(_envContent());
     }
 
-    // 2. init.gradle（阿里云 Maven 镜像）
+    // 2. init.gradle（阿里云 Maven 镜像，beforeSettings 前插版）
     onPhase?.call('init-gradle');
     final gradleHome = File('$rootfs/root/.gradle/init.gradle');
     await gradleHome.parent.create(recursive: true);
-    await gradleHome.writeAsString(_initGradleContent());
+    await gradleHome.writeAsString(initGradleContent());
 
     // 3. 改写 /root/projects 下所有项目的 wrapper distributionUrl
     onPhase?.call('wrapper');

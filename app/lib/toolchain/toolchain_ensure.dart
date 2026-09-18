@@ -4,6 +4,7 @@ import 'package:flutter/services.dart' show rootBundle;
 
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
+import 'sdk_installer.dart';
 
 /// 工具链前置确保（Step 7 修复：容器内 flutter create/build 依赖 git；
 /// Step 8 增强：git 走国内镜像源 + 项目 gradle 发行包走腾讯镜像）。
@@ -68,6 +69,49 @@ class ToolchainEnsure {
       return 'CA bundle 写入后仍不可见（$path）';
     } catch (e) {
       return '容器缺 CA 证书且自动修复失败（apt 与内置 bundle 均未就位）：$e';
+    }
+  }
+
+  /// 容器 init.gradle 旧版注入自愈（Bug 426 根因修复，2026-09-18）。
+  ///
+  /// 场景：真机工具链「一键应用」曾写入注入型 init.gradle
+  /// （allprojects{repositories{maven}} + settingsEvaluated 仓库注入），
+  /// Flutter 新模板 settings.gradle.kts 走 PREFER_SETTINGS 仓库模式，
+  /// 构建到 22% 配置 Gradle 时报
+  /// `prefer settings repositories ... repository 'maven' was added`，
+  /// plugin-loader 解析失败、构建中断。
+  ///
+  /// 自愈：检测容器 /root/.gradle/init.gradle 含注入特征
+  /// （allprojects / settingsEvaluated + maven 仓）→ 用新版
+  /// beforeSettings 前插形态（MirrorConfigurator.initGradleContent）
+  /// 覆写。rootfs 树宿主可见，直接 host 写文件（与 caCerts bundle
+  /// 写入同 IO 路径），不经容器命令。新版已就位则秒过。
+  ///
+  /// [bare]（termux 后端）gradle 目录在 prefix 下结构不同，未投产暂不处理。
+  /// 返回 null=无需处理或已自愈，非 null=错误文案（仅记录，不阻断构建——
+  /// 若用户已手动修正过 init.gradle，覆写失败不应挡构建）。
+  Future<String?> gradleInitSanitize({EnvInfo? env, bool bare = false}) async {
+    if (bare) return null;
+    const probe = 'test -f /root/.gradle/init.gradle '
+        '&& grep -qE "allprojects|settingsEvaluated" '
+        '/root/.gradle/init.gradle '
+        '&& echo INJECT_FOUND || echo INJECT_CLEAN';
+    try {
+      final r = await _bridge.exec(probe, timeoutSec: 30);
+      if (!r.stdout.contains('INJECT_FOUND')) return null;
+
+      // 旧版注入在场 → host 直写覆写为新版 beforeSettings 形态
+      final rootfs = env?.rootfsPath ?? (await _bridge.envInfo()).rootfsPath;
+      final f = File('$rootfs/root/.gradle/init.gradle');
+      await f.parent.create(recursive: true);
+      await f.writeAsString(MirrorConfigurator.initGradleContent(),
+          flush: true);
+      final verify = await _bridge.exec(probe, timeoutSec: 30);
+      if (verify.stdout.contains('INJECT_CLEAN')) return null;
+      return 'init.gradle 覆写后仍含旧版注入特征';
+    } catch (e) {
+      // 不阻断构建：真机报错时分诊 hint 会提示到工具链页重跑「一键应用」
+      return 'init.gradle 自愈检测失败：$e';
     }
   }
 

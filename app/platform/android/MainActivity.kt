@@ -1,5 +1,6 @@
 package dev.foa.flutter_on_android
 
+import android.app.NotificationManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -81,9 +82,18 @@ class MainActivity : FlutterActivity() {
     private var pendingExportSource: File? = null
     private val exportRequestCode = 0x2003
 
+    // alpha.31 构建前台服务：Dart 通道引用（原生 → Dart 反向 invoke：点通知回构建页）
+    private var dartChannel: MethodChannel? = null
+    // 冷启动点通知进来：Dart handler 未注册前先存着，Dart 就绪后 takeNavigate 拉取
+    @Volatile private var pendingNavigate = false
+
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
-        MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+        val channel = MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL)
+        dartChannel = channel
+        // 冷启动导航意图：onCreate 的 intent 可能带「点通知回构建页」标记
+        pendingNavigate = intent?.getStringExtra(BuildService.EXTRA_NAVIGATE) == BuildService.NAV_BUILD
+        channel.setMethodCallHandler { call, result ->
             // 全部放到后台线程执行，避免 ANR。
             executor.execute {
                 try {
@@ -266,6 +276,25 @@ class MainActivity : FlutterActivity() {
                             call.argument<String>("path") ?: "",
                             call.argument<String>("displayName") ?: "export.bin",
                         )
+                        // ---- alpha.31 构建前台服务：通知栏进度 + 点击回构建页 ----
+                        "notificationsEnabled" -> result.success(notificationEnabled())
+                        "notifyStart" -> {
+                            BuildService.start(this, call.argument<String>("title") ?: "构建中")
+                            result.success(true)
+                        }
+                        "notifyProgress" -> {
+                            BuildService.update(
+                                this,
+                                call.argument<String>("text") ?: "",
+                                (call.argument<Number>("percent") ?: 0).toInt(),
+                            )
+                            result.success(true)
+                        }
+                        "notifyStop" -> {
+                            BuildService.finish(this, call.argument<String>("text") ?: "")
+                            result.success(true)
+                        }
+                        "takeNavigate" -> result.success(pendingNavigate.also { pendingNavigate = false })
                         else -> result.notImplemented()
                     }
                 } catch (e: Exception) {
@@ -279,6 +308,25 @@ class MainActivity : FlutterActivity() {
         executor.shutdownNow()
         super.onDestroy()
     }
+
+    /** 通知点击回跳（singleTop：App 前台时走这里）→ 转发给 Flutter 导航。 */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.getStringExtra(BuildService.EXTRA_NAVIGATE) == BuildService.NAV_BUILD) {
+            pendingNavigate = true
+            // 主线程（onNewIntent）→ invokeMethod 安全；Dart 未就绪时引擎
+            // 内部丢弃，pendingNavigate 兜底（Dart 就绪后 takeNavigate 拉取）
+            dartChannel?.invokeMethod("navigate", null)
+        }
+    }
+
+    /** 通知是否可用（Android 13+ 用户可关；targetSdk<33 默认授权）。 */
+    private fun notificationEnabled(): Boolean =
+        try {
+            getSystemService(NotificationManager::class.java).areNotificationsEnabled()
+        } catch (_: Exception) {
+            true
+        }
 
     /** 文件选择器回调：拷贝所选文件到 filesDir/imports（后台线程），再回结果。 */
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
