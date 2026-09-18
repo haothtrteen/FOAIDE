@@ -1779,6 +1779,115 @@ onScaleUpdate: (d) {
 | 手势一旦被判为缩放就锁死 | 加**回位检测**，允许撤销误判 |
 | 凭症状想象写测试 | 先把症状的每个限定词确认清楚 |
 
+### Bug 433 ①：pub get 在 build 前盖掉转发层——AOT 跑到 54% 后 shader 编译 SIGILL
+
+**症状**（2026-09-19 真机截图）：
+
+```
+C AOT 编译 (gen_snapshot)   54%
+Dart snapshot generator failed with exit code -4
+".../flutter_assets/shaders/ink_sparkle.frag" failed with exit code -4.
+BUILD FAILED in 1m 30s
+```
+
+**与 Bug 429 的区别（同一个 SIGILL，不同的触发时机）**：
+Bug 429 是「**从未包装**顶层宿主工具层」——前置检查就该拦住。
+这次前置检查**全过**（否则 build_runner 会提前 return），却仍在
+54% 崩，说明包装在检查之后、编译之前**被覆盖了**。
+
+**根因**：`buildCommand` 的执行序列是
+
+```
+flutter pub get   ← 先跑（多源轮换重试）
+...
+flutter build apk ← 后跑
+```
+
+`pub get` 在依赖状态变化时会触发 Flutter 的**构件重新下载**，把
+`linux-arm64/<tool>` 写回真 x64 二进制（上游 `artifacts.dart` 未对
+`linux_arm64` 做 x64 回退，flutter/flutter#152281）。于是
+`qemuCompatEnsure` 刚放好的转发脚本被覆盖 → shader 阶段的 `impellerc`
+变成真 x64 ELF → arm64 上 SIGILL → exit -4。
+
+**教训**：「构建前检查」挡不住「构建过程中被改」。检查点与使用点
+之间有别的动作时，**必须在紧邻使用点处再断言一次**。这是 Bug 429
+那条「点名检查 vs 全称命题」的姊妹教训——**时序**维度上的同类错误。
+
+**修复**：新增 `QemuCompat.wrapReassertScript`（压缩版，无 precache
+分支——前置检查已确保构件存在），把它内联进 `buildCommand`，位置在
+`pub get` 之后、`flutter build` 之前，**同一条 shell 命令里**：
+
+```dart
+'{ $reassert ; } 2>&1 | tail -n 2; '
+'$flutterCmd build apk --no-shrink --release ...'
+```
+
+输出 `REASSERT=<n>`（n=本次修复的文件数），便于构建日志确认生效。
+
+**踩坑**：写这个脚本时外层变量误用了 `\$`。Dart 原始字符串
+`r'''...'''` 里 `\$` 是**两个字符**（反斜杠 + 美元），会原样传给
+shell → dash 报 `Syntax error: "(" unexpected`。规则：
+**外层脚本变量用裸 `$`；只有 heredoc 内（要写进转发脚本的）才用
+`\$`** 让 shell 在写入时还原。已由单测固化（对比两个脚本的转义风格）。
+
+**验证**：`test/bug433_build_and_terminal_test.dart` —— 断言再断言
+出现在 pub get 之后 / build 之前、不引入新的 pub get、覆盖两个目录层、
+按 `#!` 幂等、转义语义正确。另用仿真引擎目录实跑：把三个
+`linux-arm64/` 文件替换成真 x64 二进制后跑脚本 → `REASSERT=5`，
+五个文件全部恢复为转发脚本，且重跑 `REASSERT=0`（幂等）。
+
+---
+
+### Bug 433 ②：终端永久停在「正在启动终端…」——截断 argv 时残留孤立 `/bin/sh`
+
+**症状**（2026-09-19 真机截图）：终端页转圈不动，只有「正在启动终端…」，
+没有任何输出或报错。
+
+**根因**：`ptyStart`（proot 模式）要构造一个**交互式** shell，而
+`buildProotCmd` 产出的是 `... /bin/sh -c "<boot><command>"` 形式。
+原代码截掉 `-c` 之后的部分：
+
+```kotlin
+val tailIdx = base.indexOfLast { it == "-c" }
+val head = if (tailIdx > 0) base.subList(0, tailIdx) else base
+```
+
+`subList(0, tailIdx)` **只截到 `-c` 之前**，把紧邻其前的 `/bin/sh`
+留在了 `head` 末尾。重新拼接后真正传给 proot 的 argv 是：
+
+```
+proot -0 -r /rootfs ... /bin/sh  /usr/bin/env -i HOME=/root ... /bin/sh -c "boot; exec /bin/sh -i"
+                              ^^^^^^^^ 孤立残留
+```
+
+外层 sh 于是把 `/usr/bin/env` 当成**脚本文件路径**去执行（还把它后面的
+参数当作位置参数）。必然起不来，PTY 里没有任何输出 → 界面永久转圈。
+
+**修复**：截 `-c` 时把紧邻其前的 `/bin/sh` 一并截掉：
+
+```kotlin
+var headEnd = if (tailIdx > 0) tailIdx else base.size
+if (headEnd - 1 >= 0 &&
+    (base[headEnd - 1] == "/bin/sh" || base[headEnd - 1].endsWith("/sh"))) {
+  headEnd -= 1
+}
+val head = base.subList(0, headEnd)
+```
+
+**附带加固（防同类问题再次表现为"无声转圈"）**：`ptyStart` 调用加
+45 秒超时（原先**没有任何超时**，原生侧一旦卡住 Dart 就永远 await），
+超时后给出可读诊断而非继续转圈；`_pickBackend`（读偏好文件，同样在
+启动路径上）加 10 秒超时兜底。
+
+**教训**：**argv 拼接这类"删一段再接一段"的操作，边界要按"参数组"
+而不是"单个 token"来切**。`-c` 从来不是独立出现的，它总是带着
+前面的解释器路径。同类风险点：任何 `indexOf` + `subList` 的组合，
+都要问一句"我要删的是一段协议，还是一个词"。
+
+**另一个教训（观测性）**：这个 bug 的难查之处在于**没有任何错误输出**。
+凡是异步启动路径，都应该有超时 + 可读失败态。**沉默的转圈是最贵的
+bug 形态**——用户只能截图，开发者只能猜。
+
 ---
 
 ## 十二、提交 Bug 记录模板
