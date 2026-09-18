@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -6,6 +7,7 @@ import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import '../filemanager/fs_browser_bridge.dart';
 import 'build_progress.dart';
+import 'termux_backend.dart';
 import 'toolchain_ensure.dart';
 
 /// Step 6 构建页：项目列表 → 流式构建日志 → 取消 → 安装 APK。
@@ -16,7 +18,11 @@ import 'toolchain_ensure.dart';
 ///   execStreamStop 取消），日志合并单流在 Dart 侧清洗 ANSI 与 \r 进度条；
 /// - 产物路径 /root/projects/<name>/build/app/outputs/flutter-apk/*.apk，
 ///   安装时用真实宿主路径（rootfsPath + 容器路径）走 FileProvider 拉起系统安装器；
-/// - 离开本页即中止构建（防 gradle daemon 管道泄漏）。
+/// - 离开本页即中止构建（防 gradle daemon 管道泄漏）；
+/// - 双后端（2026-09-18）：proot 容器模式 = proot 内执行 + 容器路径；
+///   termux 裸原生模式 = bare 直跑（/system/bin/sh，不经 proot）+ 宿主路径
+///   （rootfsPath + 容器路径，同一物理目录）+ termux prefix 的 bionic
+///   flutter 全路径。产物定位与安装统一用容器路径，两模式映射相同。
 ///
 /// ⚠️ 进度条说明（2026-09-17 增补）：flutter build apk 不输出百分比，
 /// 只能靠日志关键词做「阶段识别 + 阶段内时间插值」——见 build_progress.dart。
@@ -48,6 +54,10 @@ class _BuildPageState extends State<BuildPage> {
   bool _loading = true;
   String _loadError = '';
   bool _syncing = false;
+
+  /// 构建后端（工具链页切换，filesDir/foa-backend.json 持久化）；
+  /// 未选择过 = proot（构建页不弹询问，默认值）。
+  BuildBackend _backend = BuildBackend.proot;
 
   _BuildStatus _status = _BuildStatus.idle;
   String? _active; // 正在构建/已构建的项目名
@@ -115,12 +125,14 @@ class _BuildPageState extends State<BuildPage> {
     });
     try {
       final env = await _bridge.envInfo();
+      final backend = await BackendPrefs.load(env);
       final list = env.rootfsInstalled
           ? await _fb.browse('/root/projects')
           : null;
       if (!mounted) return;
       setState(() {
         _env = env;
+        if (backend != null) _backend = backend;
         _projects = (list?.entries ?? const []).where((e) => e.isDir).toList();
         _loading = false;
       });
@@ -167,6 +179,9 @@ class _BuildPageState extends State<BuildPage> {
   String get _projectsDir => '/root/projects';
 
   Future<void> _startBuild(String name) async {
+    final env = _env;
+    if (env == null) return;
+    final bare = _backend == BuildBackend.termux;
     setState(() {
       _active = name;
       _status = _BuildStatus.building;
@@ -180,11 +195,41 @@ class _BuildPageState extends State<BuildPage> {
       _showJumpToBottom = false;
     });
 
-    final proj = '$_projectsDir/${_q(name)}';
+    // shell 命令里的项目目录：proot = 容器路径；termux bare = 宿主路径
+    //（bare 执行不经 proot，容器路径 /root/projects 对宿主不存在）。
+    final projectsDir = bare
+        ? '${env.rootfsPath}/root/projects'
+        : _projectsDir;
+    final proj = '$projectsDir/${_q(name)}';
+
+    // termux 后端前置组件检查（缺了就快速失败，别等 flutter 脚本报错）：
+    // bionic Flutter（含 bin/flutter）与 bionic git——容器里的 git 是
+    // glibc 二进制，bare 直跑不了，不能用 ToolchainEnsure 兜底。
+    if (bare) {
+      final miss = <String>[];
+      final flDir = TermuxPaths.flutterHome(env);
+      if (!Directory(flDir).existsSync() ||
+          !File('$flDir/bin/flutter').existsSync()) {
+        miss.add('Flutter（bionic）');
+      }
+      if (!File('${TermuxPaths.prefix(env)}/bin/git').existsSync()) {
+        miss.add('git（bionic）');
+      }
+      if (miss.isNotEmpty && mounted) {
+        setState(() {
+          _status = _BuildStatus.error;
+          _lines.add('✗ termux 后端缺组件：${miss.join('、')}');
+          _lines.add('  请到「工具链」页 → Termux 卡片安装后再构建');
+        });
+        return;
+      }
+    }
+
     // 前置校验：不是 Flutter 项目就快速失败，省一次 2h 级长任务
     final check = await _bridge.exec(
       'test -f $proj/pubspec.yaml && echo __OK__ || echo __NO__',
       timeoutSec: 30,
+      bare: bare,
     );
     if (!mounted) return;
     if (!check.stdout.contains('__OK__')) {
@@ -196,32 +241,67 @@ class _BuildPageState extends State<BuildPage> {
     }
 
     _lines.add('▶ flutter build apk --release --target-platform=android-arm64');
-    _lines.add('  目录：$_projectsDir/$name');
+    _lines.add('  目录：$projectsDir/$name');
+    _lines.add('  后端：${bare ? 'Termux 裸原生（不经 proot）' : 'Proot 容器'}');
     _lines.add('');
 
-    // flutter 工具硬依赖 git，缺失时先自动安装（幂等；已装秒过）
-    final gitErr = await ToolchainEnsure().git();
-    if (!mounted) return;
-    if (gitErr != null) {
-      setState(() {
-        _status = _BuildStatus.error;
-        _lines.add('✗ $gitErr');
-      });
-      return;
+    // flutter 工具硬依赖 git，缺失时先自动安装（幂等；已装秒过）。
+    // termux 后端跳过：前置检查已确保 bionic git 就位。
+    if (!bare) {
+      final gitErr = await ToolchainEnsure().git();
+      if (!mounted) return;
+      if (gitErr != null) {
+        setState(() {
+          _status = _BuildStatus.error;
+          _lines.add('✗ $gitErr');
+        });
+        return;
+      }
     }
 
     // gradle 发行包统一走腾讯镜像（Step 8）：老工程仍是官方源 URL，哈希
     // 与 Step 3 预下载缓存不匹配会直连 services.gradle.org；幂等改写，
     // 失败仅警告不阻断（构建仍可尝试直连）。
-    final mirrorErr = await ToolchainEnsure().projectGradleMirror(name);
-    if (mirrorErr != null && mounted) {
-      setState(() => _lines.add('⚠ $mirrorErr'));
+    // termux 后端不经容器 shell，用 Dart 文件 IO 直接改写（rootfs 树内
+    // 文件宿主可见可写，与容器改写同一份文件）。
+    if (bare) {
+      final warn = _gradleMirrorFromDart(env, name);
+      if (warn != null && mounted) {
+        setState(() => _lines.add('⚠ $warn'));
+      }
+    } else {
+      final mirrorErr = await ToolchainEnsure().projectGradleMirror(name);
+      if (mirrorErr != null && mounted) {
+        setState(() => _lines.add('⚠ $mirrorErr'));
+      }
     }
 
-    final cmd =
-        'cd $_projectsDir/${_q(name)} && FLUTTER_ALLOW_ROOT=true '
-        'flutter build apk --release --target-platform=android-arm64';
-    final start = await _bridge.execStream(cmd);
+    // aapt2 覆盖（仅 termux）：AGP 默认从 Maven 拉 x86_64 aapt2；termux
+    // aapt 组件装好后把 build 期的 aapt2 指回 prefix 里的 bionic arm64 版
+    //（-P 优先级高于 gradle.properties，不污染工程文件）。
+    String aapt2Override = '';
+    if (bare) {
+      final aapt2 = TermuxPaths.aapt2(env);
+      if (File(aapt2).existsSync()) {
+        aapt2Override = " -Pandroid.aapt2FromMavenOverride='$aapt2'";
+      }
+    }
+
+    final String cmd;
+    if (bare) {
+      final flutterBin = '${TermuxPaths.flutterHome(env)}/bin/flutter';
+      // 环境双保险：Kotlin bareEnvironment 已注入 PREFIX/JAVA_HOME/
+      // GRADLE_USER_HOME/镜像等；这里再按 Dart 口径 export 一遍
+      //（envPrefix 含 PUB/FLUTTER 镜像），flutter 用全路径不依赖 PATH。
+      cmd = "cd $proj && ${TermuxPaths.envPrefix(env)}"
+          "FLUTTER_ALLOW_ROOT=true '$flutterBin' build apk --release "
+          '--target-platform=android-arm64$aapt2Override';
+    } else {
+      cmd =
+          'cd $proj && FLUTTER_ALLOW_ROOT=true '
+          'flutter build apk --release --target-platform=android-arm64';
+    }
+    final start = await _bridge.execStream(cmd, bare: bare);
     if (!mounted) return;
     if (!start.ok || start.id <= 0) {
       setState(() {
@@ -233,6 +313,24 @@ class _BuildPageState extends State<BuildPage> {
     _streamId = start.id;
     _offset = 0;
     _timer = Timer.periodic(const Duration(milliseconds: 500), (_) => _poll());
+  }
+
+  /// termux 后端的 gradle wrapper 镜像改写：不经 shell，Dart 直接读写
+  ///（rootfs 树内文件宿主可见）。幂等；非 Flutter 工程静默跳过。
+  String? _gradleMirrorFromDart(EnvInfo env, String name) {
+    try {
+      final f = File('${env.rootfsPath}/root/projects/$name'
+          '/android/gradle/wrapper/gradle-wrapper.properties');
+      if (!f.existsSync()) return null;
+      final t = f.readAsStringSync();
+      if (t.contains('mirrors.cloud.tencent.com')) return null;
+      f.writeAsStringSync(t.replaceAll(
+          'services.gradle.org/distributions',
+          'mirrors.cloud.tencent.com/gradle'));
+      return null;
+    } catch (e) {
+      return 'gradle 镜像配置失败：$e';
+    }
   }
 
   Future<void> _poll() async {
@@ -429,6 +527,16 @@ class _BuildPageState extends State<BuildPage> {
               children: [
                 const Text('构建流程',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 4),
+                Text(
+                  _backend == BuildBackend.termux
+                      ? '当前后端：Termux 裸原生（实验性）· 构建不经 proot，'
+                          '宿主直接执行 bionic 工具链'
+                      : '当前后端：Proot 容器（稳定）',
+                  style: const TextStyle(
+                      fontSize: 12, fontWeight: FontWeight.w600,
+                      color: Color(0xFF4C8DFF)),
+                ),
                 const SizedBox(height: 8),
                 Text(
                   '1. 项目位于容器 /root/projects（需已装 JDK / Android SDK / Flutter SDK / 构建镜像，见「工具链」页）\n'

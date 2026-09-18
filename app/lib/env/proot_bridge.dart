@@ -16,10 +16,13 @@ class ProotBridge {
     return EnvInfo.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }
 
-  Future<ProotResult> exec(String command, {int timeoutSec = 180}) async {
+  Future<ProotResult> exec(String command,
+      {int timeoutSec = 180, bool bare = false}) async {
     final raw = await _channel.invokeMethod('exec', {
       'command': command,
       'timeoutSec': timeoutSec,
+      // bare=true：**不经 proot**，宿主 /system/bin/sh 直跑（Termux 裸原生后端）
+      'bare': bare,
     });
     return ProotResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }
@@ -27,11 +30,13 @@ class ProotBridge {
   // ---------------- Step 6 · 流式执行（构建日志） ----------------
 
   /// 启动流式命令（输出合并单流，超时默认 2h），返回任务 id。
+  /// bare=true：Termux 裸原生模式，命令里的路径必须是**宿主路径**。
   Future<ExecStreamStart> execStream(String command,
-      {int timeoutSec = 7200}) async {
+      {int timeoutSec = 7200, bool bare = false}) async {
     final raw = await _channel.invokeMethod('execStream', {
       'command': command,
       'timeoutSec': timeoutSec,
+      'bare': bare,
     });
     return ExecStreamStart.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }

@@ -92,13 +92,15 @@ class MainActivity : FlutterActivity() {
                         "exec" -> {
                             val command = call.argument<String>("command") ?: ""
                             val timeoutSec = (call.argument<Number>("timeoutSec") ?: 180).toLong()
-                            result.success(exec(command, timeoutSec))
+                            val bare = call.argument<Boolean>("bare") == true
+                            result.success(exec(command, timeoutSec, bare))
                         }
                         // ---- Step 6 构建：流式执行（长任务，轮询增量输出 + 可取消）----
                         "execStream" -> {
                             val command = call.argument<String>("command") ?: ""
                             val timeoutSec = (call.argument<Number>("timeoutSec") ?: 7200).toLong()
-                            result.success(execStream(command, timeoutSec))
+                            val bare = call.argument<Boolean>("bare") == true
+                            result.success(execStream(command, timeoutSec, bare))
                         }
                         "execStreamPoll" -> {
                             val id = (call.argument<Number>("id") ?: -1L).toLong()
@@ -607,8 +609,9 @@ class MainActivity : FlutterActivity() {
         return if (extra.isEmpty()) base else "$base:$extra"
     }
 
-    private fun exec(command: String, timeoutSec: Long): Map<String, Any> {
+    private fun exec(command: String, timeoutSec: Long, bare: Boolean = false): Map<String, Any> {
         val start = System.currentTimeMillis()
+        if (bare) return execBare(command, timeoutSec)
         val built = buildProotCmd(command)
         if (built.cmd == null) return built.error!!
 
@@ -673,7 +676,115 @@ class MainActivity : FlutterActivity() {
      * 输出合并进内存缓冲（redirectErrorStream），Dart 侧轮询取增量；
      * 读取在独立线程，不阻塞 MethodChannel 的单线程 executor。
      */
-    private fun execStream(command: String, timeoutSec: Long): Map<String, Any> {
+    /**
+     * Termux 裸原生后端（2026-09-18）：**不经 proot**，宿主 /system/bin/sh
+     * 直跑命令。bionic 二进制（Termux 主仓的 openjdk/aapt/Flutter 移植）
+     * 放在 <rootfs>/opt/foa-termux/usr —— 宿主与容器看同一目录，bare 模式
+     * 按宿主路径 exec（W^X：targetSdk 28 保留 filesDir 子树 execve）。
+     *
+     * 环境注入对齐容器 foa-env.sh + Termux 惯例：
+     * - PREFIX / LD_LIBRARY_PATH：bionic 二进制的库搜索（libtermux-exec 若在则预载，
+     *   兜底改写脚本里残留的 com.termux 绝对路径）；
+     * - JAVA_HOME / ANDROID_HOME：termux JDK + 容器 SDK 目录（jars/android.jar
+     *   架构无关，跨后端复用）；GRADLE_USER_HOME 指向容器缓存（零重下）；
+     * - 国内镜像（pub/flutter storage）与 foa-env.sh 同款。
+     * 命令里可再 export 覆盖。
+     */
+    private fun bareEnvironment(pb: ProcessBuilder) {
+        val termux = File(File(filesDir, ROOTFS_REL), "opt/foa-termux/usr")
+        val env = pb.environment()
+        env["TERM"] = "dumb"
+        env["HOME"] = File(filesDir, "home").apply { mkdirs() }.absolutePath
+        env["TMPDIR"] = File(filesDir, "tmp").apply { mkdirs() }.absolutePath
+        if (termux.isDirectory) {
+            env["PREFIX"] = termux.absolutePath
+            env["PATH"] = "${termux.absolutePath}/bin:/system/bin:/system/xbin"
+            env["LD_LIBRARY_PATH"] = "${termux.absolutePath}/lib"
+            val exec = File(termux, "lib/libtermux-exec.so")
+            if (exec.isFile) env["LD_PRELOAD"] = exec.absolutePath
+            val jdk = File(termux, "lib/jvm/java-17-openjdk")
+            if (jdk.isDirectory) env["JAVA_HOME"] = jdk.absolutePath
+            // 容器侧的构建缓存与 SDK 组件（架构无关）跨后端复用
+            val rootfs = File(filesDir, ROOTFS_REL)
+            env["GRADLE_USER_HOME"] = File(rootfs, "root/.gradle").absolutePath
+            val sdk = File(rootfs, "opt/android-sdk")
+            if (sdk.isDirectory) env["ANDROID_HOME"] = sdk.absolutePath
+        }
+        // 国内镜像（与容器 /etc/profile.d/foa-env.sh 同款）
+        env["PUB_HOSTED_URL"] = "https://pub.flutter-io.cn"
+        env["FLUTTER_STORAGE_BASE_URL"] = "https://storage.flutter-io.cn"
+    }
+
+    /** bare 执行：/system/bin/sh -c <command>，env 见 bareEnvironment。 */
+    private fun execBare(command: String, timeoutSec: Long): Map<String, Any> {
+        val start = System.currentTimeMillis()
+        return try {
+            val pb = ProcessBuilder("/system/bin/sh", "-c", command)
+            bareEnvironment(pb)
+            val proc = pb.start()
+            val stdout = StringBuilder()
+            val stderr = StringBuilder()
+            // 双线程读流防死锁：copyTo 只吃 OutputStream，StringBuilder
+            // 场景用 bufferededReader 逐行收集（进程 destroy 时流关闭自然结束）
+            val tOut = Thread {
+                try { proc.inputStream.bufferedReader().forEachLine { stdout.appendLine(it) } }
+                catch (_: Exception) { }
+            }
+            val tErr = Thread {
+                try { proc.errorStream.bufferedReader().forEachLine { stderr.appendLine(it) } }
+                catch (_: Exception) { }
+            }
+            tOut.start(); tErr.start()
+            val finished = proc.waitFor(timeoutSec, TimeUnit.SECONDS)
+            tOut.join(5_000); tErr.join(5_000)
+            mapOf(
+                "ok" to finished,
+                "exitCode" to (if (finished) proc.exitValue() else -999),
+                "stdout" to stdout.toString(),
+                "stderr" to stderr.toString(),
+                "durationMs" to (System.currentTimeMillis() - start),
+            )
+        } catch (e: Exception) {
+            fail(-500, "bare 执行失败: ${e.message}")
+        }
+    }
+
+    private fun execStream(command: String, timeoutSec: Long, bare: Boolean = false): Map<String, Any> {
+        if (bare) {
+            // Termux 裸原生模式：同样走流式通道，但不套 proot
+            return try {
+                val pb = ProcessBuilder("/system/bin/sh", "-c", command)
+                bareEnvironment(pb)
+                pb.redirectErrorStream(true) // 合并：gradle/flutter 多线程输出交错，单流保时序
+                val proc = pb.start()
+                val id = streamSeq.incrementAndGet()
+                val sc = StreamingCmd(proc, StringBuffer())
+                streamingCmds[id] = sc
+                Thread {
+                    try {
+                        val reader = proc.inputStream.bufferedReader(Charsets.UTF_8)
+                        val buf = CharArray(8192)
+                        while (true) {
+                            val n = try { reader.read(buf) } catch (_: Exception) { -1 }
+                            if (n <= 0) break
+                            synchronized(sc.lock) { sc.buffer.append(buf, 0, n) }
+                        }
+                        val finished = proc.waitFor(timeoutSec, TimeUnit.SECONDS)
+                        sc.exitCode = if (finished) proc.exitValue() else {
+                            proc.destroyForcibly()
+                            -999
+                        }
+                    } catch (_: Exception) {
+                        if (sc.exitCode == null) sc.exitCode = -500
+                    } finally {
+                        sc.finished = true
+                    }
+                }.apply { name = "foa-stream-$id" }.start()
+                mapOf("ok" to true, "id" to id)
+            } catch (e: Exception) {
+                fail(-500, "启动 bare 命令失败: ${e.message}")
+            }
+        }
         val built = buildProotCmd(command)
         if (built.cmd == null) return built.error!!
         return try {

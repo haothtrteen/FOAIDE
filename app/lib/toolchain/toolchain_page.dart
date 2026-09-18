@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../env/models.dart';
@@ -8,6 +10,7 @@ import 'native_arm64.dart';
 import 'qemu_compat.dart';
 import 'sdk_downloader.dart';
 import 'sdk_installer.dart';
+import 'termux_backend.dart';
 
 /// Step 3 工具链页：JDK 17 / Android SDK / Flutter SDK(官方 x64 · QEMU 转发) /
 /// x64 兼容层(QEMU) / 构建镜像配置。
@@ -149,10 +152,164 @@ class _ToolchainPageState extends State<ToolchainPage> {
   final Set<String> _nativeMirrors = {};
   DownloadCancelToken? _nativeToken;
 
+  // ---- 后端切换（proot 容器 / termux 裸原生）----
+  BuildBackend? _backend; // null = 未选择（首次进入会弹询问）
+  // ---- Termux 裸原生 ----
+  TermuxPhase _termuxPhase = TermuxPhase.idle;
+  String _termuxInfo = '';
+  String _termuxError = '';
+  String _termuxSmoke = '';
+  bool _termuxBusy = false; // 冒烟/卸载等不可取消操作
+  DownloadProgress? _termuxProgress;
+  final Set<String> _termuxMirrors = {};
+  DownloadCancelToken? _termuxToken;
+
   @override
   void initState() {
     super.initState();
-    _refreshAll();
+    _initBackendAndRefresh();
+  }
+
+  /// 加载后端偏好 →（未选择时）弹首次询问 → 刷新全部状态。
+  Future<void> _initBackendAndRefresh() async {
+    try {
+      final env = await _bridge.envInfo();
+      final b = await BackendPrefs.load(env);
+      if (!mounted) return;
+      setState(() => _backend = b);
+      if (b == null) {
+        // 首次进入：问一次用哪个后端（给推荐），不选完不进页面内容
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _showBackendChoiceDialog(firstRun: true);
+        });
+      }
+    } catch (_) {}
+    await _refreshAll();
+  }
+
+  Future<void> _switchBackend(BuildBackend b) async {
+    setState(() => _backend = b);
+    try {
+      final env = await _bridge.envInfo();
+      await BackendPrefs.save(env, b);
+    } catch (_) {}
+  }
+
+  /// 首次进入的「选后端」对话框（含推荐）。
+  ///
+  /// 推荐逻辑（诚实原则）：proot 容器是**已真机验证**的成熟路线 → 默认推荐；
+  /// termux 裸原生是 2026-09-18 新增的实验路线（供应链已核实为 Termux 主仓
+  /// 现货，但构建链路还没真机验证过）→ 明确标注实验性。
+  Future<void> _showBackendChoiceDialog({required bool firstRun}) async {
+    final choice = await showDialog<BuildBackend>(
+      context: context,
+      barrierDismissible: !firstRun,
+      builder: (ctx) => AlertDialog(
+        title: Text(firstRun ? '选择构建后端' : '切换构建后端'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'FOA 支持两套可切换的构建后端，装的工具不一样：',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 12),
+              _backendOptionTile(
+                ctx,
+                backend: BuildBackend.proot,
+                title: 'Proot 容器（推荐）',
+                subtitle: 'Debian 官方工具链 + 可选 QEMU/原生加速。\n'
+                    '✅ 已真机验证 · 兼容性最好 · 文档最全\n'
+                    '⚠️ 需下载 78MB rootfs；proot 有少量系统调用开销',
+              ),
+              const SizedBox(height: 8),
+              _backendOptionTile(
+                ctx,
+                backend: BuildBackend.termux,
+                title: 'Termux 裸原生（实验性）',
+                subtitle: 'Termux 主仓 bionic 工具链，不经 proot 直接跑。\n'
+                    '✅ 无 rootfs 依赖路径 · 无 proot 开销 · 原生全速\n'
+                    '⚠️ 新路线，构建链路未经真机验证；Flutter 需导入移植版'
+                    '（版本可能与官方 SDK 不同）',
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          if (!firstRun)
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('取消'),
+            ),
+        ],
+      ),
+    );
+    if (choice != null && mounted) {
+      await _switchBackend(choice);
+    }
+  }
+
+  Widget _backendOptionTile(
+    BuildContext ctx, {
+    required BuildBackend backend,
+    required String title,
+    required String subtitle,
+  }) {
+    final selected = _backend == backend;
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => Navigator.pop(ctx, backend),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: selected
+                ? Theme.of(ctx).colorScheme.primary
+                : Theme.of(ctx).colorScheme.outlineVariant,
+          ),
+        ),
+        child: Row(
+          children: [
+            // 自绘选中圆点（Radio 的 groupValue/onChanged 已 deprecated，
+            // 而整块 tile 本身就是点选入口，这里只需要视觉态）
+            Container(
+              width: 20,
+              height: 20,
+              margin: const EdgeInsets.only(right: 4),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: selected ? Theme.of(ctx).colorScheme.primary : null,
+                border: Border.all(
+                  width: 2,
+                  color: selected
+                      ? Theme.of(ctx).colorScheme.primary
+                      : Theme.of(ctx).colorScheme.outlineVariant,
+                ),
+              ),
+              child: selected
+                  ? const Icon(Icons.check, size: 14,
+                      color: Colors.white)
+                  : null,
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  Text(subtitle,
+                      style: const TextStyle(fontSize: 12, height: 1.4)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _refreshAll() async {
@@ -675,6 +832,158 @@ class _ToolchainPageState extends State<ToolchainPage> {
 
   // ============================ x64 兼容层(QEMU) ============================
 
+  // ============================ Termux 裸原生后端 ============================
+
+  Future<void> _termuxRunSmoke() async {
+    setState(() {
+      _termuxBusy = true;
+      _termuxError = '';
+    });
+    try {
+      final env = await _bridge.envInfo();
+      final s = await TermuxInstaller.smoke(_bridge, env);
+      if (!mounted) return;
+      setState(() {
+        _termuxBusy = false;
+        _termuxSmoke = s;
+        _termuxPhase = TermuxPhase.ready;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _termuxBusy = false;
+        _termuxPhase = TermuxPhase.error;
+        _termuxError = e.toString();
+      });
+    }
+  }
+
+  /// 装 Termux 仓库组件（openjdk-17 / aapt 四件套）。
+  Future<void> _termuxInstallPackage(String pkg) async {
+    setState(() {
+      _termuxPhase = TermuxPhase.indexing;
+      _termuxError = '';
+      _termuxInfo = '';
+    });
+    try {
+      final env = await _bridge.envInfo();
+      final msg = await TermuxInstaller.installPackage(
+        _bridge,
+        env,
+        pkg,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _termuxPhase = switch (p) {
+                'indexing' => TermuxPhase.indexing,
+                'downloading' => TermuxPhase.downloading,
+                'unpacking' => TermuxPhase.unpacking,
+                _ => TermuxPhase.unpacking,
+              });
+        },
+        onMirror: (m) {
+          if (!mounted) return;
+          setState(() => _termuxMirrors..clear()..add(m));
+        },
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() => _termuxProgress = p);
+        },
+        token: _termuxToken,
+      );
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.ready;
+        _termuxInfo = msg;
+      });
+      await _termuxRunSmoke();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.error;
+        _termuxError = e.toString();
+      });
+    }
+  }
+
+  /// 导入 bionic Flutter（ImL1s 系 deb / tar.xz，本地文件）。
+  Future<void> _termuxImportFlutter() async {
+    final ok = await _confirm(
+      '导入 Termux 版 Flutter（bionic）',
+      '需要你自备 Termux 系的 Flutter aarch64 包（如 ImL1s/termux-flutter '
+          '的 flutter_3.44.0_aarch64.deb，或同源 tar.xz）。\n\n'
+          '导入后：\n'
+          '  1. 解包到 /opt/foa-termux/usr/opt/flutter（不经 proot 运行）；\n'
+          '  2. 自动改写包内 Termux 前缀路径；\n'
+          '  3. bare 冒烟 flutter --version。\n\n'
+          '⚠️ 版本以导入包为准（如 3.44.0），与容器里官方 SDK（3.47.4）'
+          '可能不同——Termux 模式构建用的是导入的这套（dart 与 gen_snapshot '
+          '必须配套）。',
+    );
+    if (!ok) return;
+    final picked = await LocalInstallPicker.pickInstallFile();
+    if (!mounted) return;
+    if (!picked.ok || picked.path == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(picked.error ?? '未选择文件')),
+      );
+      return;
+    }
+    setState(() {
+      _termuxPhase = TermuxPhase.importing;
+      _termuxError = '';
+      _termuxInfo = '';
+    });
+    try {
+      final env = await _bridge.envInfo();
+      final msg = await TermuxInstaller.installFlutterFromLocalFile(
+        _bridge,
+        env,
+        picked.path!,
+        onPhase: (p) {
+          if (!mounted) return;
+          setState(() => _termuxPhase = TermuxPhase.importing);
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.ready;
+        _termuxInfo = msg;
+      });
+      await _termuxRunSmoke();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.error;
+        _termuxError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _termuxCancel() async {
+    _termuxToken?.cancel();
+    setState(() => _termuxPhase = TermuxPhase.idle);
+  }
+
+  Future<void> _termuxUninstall() async {
+    setState(() => _termuxPhase = TermuxPhase.uninstalling);
+    try {
+      final env = await _bridge.envInfo();
+      await TermuxInstaller.uninstall(env);
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.idle;
+        _termuxSmoke = '';
+        _termuxInfo = '';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _termuxPhase = TermuxPhase.error;
+        _termuxError = e.toString();
+      });
+    }
+  }
+
   QemuPhase _qemuPhaseFrom(String p) => switch (p) {
         'apt' => QemuPhase.apt,
         'engine' => QemuPhase.engine,
@@ -1056,133 +1365,488 @@ class _ToolchainPageState extends State<ToolchainPage> {
   @override
   Widget build(BuildContext context) {
     final rootfsReady = _env?.rootfsInstalled == true;
-    // 顺序门控：SDK 工具为 x64 宿主二进制，**两种后端任一就绪**即可装 SDK：
-    //   ① 走 QEMU 兼容层 → x64 二进制经 qemu 转发可执行；
-    //   ② 走原生 arm64   → 二进制本身就是 aarch64，无需转发。
-    // 二者是可切换的并行后端，不是先后依赖。
-    final sdkOrderReady =
-        _qemuPhase == QemuPhase.installed || _nativePhase == NativePhase.installed;
+    final backend = _backend;
+    final isTermux = backend == BuildBackend.termux;
+    // 顺序门控（proot 模式）：SDK 工具为 x64 宿主二进制，**两种后端任一就绪**
+    // 即可装 SDK：① QEMU 兼容层转发 ② 原生 arm64 落位。二者是并行后端。
+    // termux 模式：SDK 组件（android.jar / lib jars / 许可）架构无关，
+    // 装在容器目录但裸模式直接复用，无需任何后端前置。
+    final sdkOrderReady = isTermux ||
+        _qemuPhase == QemuPhase.installed ||
+        _nativePhase == NativePhase.installed;
     return Scaffold(
       appBar: AppBar(title: const Text('工具链')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
+      body: backend == null
+          // 首次进入：还没选后端（对话框已弹出），先不渲染卡片
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.all(16),
+              children: [
+                _BackendSwitcher(
+                  backend: backend,
+                  onChanged: (b) async {
+                    if (b == backend) return;
+                    await _switchBackend(b);
+                  },
+                  onDetails: () => _showBackendChoiceDialog(firstRun: false),
+                ),
+                const SizedBox(height: 12),
+                if (isTermux) ...[
+                  _TermuxCard(
+                    phase: _termuxPhase,
+                    info: _termuxInfo,
+                    smoke: _termuxSmoke,
+                    error: _termuxError,
+                    rootfsReady: rootfsReady,
+                    busy: _termuxBusy,
+                    progress: _termuxProgress,
+                    mirrorName: _termuxMirrors.join(' + '),
+                    prefixReady: _env != null && TermuxPaths.prefixExists(_env!),
+                    hasJdk: _env != null &&
+                        Directory(TermuxPaths.jdkHome(_env!)).existsSync(),
+                    hasBuildTools: _env != null &&
+                        File(TermuxPaths.aapt2(_env!)).existsSync(),
+                    hasFlutter: _env != null &&
+                        Directory(TermuxPaths.flutterHome(_env!)).existsSync(),
+                    onInstallJdk: () => _termuxInstallPackage(TermuxRepo.jdkPackage),
+                    onInstallBuildTools: () =>
+                        _termuxInstallPackage(TermuxRepo.buildToolsPackage),
+                    onImportFlutter: _termuxImportFlutter,
+                    onSmoke: _termuxRunSmoke,
+                    onCancel: _termuxCancel,
+                    onUninstall: _termuxUninstall,
+                  ),
+                  const SizedBox(height: 12),
+                  _asdkCard(termuxMode: true, rootfsReady: rootfsReady, orderReady: sdkOrderReady),
+                ] else ...[
+                  _QemuCard(
+                    phase: _qemuPhase,
+                    info: _qemuInfo,
+                    error: _qemuError,
+                    rootfsReady: rootfsReady,
+                    verifying: _qemuVerifying,
+                    onApply: _qemuApply,
+                    onVerify: _qemuVerify,
+                    onUninstall: _qemuUninstall,
+                  ),
+                  const SizedBox(height: 12),
+                  _NativeCard(
+                    phase: _nativePhase,
+                    audit: _nativeAudit,
+                    info: _nativeInfo,
+                    error: _nativeError,
+                    rootfsReady: rootfsReady,
+                    auditing: _nativeAuditing,
+                    progress: _nativeProgress,
+                    mirrorName: _nativeMirrors.join(' + '),
+                    hasGenSnapshot: _nativeAudit?.probe('native:gen_snapshot') != null,
+                    onAudit: _nativeRunAudit,
+                    onInstall: () => _nativeInstall(),
+                    onInstallLocal: () => _nativeInstall(local: true),
+                    onImportGenSnapshot: _nativeImportGenSnapshot,
+                    onCancel: _nativeCancel,
+                    onUninstall: _nativeUninstall,
+                  ),
+                  const SizedBox(height: 12),
+                  _JdkCard(
+                    phase: _phase,
+                    progress: _progress,
+                    mirrorName: _mirrors.join(' + '),
+                    version: _version,
+                    error: _error,
+                    env: _env,
+                    onInstall: _install,
+                    onCancel: _cancel,
+                    onUninstall: _uninstall,
+                    onVerify: _onVerify,
+                    onInstallLocal: _installFromLocal,
+                    verifying: _verifying,
+                  ),
+                  const SizedBox(height: 12),
+                  _asdkCard(termuxMode: false, rootfsReady: rootfsReady, orderReady: sdkOrderReady),
+                  const SizedBox(height: 12),
+                  _SdkCard(
+                    title: 'Flutter SDK（官方 x64 · QEMU 转发）',
+                    icon: Icons.bolt,
+                    phase: _flPhase,
+                    progress: _flProgress,
+                    mirrorName: _flMirrors.join(' + '),
+                    info: _flInfo,
+                    error: _flError,
+                    sizeLabel: '约 1575 MB · 官方 tarball（x64 工具链由 QEMU 转发）',
+                    desc: 'Flutter ${FlutterSdkInstaller.version} 官方仅发布 x64 Linux 构建，'
+                        '其 flutter_tools.snapshot 为 x64 快照，aarch64 直跑报 '
+                        '"Snapshot not compatible"（真机已复现）。\n'
+                        '本方案保留官方 x64 dart-sdk 原样，由「x64 兼容层(QEMU)」统一转发 '
+                        'dart/gen_snapshot/aapt2 等 x64 二进制后即可在 aarch64 上执行 '
+                        'flutter build apk。\n'
+                        '国内源（flutter-io.cn 官方中国镜像）优先；解压到容器内 /opt/flutter。',
+                    verifying: _flVerifying,
+                    rootfsReady: rootfsReady,
+                    orderReady: sdkOrderReady,
+                    orderHint: '需先应用上方「x64 兼容层(QEMU)」再安装：flutter_tools.snapshot '
+                        '为 x64 快照、dart 也是 x64 宿主二进制，'
+                        '目前**只能**靠 QEMU 转发（原生 arm64 的 dart 替换 + 快照重建尚未实现，'
+                        '不做就不会有 "原生提速"）。\n'
+                        '若已装反顺序无需卸载——点兼容层「重新应用」会自动补上转发。',
+                    onInstall: _flInstall,
+                    onVerify: _flVerify,
+                    onCancel: _flCancel,
+                    onUninstall: _flUninstall,
+                    onInstallLocal: _flInstallFromLocal,
+                  ),
+                  const SizedBox(height: 12),
+                  _MirrorCard(
+                    phase: _mirrorPhase,
+                    progress: _mirrorProgress,
+                    info: _mirrorInfo,
+                    error: _mirrorError,
+                    rootfsReady: rootfsReady,
+                    onApply: _mirrorApply,
+                    onVerify: _mirrorVerify,
+                    onCancel: _mirrorCancel,
+                  ),
+                  const SizedBox(height: 12),
+                  _AvfCard(env: _env),
+                ],
+              ],
+            ),
+    );
+  }
+
+  /// Android SDK 卡（两种后端共用：组件架构无关，装在容器目录树下，
+  /// proot 走容器路径访问、termux 裸模式走宿主路径访问——同一目录）。
+  Widget _asdkCard({
+    required bool termuxMode,
+    required bool rootfsReady,
+    required bool orderReady,
+  }) {
+    return _SdkCard(
+      title: termuxMode ? 'Android SDK（组件共享 · 裸模式复用）' : 'Android SDK',
+      icon: Icons.android,
+      phase: _asdkPhase,
+      progress: _asdkProgress,
+      mirrorName: _asdkMirrors.join(' + '),
+      info: _asdkInfo,
+      error: _asdkError,
+      sizeLabel: '约 ${(AndroidSdkInstaller.totalSize / 1048576).toStringAsFixed(0)} MB · 4 个组件',
+      desc: termuxMode
+          ? 'platform android.jar / build-tools 的 lib jars / 许可文件全部'
+              '架构无关——Termux 裸模式构建时由原生层直接指向容器 SDK 目录复用，'
+              '其中 x64 的 bin/ 二进制不会被调用（aapt2 由 Termux 版顶替）。\n'
+              '安装仍写入容器内 /opt/android-sdk（与 proot 模式同一份，切换不重复下载）。'
+          : 'platform-tools r37 + platforms;android-36 + build-tools 36.0.0 '
+              '+ cmdline-tools（与 Flutter 3.47.4 的 compileSdk 36 对齐）。\n'
+              '国内源优先（腾讯云）探测取最快，4 线程分段并发 + SHA-1 校验；'
+              '解压到容器内 /opt/android-sdk 并预置许可。',
+      verifying: _asdkVerifying,
+      rootfsReady: rootfsReady,
+      orderReady: orderReady,
+      orderHint: termuxMode
+          ? 'Termux 模式无需任何前置：SDK 组件本身架构无关。\n'
+              '⚠️ adb / fastboot 等可执行文件仍是 x64，裸模式下不可用'
+              '（构建流程用不到 adb）。\n'
+              '⚠️ 本模式仍需 rootfs 已安装（解包借用容器 dpkg-deb）——'
+              '但构建执行不经 proot。'
+          : '需先启用一套后端（上方「x64 兼容层(QEMU)」或「原生 arm64」）'
+              '再安装：aapt2/adb 默认是 x64 宿主二进制，'
+              '既没 QEMU 转发又没换原生版就无法执行。\n'
+              '⚠️ 现阶段原生后端只覆盖 build-tools 四件套（aapt2/aidl/zipalign/'
+              'split-select），adb 仍是 x64——建议两套都启用：QEMU 兜底、原生提速。',
+      onInstall: _asdkInstall,
+      onVerify: _asdkVerify,
+      onCancel: _asdkCancel,
+      onUninstall: _asdkUninstall,
+      onInstallLocal: _asdkInstallFromLocal,
+    );
+  }
+}
+
+// ============================ 后端切换器 ============================
+
+/// 工具链页顶部的后端切换（「Termux 裸原生」⇄「Proot 容器」）。
+class _BackendSwitcher extends StatelessWidget {
+  final BuildBackend backend;
+  final ValueChanged<BuildBackend> onChanged;
+  final VoidCallback onDetails;
+
+  const _BackendSwitcher({
+    required this.backend,
+    required this.onChanged,
+    required this.onDetails,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: cs.surfaceContainerHighest.withValues(alpha: 0.4),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _QemuCard(
-            phase: _qemuPhase,
-            info: _qemuInfo,
-            error: _qemuError,
-            rootfsReady: rootfsReady,
-            verifying: _qemuVerifying,
-            onApply: _qemuApply,
-            onVerify: _qemuVerify,
-            onUninstall: _qemuUninstall,
+          Row(
+            children: [
+              Icon(Icons.swap_horiz, size: 18, color: cs.primary),
+              const SizedBox(width: 6),
+              const Text('构建后端',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const Spacer(),
+              TextButton(
+                onPressed: onDetails,
+                child: const Text('两者有什么区别？'),
+              ),
+            ],
           ),
-          const SizedBox(height: 12),
-          _NativeCard(
-            phase: _nativePhase,
-            audit: _nativeAudit,
-            info: _nativeInfo,
-            error: _nativeError,
-            rootfsReady: rootfsReady,
-            auditing: _nativeAuditing,
-            progress: _nativeProgress,
-            mirrorName: _nativeMirrors.join(' + '),
-            hasGenSnapshot: _nativeAudit?.probe('native:gen_snapshot') != null,
-            onAudit: _nativeRunAudit,
-            onInstall: () => _nativeInstall(),
-            onInstallLocal: () => _nativeInstall(local: true),
-            onImportGenSnapshot: _nativeImportGenSnapshot,
-            onCancel: _nativeCancel,
-            onUninstall: _nativeUninstall,
+          const SizedBox(height: 4),
+          SegmentedButton<BuildBackend>(
+            segments: const [
+              ButtonSegment(
+                value: BuildBackend.termux,
+                icon: Icon(Icons.bolt),
+                label: Text('Termux 裸原生'),
+              ),
+              ButtonSegment(
+                value: BuildBackend.proot,
+                icon: Icon(Icons.dns),
+                label: Text('Proot 容器'),
+              ),
+            ],
+            selected: {backend},
+            onSelectionChanged: (s) => onChanged(s.first),
           ),
-          const SizedBox(height: 12),
-          _JdkCard(
-            phase: _phase,
-            progress: _progress,
-            mirrorName: _mirrors.join(' + '),
-            version: _version,
-            error: _error,
-            env: _env,
-            onInstall: _install,
-            onCancel: _cancel,
-            onUninstall: _uninstall,
-            onVerify: _onVerify,
-            onInstallLocal: _installFromLocal,
-            verifying: _verifying,
+          const SizedBox(height: 6),
+          Text(
+            backend == BuildBackend.termux
+                ? '实验性：Termux 主仓 bionic 工具链，不经 proot 直接在真机内核上执行。'
+                    '构建页会自动走裸执行通道（宿主路径）。'
+                : '成熟路线：Debian 容器 + 官方/原生工具链（已真机验证）。'
+                    '支持 QEMU 兼容层与容器内原生 arm64 两套加速。',
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
           ),
-          const SizedBox(height: 12),
-          _SdkCard(
-            title: 'Android SDK',
-            icon: Icons.android,
-            phase: _asdkPhase,
-            progress: _asdkProgress,
-            mirrorName: _asdkMirrors.join(' + '),
-            info: _asdkInfo,
-            error: _asdkError,
-            sizeLabel: '约 ${(AndroidSdkInstaller.totalSize / 1048576).toStringAsFixed(0)} MB · 4 个组件',
-            desc: 'platform-tools r37 + platforms;android-36 + build-tools 36.0.0 '
-                '+ cmdline-tools（与 Flutter 3.47.4 的 compileSdk 36 对齐）。\n'
-                '国内源优先（腾讯云）探测取最快，4 线程分段并发 + SHA-1 校验；'
-                '解压到容器内 /opt/android-sdk 并预置许可。',
-            verifying: _asdkVerifying,
-            rootfsReady: rootfsReady,
-            orderReady: sdkOrderReady,
-            orderHint: '需先启用一套后端（上方「x64 兼容层(QEMU)」或「原生 arm64」）'
-                '再安装：aapt2/adb 默认是 x64 宿主二进制，'
-                '既没 QEMU 转发又没换原生版就无法执行。\n'
-                '⚠️ 现阶段原生后端只覆盖 build-tools 四件套（aapt2/aidl/zipalign/'
-                'split-select），adb 仍是 x64——建议两套都启用：QEMU 兜底、原生提速。',
-            onInstall: _asdkInstall,
-            onVerify: _asdkVerify,
-            onCancel: _asdkCancel,
-            onUninstall: _asdkUninstall,
-            onInstallLocal: _asdkInstallFromLocal,
-          ),
-          const SizedBox(height: 12),
-          _SdkCard(
-            title: 'Flutter SDK（官方 x64 · QEMU 转发）',
-            icon: Icons.bolt,
-            phase: _flPhase,
-            progress: _flProgress,
-            mirrorName: _flMirrors.join(' + '),
-            info: _flInfo,
-            error: _flError,
-            sizeLabel: '约 1575 MB · 官方 tarball（x64 工具链由 QEMU 转发）',
-            desc: 'Flutter ${FlutterSdkInstaller.version} 官方仅发布 x64 Linux 构建，'
-                '其 flutter_tools.snapshot 为 x64 快照，aarch64 直跑报 '
-                '"Snapshot not compatible"（真机已复现）。\n'
-                '本方案保留官方 x64 dart-sdk 原样，由「x64 兼容层(QEMU)」统一转发 '
-                'dart/gen_snapshot/aapt2 等 x64 二进制后即可在 aarch64 上执行 '
-                'flutter build apk。\n'
-                '国内源（flutter-io.cn 官方中国镜像）优先；解压到容器内 /opt/flutter。',
-            verifying: _flVerifying,
-            rootfsReady: rootfsReady,
-            orderReady: sdkOrderReady,
-            orderHint: '需先应用上方「x64 兼容层(QEMU)」再安装：flutter_tools.snapshot '
-                '为 x64 快照、dart 也是 x64 宿主二进制，'
-                '目前**只能**靠 QEMU 转发（原生 arm64 的 dart 替换 + 快照重建尚未实现，'
-                '不做就不会有 "原生提速"）。\n'
-                '若已装反顺序无需卸载——点兼容层「重新应用」会自动补上转发。',
-            onInstall: _flInstall,
-            onVerify: _flVerify,
-            onCancel: _flCancel,
-            onUninstall: _flUninstall,
-            onInstallLocal: _flInstallFromLocal,
-          ),
-          const SizedBox(height: 12),
-          _MirrorCard(
-            phase: _mirrorPhase,
-            progress: _mirrorProgress,
-            info: _mirrorInfo,
-            error: _mirrorError,
-            rootfsReady: rootfsReady,
-            onApply: _mirrorApply,
-            onVerify: _mirrorVerify,
-            onCancel: _mirrorCancel,
-          ),
-          const SizedBox(height: 12),
-          _AvfCard(env: _env),
         ],
+      ),
+    );
+  }
+}
+
+// ============================ Termux 裸原生卡片 ============================
+
+/// Termux 裸原生后端卡：三件套安装 + bare 冒烟 + 卸载。
+///
+/// 三件套 = ① Termux openjdk-17（bionic JVM）② aapt 包（aapt2/aidl/zipalign
+/// bionic 四件套）③ Flutter bionic 移植版（本地导入，dart 与 gen_snapshot 配套）。
+/// Gradle/d8/R8/kotlinc 纯 JVM 随 JDK 走；Android SDK 组件卡片共享。
+class _TermuxCard extends StatelessWidget {
+  final TermuxPhase phase;
+  final String info;
+  final String smoke;
+  final String error;
+  final bool rootfsReady;
+  final bool busy;
+  final DownloadProgress? progress;
+  final String mirrorName;
+  final bool prefixReady;
+  final bool hasJdk;
+  final bool hasBuildTools;
+  final bool hasFlutter;
+  final VoidCallback onInstallJdk;
+  final VoidCallback onInstallBuildTools;
+  final VoidCallback onImportFlutter;
+  final VoidCallback onSmoke;
+  final VoidCallback onCancel;
+  final VoidCallback onUninstall;
+
+  const _TermuxCard({
+    required this.phase,
+    required this.info,
+    required this.smoke,
+    required this.error,
+    required this.rootfsReady,
+    required this.busy,
+    required this.progress,
+    required this.mirrorName,
+    required this.prefixReady,
+    required this.hasJdk,
+    required this.hasBuildTools,
+    required this.hasFlutter,
+    required this.onInstallJdk,
+    required this.onInstallBuildTools,
+    required this.onImportFlutter,
+    required this.onSmoke,
+    required this.onCancel,
+    required this.onUninstall,
+  });
+
+  String get _statusLabel => switch (phase) {
+        TermuxPhase.idle => prefixReady ? '已初始化' : '未安装',
+        TermuxPhase.indexing => '查询 Termux 仓库索引…',
+        TermuxPhase.downloading => '下载中…',
+        TermuxPhase.unpacking => '容器内解包 + 前缀改写…',
+        TermuxPhase.importing => '导入 Flutter…',
+        TermuxPhase.verifying => 'bare 冒烟验证…',
+        TermuxPhase.ready => '就绪',
+        TermuxPhase.uninstalling => '卸载中…',
+        TermuxPhase.error => '出错',
+      };
+
+  Widget _compRow(BuildContext context, String name, String desc, bool installed,
+      {VoidCallback? onInstall, required String action}) {
+    final cs = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Icon(
+            installed ? Icons.check_circle : Icons.radio_button_unchecked,
+            size: 18,
+            color: installed ? Colors.green : cs.outline,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(name, style: const TextStyle(fontWeight: FontWeight.w600)),
+                Text(desc, style: const TextStyle(fontSize: 11.5, height: 1.3)),
+              ],
+            ),
+          ),
+          if (!installed && onInstall != null)
+            TextButton(onPressed: onInstall, child: Text(action)),
+          if (installed)
+            Text('已装', style: TextStyle(fontSize: 12, color: cs.primary)),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final installing = switch (phase) {
+      TermuxPhase.indexing ||
+      TermuxPhase.downloading ||
+      TermuxPhase.unpacking ||
+      TermuxPhase.importing =>
+        true,
+      _ => false,
+    };
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.bolt, color: cs.primary),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text('Termux 裸原生（实验性）',
+                      style: TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.bold)),
+                ),
+                Text(_statusLabel,
+                    style: TextStyle(
+                        color: phase == TermuxPhase.error
+                            ? cs.error
+                            : cs.primary,
+                        fontWeight: FontWeight.w600)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              '不经 proot：Termux 主仓 bionic 二进制直接在真机内核上执行'
+              '（无指令翻译、无 ptrace 拦截开销）。安装期借用容器 dpkg-deb 解包'
+              '（需 rootfs 已装），**构建执行完全不走 proot**。\n'
+              '⚠️ 供应链已核实（dev-handbook/07 §八），但构建链路尚未真机验证。',
+              style: TextStyle(fontSize: 12, height: 1.4),
+            ),
+            const Divider(height: 20),
+            _compRow(context, 'JDK 17（Termux openjdk-17）',
+                'bionic 构建，Gradle/d8/R8/kotlinc 纯 JVM 随其运行', hasJdk,
+                onInstall: rootfsReady && !installing && !busy
+                    ? onInstallJdk
+                    : null,
+                action: '安装'),
+            _compRow(context, 'aapt2 / aidl / zipalign',
+                'Termux aapt 包（AOSP 源码 bionic 构建），AGP 直接调用', hasBuildTools,
+                onInstall: rootfsReady && !installing && !busy
+                    ? onInstallBuildTools
+                    : null,
+                action: '安装'),
+            _compRow(context, 'Flutter（bionic 移植版）',
+                '本地导入 ImL1s 系 deb/tar.xz；dart 与 gen_snapshot 配套，'
+                '版本可能与官方 SDK 不同',
+                hasFlutter,
+                onInstall: rootfsReady && !installing && !busy
+                    ? onImportFlutter
+                    : null,
+                action: '导入'),
+            if (installing && progress != null) ...[
+              const SizedBox(height: 8),
+              LinearProgressIndicator(
+                value: progress!.total > 0
+                    ? progress!.received / progress!.total
+                    : null,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '${(progress!.received / 1048576).toStringAsFixed(1)} / '
+                '${(progress!.total / 1048576).toStringAsFixed(1)} MB'
+                '${mirrorName.isEmpty ? '' : ' · $mirrorName'}',
+                style: const TextStyle(fontSize: 11),
+              ),
+            ],
+            if (info.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(info,
+                  style: TextStyle(fontSize: 12, color: cs.primary, height: 1.4)),
+            ],
+            if (smoke.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(8),
+                  color: cs.surfaceContainerHighest.withValues(alpha: 0.5),
+                ),
+                child: Text('bare 冒烟（不经 proot 直跑）：\n$smoke',
+                    style: const TextStyle(fontSize: 11.5, height: 1.5)),
+              ),
+            ],
+            if (error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(error,
+                  style: TextStyle(fontSize: 12, color: cs.error, height: 1.4)),
+            ],
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: [
+                OutlinedButton(
+                  onPressed: busy || installing ? null : onSmoke,
+                  child: const Text('bare 冒烟'),
+                ),
+                if (installing)
+                  OutlinedButton(onPressed: onCancel, child: const Text('取消')),
+                OutlinedButton(
+                  onPressed: busy || installing || !prefixReady
+                      ? null
+                      : onUninstall,
+                  child: const Text('卸载'),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
