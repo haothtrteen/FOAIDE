@@ -1209,6 +1209,42 @@ openjdk-17  80.2 MB / 91.8 MB   ← 长时间冻结，无报错、不换源、�
 - 测试难以覆盖"服务端 hang"场景（真机弱网才暴露），代码评审时
   对"循环体内做超时检查"的模式要保持警惕。
 
+### Bug 422：Termux 仓库索引查询一小时不返回（join() 无熔断 + 明文 8MB）
+
+**症状**（2026-09-18 真机，工具链页 Termux 卡片）：
+"查询 Termux 仓库索引..." 挂 15:33 → 16:34（一小时）后报
+`SocketException: Failed host lookup: 'mirror.iscas.ac.cn'`。
+
+**原因**（两层）：
+1. `_fetchText` 的 `resp.transform(...).join()` 无任何数据侧超时——服务端
+   hang 时永久挂起（Bug 421 同款死逻辑的第 3 处实例）；
+2. 拉的是明文 Packages（8MB+），真机 20~50KB/s 下单镜像就要 5~10 分钟，
+   逐镜像试完四个源轻松超过半小时。
+
+**解决**（alpha.32）：拉 `Packages.gz`（~1.5MB，gzip.decode 解压）+
+响应头 20s / Stream.timeout stall 15s 熔断 + filesDir 磁盘缓存回退
+（全镜像失败用上次成功索引，旧版本可装不阻断）。
+
+**教训**：`join()`/`listen` 的超时检查写在外面等于没有——凡是读流，
+一律 `stream.timeout(stall)` 驱动；大文件先想"有没有压缩版本"。
+
+### Bug 423：真机构建 pub TLS 持续失败（同源重试无效）
+
+**症状**（2026-09-18 真机 alpha.31，my_demo 构建 4%）：exit 69，
+`Got TLS error trying to find package archive at https://pub.flutter-io.cn`
+重试 3 次全败（好消息：alpha.30/31 的清理锁+重试+分诊全部生效——
+不再卡死、干净退出、给出可执行建议）。
+
+**原因**：真机 50KB/s 弱网下到 pub.flutter-io.cn 的 TLS 握手**持续**
+失败（丢握手包），同源重试 3 次每次都撞同一堵墙。
+
+**解决**（alpha.32）：pub get 改多源轮换——io.cn → 清华 TUNA dart-pub →
+中科大，每源 2 次；`break 2` 后 shell 变量 $src 保留成功源，
+`export PUB_HOSTED_URL=$src` 供 build 内部自动 pub get 复用。
+
+**教训**：网络重试要区分"瞬断"（同源重试有效）与"持续不可达"
+（必须换源）；弱网下 TLS 握手是第一个牺牲品。
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
