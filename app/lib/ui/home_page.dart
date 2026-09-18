@@ -282,15 +282,17 @@ class _HomePageState extends State<HomePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('官方 SDK + QEMU 兼容层',
+                const Text('两套可切换的构建后端',
                     style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 6),
                 Text(
-                  'Flutter 官方 Linux 仅发布 x64 工具链；aarch64 上由「x64 兼容层」'
-                  '用 qemu 转发 dart / gen_snapshot / aapt2 等 x64 二进制，'
-                  '即可在设备上原生构建 arm64 APK。\n'
-                  '安装顺序：先应用「x64 兼容层(QEMU)」，再安装 Flutter / Android SDK；'
-                  '若已装反顺序无需卸载——点兼容层「重新应用」自动补上转发。',
+                  'Flutter 官方 Linux 仅发布 x64 工具链，aarch64 上要跑起来有两条路：\n'
+                  '① 转译：由「x64 兼容层」用 qemu 转发 dart / gen_snapshot / aapt2；\n'
+                  '② 原生：把关键二进制换成 aarch64 版（工具链页「原生 arm64」可先做体检，'
+                  '看清哪些还在模拟）。\n'
+                  '两者可切换、可共存，任一就绪即可安装 Flutter / Android SDK。\n'
+                  '注意：gen_snapshot 官方不发 arm64 版，是原生化的唯一硬缺口，'
+                  '需自备移植产物导入。',
                   style: TextStyle(
                       fontSize: 12,
                       color: Colors.grey.shade500,

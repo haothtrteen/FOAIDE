@@ -12,6 +12,14 @@ class EnvInfo {
   final int androidSdk;
   final String device;
 
+  // ---- AVF（Android 虚拟化框架）能力检测 ----
+  // 仅用于「告知用户可否走 AVF 路线」，不代表 App 能驱动 VM：
+  // AVF 的 VM 由特权系统服务 virtmgr 管理，普通 App 无 API 可及。
+  // 详见 dev-handbook 与《AVF集成可行性评估.md》。
+  final bool avfSupported;
+  final bool avfTerminalInstalled;
+  final String avfReason;
+
   const EnvInfo({
     required this.filesDir,
     required this.cacheDir,
@@ -23,6 +31,9 @@ class EnvInfo {
     this.abi,
     this.androidSdk = 0,
     this.device = '',
+    this.avfSupported = false,
+    this.avfTerminalInstalled = false,
+    this.avfReason = '',
   });
 
   factory EnvInfo.fromMap(Map<Object?, Object?> m) => EnvInfo(
@@ -36,6 +47,9 @@ class EnvInfo {
         abi: m['abi'] as String?,
         androidSdk: m['androidSdk'] as int? ?? 0,
         device: m['device'] as String? ?? '',
+        avfSupported: m['avfSupported'] as bool? ?? false,
+        avfTerminalInstalled: m['avfTerminalInstalled'] as bool? ?? false,
+        avfReason: m['avfReason'] as String? ?? '',
       );
 }
 

@@ -368,6 +368,18 @@ echo UNINSTALL_OK
   }
 
   /// 写入 /root/.gradle/gradle.properties 的 aapt2 覆盖项（宿主机直写 rootfs）。
+  ///
+  /// 公开给**原生 arm64 后端**复用：AGP 9.x 默认从 Maven 拉
+  /// `com.android.tools.build:aapt2::<ver>:linux`（x86_64-only），
+  /// 无论走 QEMU 转发还是原生 arm64，都必须把 AGP 指回 SDK 里那个
+  /// 能在本机跑起来的 aapt2（同一条路径，只是内容不同）。
+  static Future<void> writeAapt2Override(String rootfsPath) =>
+      _writeGradleOverride(rootfsPath);
+
+  /// 移除 gradle 覆盖项（宿主机直写）。
+  static Future<void> removeAapt2Override(String rootfsPath) =>
+      _removeGradleOverride(rootfsPath);
+
   static Future<void> _writeGradleOverride(String rootfsPath) async {
     final f = File('$rootfsPath$gradleProps');
     await f.parent.create(recursive: true);

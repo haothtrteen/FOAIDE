@@ -74,6 +74,18 @@ android {
     }
 }
 
+// 依赖说明（2026-09-17）：本模块**没有任何第三方依赖**，是有意为之。
+//
+// 曾短暂引入过 Kadb（com.flyfishxu:kadb，Apache-2.0）做无线调试 adb，
+// 但它拖进一个 **GPL-3.0** 的传递依赖 spake2-java（且只在 JitPack 发布），
+// 会被 dex 进 App 进程——那是本项目闭源商业化的唯一真阻塞点。
+// 现在 AVF 路线因设备不支持而暂缓、原生 arm64 路线不需要 adb，
+// 整块已移除（含 AdbWireless.kt / adb_bridge.dart / adb_page.dart / vendor_kadb.sh）。
+//
+// ⚠️ 若将来要重新引入任何 AAR/JAR，先跑一遍 dev-handbook/05-许可证合规.md
+// 的「闭源检查清单」：只要出现 GPL/LGPL/AGPL 的**进程内链接**依赖就否决。
+// 独立子进程（proot 里的可执行程序）不在此列——那是「发行义务」而非「传染」。
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

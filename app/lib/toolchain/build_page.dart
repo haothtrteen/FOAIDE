@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import '../filemanager/fs_browser_bridge.dart';
+import 'build_progress.dart';
 import 'toolchain_ensure.dart';
 
 /// Step 6 构建页：项目列表 → 流式构建日志 → 取消 → 安装 APK。
@@ -16,6 +17,15 @@ import 'toolchain_ensure.dart';
 /// - 产物路径 /root/projects/<name>/build/app/outputs/flutter-apk/*.apk，
 ///   安装时用真实宿主路径（rootfsPath + 容器路径）走 FileProvider 拉起系统安装器；
 /// - 离开本页即中止构建（防 gradle daemon 管道泄漏）。
+///
+/// ⚠️ 进度条说明（2026-09-17 增补）：flutter build apk 不输出百分比，
+/// 只能靠日志关键词做「阶段识别 + 阶段内时间插值」——见 build_progress.dart。
+/// 进度条本身不做假匀速，永不封顶，只有真正成功才到 100%。
+///
+/// ⚠️ 长任务与保活：ProotBridge 的 executor 是原生侧单线程队列
+/// （MainActivity.executor = newSingleThreadExecutor），构建期间**整个应用
+/// 所有 proot 调用都会排队**——包括文件浏览器、编辑器格式化、终端。
+/// 这是"长时间占用主界面"的真正根因，详见 dev-handbook 新增章节。
 class BuildPage extends StatefulWidget {
   /// 传入后加载完成即自动开始构建该项目（主页工程卡片直达）。
   final String? initialProject;
@@ -48,11 +58,42 @@ class _BuildPageState extends State<BuildPage> {
   int _offset = 0;
   String? _apkGuest; // 产物容器路径（rootfs 内）
 
+  /// 进度追踪：吃日志行 → 出阶段与百分比（见 build_progress.dart）。
+  final BuildProgressTracker _prog = BuildProgressTracker();
+
+  /// 已构建耗时（秒），用于"仍在运行"提示里的 `已用 mm:ss`。
+  int _elapsedSec = 0;
+  DateTime? _startedAt;
+
+  /// 滚动是否跟随到底部。用户手动上滑看历史时自动关闭，避免被强行拽回。
+  bool _autoScroll = true;
+  bool _showJumpToBottom = false;
+
+  /// 命中的修复建议（去重，最多保留 3 条）。
+  final List<String> _hints = [];
+
   static const int _maxLines = 3000;
 
   @override
   void initState() {
     super.initState();
+    _scroll.addListener(() {
+      if (!_scroll.hasClients) return;
+      final atBottom = _scroll.offset >=
+          _scroll.position.maxScrollExtent - 24;
+      if (atBottom && !_autoScroll) {
+        setState(() {
+          _autoScroll = true;
+          _showJumpToBottom = false;
+        });
+      } else if (!atBottom && _autoScroll) {
+        // 用户主动上滑：暂停自动跟随
+        setState(() {
+          _autoScroll = false;
+          _showJumpToBottom = true;
+        });
+      }
+    });
     _load();
   }
 
@@ -132,6 +173,11 @@ class _BuildPageState extends State<BuildPage> {
       _lines.clear();
       _partial = '';
       _apkGuest = null;
+      _prog.reset();
+      _elapsedSec = 0;
+      _startedAt = DateTime.now();
+      _autoScroll = true;
+      _showJumpToBottom = false;
     });
 
     final proj = '$_projectsDir/${_q(name)}';
@@ -196,19 +242,27 @@ class _BuildPageState extends State<BuildPage> {
       _timer?.cancel();
       setState(() {
         _status = _BuildStatus.error;
+        _prog.markHalted();
         _lines.add('✗ 轮询失败：${poll.error ?? '未知错误'}');
+        _lines.add('  进度已冻结在 ${_prog.percent}%（任务已失联，请重试）');
       });
       return;
     }
     _appendChunk(poll.chunk);
     _offset = poll.len;
+    // 进度插值：日志推进阶段，时间推进阶段内百分比
+    _prog.tick();
+    final started = _startedAt;
+    if (started != null) {
+      _elapsedSec = DateTime.now().difference(started).inSeconds;
+    }
     if (!poll.running) {
       _timer?.cancel();
       final code = poll.exitCode;
       _finish(code);
     } else {
       setState(() {});
-      _scrollToBottom();
+      if (_autoScroll) _scrollToBottom();
     }
   }
 
@@ -220,7 +274,11 @@ class _BuildPageState extends State<BuildPage> {
     for (final p in parts) {
       // 进度条用 \r 原地刷新：只保留最后一段
       final segs = p.split('\r');
-      _lines.add(segs.last);
+      final line = segs.last;
+      _lines.add(line);
+      // 进度识别吃"清洗后"的行：ANSI 已去、\r 段已取末段
+      _prog.feed(line);
+      _feedErrorBreakdown(line);
     }
     if (_lines.length > _maxLines) {
       _lines.removeRange(0, _lines.length - _maxLines);
@@ -228,25 +286,51 @@ class _BuildPageState extends State<BuildPage> {
     }
   }
 
+  /// 从日志里提取"失败类型"，供进度条下方给出可执行的修复建议。
+  /// 只识别本仓库已知的失败模式（见 dev-handbook §十 工具链 / §十一 体积）。
+  void _feedErrorBreakdown(String line) {
+    final l = line.toLowerCase();
+    String? tip;
+    if (l.contains('exec format error')) {
+      tip = '架构不匹配：x64 工具未经 qemu 转发（工具链页 → x64 兼容层 → 重新应用）';
+    } else if (l.contains('shared libraries')) {
+      tip = '多架构运行库缺失：x64 兼容层 → 重新应用';
+    } else if (l.contains('no space left')) {
+      tip = '磁盘空间不足：清理 build/ 与 .gradle 缓存后重试';
+    } else if (l.contains('could not resolve') || l.contains('sslhandshake')) {
+      tip = '依赖下载失败：检查镜像源（工具链页 → Gradle 镜像）';
+    } else if (l.contains('snapshot not compatible')) {
+      tip = 'flutter_tools.snapshot 架构不匹配：x64 兼容层未接管 dart-sdk';
+    }
+    if (tip != null && !_hints.contains(tip)) _hints.add(tip);
+  }
+
   Future<void> _finish(int? code) async {
     if (code == 0) {
       await _locateApk(_active!);
     }
     if (!mounted) return;
+    final ok = code == 0 && _apkGuest != null;
     setState(() {
-      _status = code == 0
-          ? (_apkGuest == null ? _BuildStatus.error : _BuildStatus.done)
-          : _BuildStatus.error;
-      if (_apkGuest == null && code == 0) {
+      if (ok) {
+        // 只有"成功且产物就位"才授予 100%，不动用插值
+        _prog.markDone();
+      } else {
+        _prog.markHalted();
+      }
+      _status = ok ? _BuildStatus.done : _BuildStatus.error;
+      if (code == 0 && _apkGuest == null) {
         _lines.add('✗ 构建成功但未找到 APK 产物');
       } else if (code != 0) {
-        _lines.add('✗ 构建失败（exit ${code ?? -1}）');
+        _lines.add('✗ 构建失败（exit ${code ?? -1}）· 已运行 ${_fmtDur(_elapsedSec)}'
+            ' · 进度冻结在 ${_prog.percent}%');
       } else {
         _lines.add('');
         _lines.add('✓ 构建成功：$_apkGuest');
+        _lines.add('  总耗时 ${_fmtDur(_elapsedSec)}');
       }
     });
-    _scrollToBottom();
+    if (_autoScroll) _scrollToBottom();
   }
 
   /// 在容器内查找 flutter-apk 产物（优先 app-release.apk）。
@@ -275,10 +359,21 @@ class _BuildPageState extends State<BuildPage> {
     if (!mounted) return;
     setState(() {
       _status = _BuildStatus.cancelled;
+      _prog.markHalted();
       _lines.add('');
-      _lines.add('⏹ 已取消（用户中止）');
+      _lines.add('⏹ 已取消（用户中止）· 已运行 ${_fmtDur(_elapsedSec)}');
     });
     _scrollToBottom();
+  }
+
+  /// 秒 → `mm:ss` / `h:mm:ss`。
+  static String _fmtDur(int sec) {
+    final h = sec ~/ 3600;
+    final m = (sec % 3600) ~/ 60;
+    final s = sec % 60;
+    final mm = m.toString().padLeft(2, '0');
+    final ss = s.toString().padLeft(2, '0');
+    return h > 0 ? '$h:$mm:$ss' : '$mm:$ss';
   }
 
   Future<void> _install() async {
@@ -511,38 +606,185 @@ class _BuildPageState extends State<BuildPage> {
               ),
             ),
           ),
+        _buildProgressPanel(building, done, cancelled),
         Expanded(
-          child: Container(
-            margin: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF0C0F13),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.white12),
-            ),
-            child: _lines.isEmpty && building
-                ? const Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(24),
-                      child: CircularProgressIndicator(),
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scroll,
-                    padding: const EdgeInsets.all(10),
-                    itemCount: _lines.length,
-                    itemBuilder: (context, i) => Text(
-                      _lines[i],
-                      style: const TextStyle(
-                        fontSize: 12,
-                        fontFamily: 'monospace',
-                        height: 1.4,
-                        color: Color(0xFFD6DEE8),
+          child: Stack(
+            children: [
+              Container(
+                margin: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0C0F13),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: _lines.isEmpty && building
+                    ? const Center(
+                        child: Padding(
+                          padding: EdgeInsets.all(24),
+                          child: CircularProgressIndicator(),
+                        ),
+                      )
+                    : ListView.builder(
+                        controller: _scroll,
+                        padding: const EdgeInsets.all(10),
+                        itemCount: _lines.length,
+                        itemBuilder: (context, i) => Text(
+                          _lines[i],
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontFamily: 'monospace',
+                            height: 1.4,
+                            color: Color(0xFFD6DEE8),
+                          ),
+                        ),
                       ),
-                    ),
+              ),
+              // 用户上滑看历史时出现"回到底部"，避免被自动滚动拽走
+              if (_showJumpToBottom && _lines.isNotEmpty)
+                Positioned(
+                  right: 22,
+                  bottom: 22,
+                  child: FloatingActionButton.small(
+                    heroTag: 'foa_jump_bottom',
+                    tooltip: '回到底部',
+                    onPressed: () {
+                      setState(() {
+                        _autoScroll = true;
+                        _showJumpToBottom = false;
+                      });
+                      _scrollToBottom();
+                    },
+                    child: const Icon(Icons.arrow_downward, size: 18),
                   ),
+                ),
+            ],
           ),
         ),
       ],
+    );
+  }
+
+  // ============================ 进度面板 ============================
+
+  /// 进度条 + 阶段名 + 计时 + 失败建议。
+  ///
+  /// 为什么不是普通 `LinearProgressIndicator(value: x)`：构建是 20 分钟级
+  /// 长任务，用户最容易误判"卡死"。所以面板同时给出四层信息：百分比、
+  /// 当前阶段、已用时间、"仍在运行"的实时证明（脉冲圆点 + 递增计时）。
+  Widget _buildProgressPanel(bool building, bool done, bool cancelled) {
+    final pct = _prog.percent;
+    final color = done
+        ? const Color(0xFF3DDC84)
+        : building
+            ? const Color(0xFF4C8DFF)
+            : const Color(0xFFFF7A7A);
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF11151B),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (building)
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    valueColor: AlwaysStoppedAnimation<Color>(color),
+                  ),
+                ),
+              if (building) const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  done
+                      ? '构建完成'
+                      : cancelled
+                          ? '已取消'
+                          : building
+                              ? _prog.stage.label
+                              : '构建中断于：${_prog.stage.label}',
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w600, color: color),
+                ),
+              ),
+              Text(
+                '$pct%',
+                style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                    color: color),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: _prog.progress,
+              minHeight: 8,
+              backgroundColor: Colors.white10,
+              valueColor: AlwaysStoppedAnimation<Color>(color),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Icon(Icons.schedule, size: 13, color: Colors.grey.shade500),
+              const SizedBox(width: 4),
+              Text(
+                building
+                    ? '已用 ${_fmtDur(_elapsedSec)}'
+                    : '耗时 ${_fmtDur(_elapsedSec)}',
+                style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+              ),
+              if (building) ...[
+                const SizedBox(width: 10),
+                Text(
+                  '构建为长任务（首次 15~30 分钟），后台仍在运行',
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.grey.shade600,
+                      fontStyle: FontStyle.italic),
+                ),
+              ],
+            ],
+          ),
+          if (!building && _hints.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            const Divider(height: 1),
+            const SizedBox(height: 8),
+            for (final h in _hints.take(3))
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.lightbulb_outline,
+                        size: 13, color: Color(0xFFFFC46B)),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        h,
+                        style: const TextStyle(
+                            fontSize: 11, color: Color(0xFFFFC46B)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ],
+      ),
     );
   }
 }

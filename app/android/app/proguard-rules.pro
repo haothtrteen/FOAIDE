@@ -20,5 +20,8 @@
 #      通常无需规则；如有反射调用插件类再补）----
 # -keep class com.example.some_plugin.** { *; }
 
+# ---- 曾为无线调试 adb 保留 Kadb / spake2 / Elisabeth 的规则已于 2026-09-17 移除 ----
+# （整块功能下线，见 app/build.gradle.kts 顶部的依赖说明）
+
 # ---- 可选：压掉对可选依赖的缺类提示（仅 warning 场景有效，errors 无效）----
 # -dontwarn com.google.android.play.core.**

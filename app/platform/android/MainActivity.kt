@@ -61,6 +61,10 @@ class MainActivity : FlutterActivity() {
         const val PROJECTS_EXTERNAL_NAME = "projects"
         // toExternal 方向跳过这些构建缓存目录，避免污染用户可见区
         val PROJECT_CACHE_DIRS = setOf("build", ".gradle", ".dart_tool")
+        // 原生 arm64 后端：容器内原生产物目录，以及"是否已落位 bionic 版
+        // gen_snapshot"的判定文件（存在即给 proot 追加 /system、/apex 挂载）。
+        const val NATIVE_GEN_SNAPSHOT_REL = "opt/foa-native/gen_snapshot"
+        val NATIVE_BIONIC_BINDS = listOf("/system", "/apex", "/linkerconfig")
     }
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -80,7 +84,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
         MethodChannel(engine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            // 全部放到后台线程执行，避免 ANR
+            // 全部放到后台线程执行，避免 ANR。
             executor.execute {
                 try {
                     when (call.method) {
@@ -383,6 +387,7 @@ class MainActivity : FlutterActivity() {
 
     private fun envInfo(): Map<String, Any?> {
         val rootfs = File(filesDir, ROOTFS_REL)
+        val avf = avfCapability()
         return mapOf(
             "filesDir" to filesDir.absolutePath,
             "cacheDir" to cacheDir.absolutePath,
@@ -395,7 +400,60 @@ class MainActivity : FlutterActivity() {
             "abi" to Build.SUPPORTED_ABIS.firstOrNull(),
             "androidSdk" to Build.VERSION.SDK_INT,
             "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+            // AVF（Android 虚拟化框架）能力检测：只用于「告知用户可否走 AVF 路线」，
+            // 不尝试创建/驱动 VM——普通 App（untrusted_app 域）没有该系统服务的 API 权限。
+            "avfSupported" to avf.supported,
+            "avfTerminalInstalled" to avf.terminalInstalled,
+            "avfReason" to avf.reason,
         )
+    }
+
+    /** AVF 能力探测结果。 */
+    private data class AvfCapability(
+        val supported: Boolean,
+        val terminalInstalled: Boolean,
+        val reason: String,
+    )
+
+    /**
+     * 探测本机是否具备 AVF（Android Virtualization Framework）Linux 开发环境。
+     *
+     * 判据（全部只读，无副作用）：
+     * 1. API ≥ 33（AVF 自 Android 13 引入）；
+     * 2. 存在虚拟化终端 App（com.android.virtualization.terminal，Pixel 的「Linux 开发环境」）；
+     * 3. 内核暴露 pKVM 支持（/proc/version 或只读系统属性）。
+     *
+     * ⚠️ 本函数**只做检测与引导**。不创建 VM、不启动 VM、不调用 virtmgr ——
+     *    这些是特权系统服务的职责，普通应用无 API 可及（详见 AVF集成可行性评估.md）。
+     *    目的是告诉用户「你的设备能不能走 AVF 这条更快的路」，避免瞎折腾。
+     */
+    private fun avfCapability(): AvfCapability {
+        if (Build.VERSION.SDK_INT < 33) {
+            return AvfCapability(false, false, "需要 Android 13+（当前 API ${Build.VERSION.SDK_INT}）")
+        }
+        val terminal = try {
+            packageManager.getPackageInfo("com.android.virtualization.terminal", 0)
+            true
+        } catch (_: Exception) {
+            false
+        }
+        // pKVM 支持：内核启动参数/版本串里带 pkvm 或 hypervisor 标识
+        val kernelEvidences = try {
+            File("/proc/version").readText().lowercase()
+        } catch (_: Exception) {
+            ""
+        }
+        val hasPkvm = kernelEvidences.contains("pkvm") || kernelEvidences.contains("hypervisor")
+        return when {
+            terminal && hasPkvm ->
+                AvfCapability(true, true, "设备支持 AVF，且已安装 Linux 开发环境终端")
+            terminal ->
+                AvfCapability(true, true, "已安装 Linux 开发环境终端（pKVM 标识未在 /proc/version 出现，可能被内核隐藏）")
+            hasPkvm ->
+                AvfCapability(true, false, "设备具备虚拟化能力，但未找到 Linux 开发环境入口")
+            else ->
+                AvfCapability(false, false, "本机未检测到 AVF 支持（需 pKVM 硬件 + 厂商开放入口）")
+        }
     }
 
     /** 外部存储的 app 专属目录：/storage/emulated/0/Android/data/<pkg>（getExternalFilesDir 的父级）。 */
@@ -489,23 +547,64 @@ class MainActivity : FlutterActivity() {
         // 注入 2：加载 /etc/profile.d/foa-env.sh（镜像配置器写入的 Flutter/Dart 镜像、
         // ANDROID_HOME/JAVA_HOME/GRADLE_USER_HOME/PATH），构建命令自动生效。
         val boot = "if ! grep -qE '^nameserver (223\\.5\\.5\\.5|119\\.29\\.29\\.29|8\\.8\\.8\\.8|114\\.114\\.114\\.114|1\\.1\\.1\\.1)' /etc/resolv.conf 2>/dev/null; then printf 'nameserver 223.5.5.5\\nnameserver 119.29.29.29\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; fi; [ -f /etc/profile.d/foa-env.sh ] && . /etc/profile.d/foa-env.sh; "
-        return ProotCmd(
+        val argv = mutableListOf(
+            proot.absolutePath,
+            "-0",
+            "-r", rootfs.absolutePath,
+            "-b", "/dev",
+            "-b", "/proc",
+            "-b", "/sys",
+        )
+        // 原生 arm64 后端（2026-09-18）：Termux 移植来的 gen_snapshot 是
+        // **bionic 链接**的——INTERP 指向 /system/bin/linker64，libc.so 来自
+        // /apex/com.android.runtime/lib64/bionic。而容器 rootfs 是 glibc 的
+        // Debian，压根没有 /system 与 /apex：直接跑会报
+        // "No such file or directory"（连解释器都找不到）或
+        // "CANNOT LINK EXECUTABLE ... library not found"。
+        // 因此只要 /opt/foa-native/gen_snapshot 落位，就把 Android 运行时目录
+        // 只读挂进容器（仅新增挂载点，不动 rootfs 自己的文件，Debian 程序
+        // 不会去 /system 找库，无副作用）。未落位时行为与以前完全一致。
+        if (File(rootfs, NATIVE_GEN_SNAPSHOT_REL).exists()) {
+            for (p in NATIVE_BIONIC_BINDS) {
+                if (File(p).exists()) {
+                    argv.add("-b")
+                    argv.add(p)
+                }
+            }
+        }
+        argv.addAll(
             listOf(
-                proot.absolutePath,
-                "-0",
-                "-r", rootfs.absolutePath,
-                "-b", "/dev",
-                "-b", "/proc",
-                "-b", "/sys",
                 "--link2symlink",
                 "-w", "/root",
                 "/usr/bin/env", "-i",
                 "HOME=/root", "TERM=dumb",
                 "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
                 "/bin/sh", "-c", boot + command,
-            ),
-            null,
+            )
         )
+        return ProotCmd(argv, null)
+    }
+
+    /**
+     * proot 进程需要的 LD_LIBRARY_PATH（Bug 210：filesDir/tools 里的
+     * libtalloc.so.2 / libandroid-shmem.so）。
+     *
+     * 落位了 bionic 原生产物时，额外追加 Android 运行时库搜索路径——
+     * bionic 的 linker 默认搜索路径由 /linkerconfig 决定，容器里拿不到
+     * （proot 不实现 linkerconfig），显式给一份最稳。
+     */
+    private fun libraryPath(): String {
+        val base = File(filesDir, "tools").absolutePath
+        if (!File(File(filesDir, ROOTFS_REL), NATIVE_GEN_SNAPSHOT_REL).exists()) {
+            return base
+        }
+        val extra = listOf(
+            "/apex/com.android.runtime/lib64/bionic",
+            "/apex/com.android.art/lib64",
+            "/system/lib64",
+            "/vendor/lib64",
+        ).filter { File(it).exists() }.joinToString(":")
+        return if (extra.isEmpty()) base else "$base:$extra"
     }
 
     private fun exec(command: String, timeoutSec: Long): Map<String, Any> {
@@ -521,7 +620,8 @@ class MainActivity : FlutterActivity() {
             // Bug 210：proot 的 DT_NEEDED 含 libtalloc.so.2 / libandroid-shmem.so，
             // Android 系统目录没有这两个库 → 注入 LD_LIBRARY_PATH 让 linker
             // 到 filesDir/tools 找（对主二进制的依赖查找同样生效）。
-            pb.environment()["LD_LIBRARY_PATH"] = File(filesDir, "tools").absolutePath
+            // 若落位了 bionic 原生产物，还会追加 Android 运行时库目录（见 libraryPath）。
+            pb.environment()["LD_LIBRARY_PATH"] = libraryPath()
             // Bug 211：Termux 版 proot 编译时把临时目录硬编码为
             // /data/data/com.termux/files/usr/tmp/，其他应用无写权限 →
             // proot error: can't create glue rootfs。PROOT_TMP_DIR 重定向到
@@ -579,7 +679,7 @@ class MainActivity : FlutterActivity() {
         return try {
             val pb = ProcessBuilder(built.cmd)
             findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
-            pb.environment()["LD_LIBRARY_PATH"] = File(filesDir, "tools").absolutePath
+            pb.environment()["LD_LIBRARY_PATH"] = libraryPath()
             val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
             pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
             pb.redirectErrorStream(true) // 合并：gradle/flutter 多线程输出交错，单流保时序

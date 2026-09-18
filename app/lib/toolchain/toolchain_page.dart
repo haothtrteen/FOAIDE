@@ -4,6 +4,7 @@ import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import 'jdk_installer.dart';
 import 'local_install_picker.dart';
+import 'native_arm64.dart';
 import 'qemu_compat.dart';
 import 'sdk_downloader.dart';
 import 'sdk_installer.dart';
@@ -65,6 +66,23 @@ enum MirrorPhase {
   error,
 }
 
+/// 原生 arm64 阶段。
+///
+/// 注意：这里只有「体检」一种动作（只读）。原生产物落位属于后续步骤，
+/// 体检结果决定要不要走那条路——先看清楚现状再动手。
+enum NativePhase {
+  idle,
+  auditing, // 只读体检
+  apt, // 容器内补原生运行库（libstdc++6 等）
+  downloading,
+  importing, // 本地文件导入 + 校验
+  extracting, // 解 tar.xz 到 /opt/foa-native
+  deploying, // 落到 build-tools + 冒烟
+  installed, // /opt/foa-native 已落位
+  uninstalling,
+  error,
+}
+
 /// x64 兼容层(QEMU)阶段。
 enum QemuPhase {
   idle,
@@ -121,6 +139,16 @@ class _ToolchainPageState extends State<ToolchainPage> {
   String _qemuError = '';
   bool _qemuVerifying = false;
 
+  // ---- 原生 arm64 ----
+  NativePhase _nativePhase = NativePhase.idle;
+  String _nativeInfo = '';
+  String _nativeError = '';
+  bool _nativeAuditing = false;
+  NativeAudit? _nativeAudit;
+  DownloadProgress? _nativeProgress;
+  final Set<String> _nativeMirrors = {};
+  DownloadCancelToken? _nativeToken;
+
   @override
   void initState() {
     super.initState();
@@ -141,6 +169,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
           ? await MirrorConfigurator.verify(_bridge, env)
           : null;
       final q = env.rootfsInstalled ? await QemuCompat.verify(_bridge) : null;
+      final nv =
+          env.rootfsInstalled ? await NativeArm64.verify(_bridge) : null;
       if (!mounted) return;
       setState(() {
         _env = env;
@@ -154,6 +184,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
         _mirrorInfo = m ?? '';
         _qemuPhase = q == null ? QemuPhase.idle : QemuPhase.installed;
         _qemuInfo = q ?? '';
+        _nativePhase = nv == null ? NativePhase.idle : NativePhase.installed;
+        _nativeInfo = nv ?? '';
       });
     } catch (e) {
       if (!mounted) return;
@@ -737,6 +769,184 @@ class _ToolchainPageState extends State<ToolchainPage> {
     }
   }
 
+  // ============================ 原生 arm64 ============================
+
+  NativePhase _nativePhaseFrom(String p) => switch (p) {
+        'apt' => NativePhase.apt,
+        'downloading' => NativePhase.downloading,
+        'importing' => NativePhase.importing,
+        'extracting' => NativePhase.extracting,
+        'deploying' => NativePhase.deploying,
+        _ => NativePhase.idle,
+      };
+
+  Future<void> _nativeInstall({bool local = false}) async {
+    String? localPath;
+    if (local) {
+      final picked = await LocalInstallPicker.pickInstallFile();
+      if (!mounted) return;
+      if (!picked.ok || picked.path == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(picked.error ?? '未选择文件')),
+        );
+        return;
+      }
+      localPath = picked.path;
+    }
+    setState(() {
+      _nativePhase =
+          local ? NativePhase.importing : NativePhase.downloading;
+      _nativeProgress = null;
+      _nativeError = '';
+      _nativeMirrors.clear();
+    });
+    _nativeToken = DownloadCancelToken();
+    try {
+      final env = await _bridge.envInfo();
+      if (local) {
+        await NativeBuildTools.installFromLocalFile(
+          _bridge,
+          env,
+          localPath!,
+          onPhase: (p) {
+            if (!mounted) return;
+            setState(() => _nativePhase = _nativePhaseFrom(p));
+          },
+        );
+      } else {
+        await NativeBuildTools.install(
+          _bridge,
+          env,
+          token: _nativeToken,
+          onPhase: (p) {
+            if (!mounted) return;
+            setState(() => _nativePhase = _nativePhaseFrom(p));
+          },
+          onProgress: (p) {
+            if (!mounted) return;
+            setState(() => _nativeProgress = p);
+          },
+          onMirrorUsed: (m) {
+            if (!mounted) return;
+            setState(() => _nativeMirrors.add(m.name));
+          },
+        );
+      }
+      if (!mounted) return;
+      final v = await NativeArm64.verify(_bridge);
+      setState(() {
+        _nativePhase = NativePhase.installed;
+        _nativeInfo = v ?? '已落位';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _nativePhase = NativePhase.error;
+        _nativeError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _nativeCancel() async {
+    _nativeToken?.cancel();
+    setState(() => _nativePhase = NativePhase.idle);
+  }
+
+  /// 导入原生 gen_snapshot（**有门禁**：先讲清风险再让用户选文件）。
+  Future<void> _nativeImportGenSnapshot() async {
+    final ok = await _confirm(
+      '导入原生 gen_snapshot',
+      'gen_snapshot 是 Flutter AOT 编译的核心宿主工具，Google 不发布 arm64 版本，'
+          '只能取第三方移植产物（如 Termux 系的 Flutter aarch64 构建）。\n\n'
+          '请你自己准备好这个文件后点「确定」再选择它。导入后会立即做两件事：\n'
+          '  1. 校验必须是 aarch64 ELF；\n'
+          '  2. 实跑一次 --help 冒烟。\n'
+          '冒烟不过会当场撤销落位，不会留下半吊子状态。\n\n'
+          '注意：Termux 系二进制是 bionic 链接的，运行时需要容器内可见 '
+          '/system 与 /apex（原生层会自动追加挂载）。',
+    );
+    if (!ok) return;
+    final picked = await LocalInstallPicker.pickInstallFile();
+    if (!mounted) return;
+    if (!picked.ok || picked.path == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(picked.error ?? '未选择文件')),
+      );
+      return;
+    }
+    setState(() {
+      _nativePhase = NativePhase.importing;
+      _nativeError = '';
+    });
+    try {
+      final env = await _bridge.envInfo();
+      final msg =
+          await NativeGenSnapshot.importFromLocalFile(_bridge, env, picked.path!);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg), duration: const Duration(seconds: 6)),
+      );
+      await _nativeRunAudit();
+      await _refreshAll();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _nativePhase = NativePhase.error;
+        _nativeError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _nativeUninstall() async {
+    final ok = await _confirm(
+      '卸载原生产物',
+      '将还原 build-tools 里的 x64 原件，并删除 /opt/foa-native'
+      '（含已导入的 gen_snapshot），确定？',
+    );
+    if (!ok) return;
+    setState(() => _nativePhase = NativePhase.uninstalling);
+    try {
+      final env = await _bridge.envInfo();
+      await NativeBuildTools.uninstall(_bridge, env);
+      await _refreshAll();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _nativePhase = NativePhase.error;
+        _nativeError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _nativeRunAudit() async {
+    setState(() {
+      _nativeAuditing = true;
+      _nativeError = '';
+    });
+    try {
+      final env = await _bridge.envInfo();
+      if (!env.rootfsInstalled) {
+        throw DownloadException('rootfs 未安装，请先在主页初始化环境');
+      }
+      final a = await NativeArm64.audit(_bridge);
+      final v = await NativeArm64.verify(_bridge);
+      if (!mounted) return;
+      setState(() {
+        _nativeAuditing = false;
+        _nativeAudit = a;
+        _nativePhase = v == null ? NativePhase.idle : NativePhase.installed;
+        _nativeInfo = v ?? '';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _nativeAuditing = false;
+        _nativePhase = NativePhase.error;
+        _nativeError = '体检失败：$e';
+      });
+    }
+  }
+
   // ============================ 构建镜像配置 ============================
 
   MirrorPhase _mirrorPhaseFrom(String p) => switch (p) {
@@ -846,8 +1056,12 @@ class _ToolchainPageState extends State<ToolchainPage> {
   @override
   Widget build(BuildContext context) {
     final rootfsReady = _env?.rootfsInstalled == true;
-    // 顺序门控：SDK 工具为 x64 宿主二进制，须先应用兼容层再装 SDK。
-    final sdkOrderReady = _qemuPhase == QemuPhase.installed;
+    // 顺序门控：SDK 工具为 x64 宿主二进制，**两种后端任一就绪**即可装 SDK：
+    //   ① 走 QEMU 兼容层 → x64 二进制经 qemu 转发可执行；
+    //   ② 走原生 arm64   → 二进制本身就是 aarch64，无需转发。
+    // 二者是可切换的并行后端，不是先后依赖。
+    final sdkOrderReady =
+        _qemuPhase == QemuPhase.installed || _nativePhase == NativePhase.installed;
     return Scaffold(
       appBar: AppBar(title: const Text('工具链')),
       body: ListView(
@@ -862,6 +1076,24 @@ class _ToolchainPageState extends State<ToolchainPage> {
             onApply: _qemuApply,
             onVerify: _qemuVerify,
             onUninstall: _qemuUninstall,
+          ),
+          const SizedBox(height: 12),
+          _NativeCard(
+            phase: _nativePhase,
+            audit: _nativeAudit,
+            info: _nativeInfo,
+            error: _nativeError,
+            rootfsReady: rootfsReady,
+            auditing: _nativeAuditing,
+            progress: _nativeProgress,
+            mirrorName: _nativeMirrors.join(' + '),
+            hasGenSnapshot: _nativeAudit?.probe('native:gen_snapshot') != null,
+            onAudit: _nativeRunAudit,
+            onInstall: () => _nativeInstall(),
+            onInstallLocal: () => _nativeInstall(local: true),
+            onImportGenSnapshot: _nativeImportGenSnapshot,
+            onCancel: _nativeCancel,
+            onUninstall: _nativeUninstall,
           ),
           const SizedBox(height: 12),
           _JdkCard(
@@ -895,8 +1127,11 @@ class _ToolchainPageState extends State<ToolchainPage> {
             verifying: _asdkVerifying,
             rootfsReady: rootfsReady,
             orderReady: sdkOrderReady,
-            orderHint: '需先应用上方「x64 兼容层(QEMU)」再安装：aapt2/adb 为 '
-                'x64 宿主二进制，无 QEMU 转发无法执行，构建会失败。',
+            orderHint: '需先启用一套后端（上方「x64 兼容层(QEMU)」或「原生 arm64」）'
+                '再安装：aapt2/adb 默认是 x64 宿主二进制，'
+                '既没 QEMU 转发又没换原生版就无法执行。\n'
+                '⚠️ 现阶段原生后端只覆盖 build-tools 四件套（aapt2/aidl/zipalign/'
+                'split-select），adb 仍是 x64——建议两套都启用：QEMU 兜底、原生提速。',
             onInstall: _asdkInstall,
             onVerify: _asdkVerify,
             onCancel: _asdkCancel,
@@ -924,7 +1159,9 @@ class _ToolchainPageState extends State<ToolchainPage> {
             rootfsReady: rootfsReady,
             orderReady: sdkOrderReady,
             orderHint: '需先应用上方「x64 兼容层(QEMU)」再安装：flutter_tools.snapshot '
-                '为 x64 快照，dart 须经 QEMU 转发后才不会报 "Snapshot not compatible"。\n'
+                '为 x64 快照、dart 也是 x64 宿主二进制，'
+                '目前**只能**靠 QEMU 转发（原生 arm64 的 dart 替换 + 快照重建尚未实现，'
+                '不做就不会有 "原生提速"）。\n'
                 '若已装反顺序无需卸载——点兼容层「重新应用」会自动补上转发。',
             onInstall: _flInstall,
             onVerify: _flVerify,
@@ -943,7 +1180,453 @@ class _ToolchainPageState extends State<ToolchainPage> {
             onVerify: _mirrorVerify,
             onCancel: _mirrorCancel,
           ),
+          const SizedBox(height: 12),
+          _AvfCard(env: _env),
         ],
+      ),
+    );
+  }
+}
+
+// ============================ 原生 arm64 体检卡片 ============================
+
+/// 原生 arm64 体检卡（**只读**）。
+///
+/// 只回答一个问题：现在这套构建链里，哪些二进制是 aarch64 原生、
+/// 哪些还是 x86-64（靠 QEMU 模拟）。落位原生产物是后续步骤的事——
+/// 先看清楚现状，再决定要不要换后端。
+class _NativeCard extends StatelessWidget {
+  final NativePhase phase;
+  final NativeAudit? audit;
+  final String info;
+  final String error;
+  final bool rootfsReady;
+  final bool auditing;
+  final DownloadProgress? progress;
+  final String mirrorName;
+  final bool hasGenSnapshot;
+  final VoidCallback onAudit;
+  final VoidCallback onInstall;
+  final VoidCallback onInstallLocal;
+  final VoidCallback onImportGenSnapshot;
+  final VoidCallback onCancel;
+  final VoidCallback onUninstall;
+
+  const _NativeCard({
+    required this.phase,
+    required this.audit,
+    required this.info,
+    required this.error,
+    required this.rootfsReady,
+    required this.auditing,
+    required this.progress,
+    required this.mirrorName,
+    required this.hasGenSnapshot,
+    required this.onAudit,
+    required this.onInstall,
+    required this.onInstallLocal,
+    required this.onImportGenSnapshot,
+    required this.onCancel,
+    required this.onUninstall,
+  });
+
+  bool get _busy => phase == NativePhase.auditing ||
+      phase == NativePhase.apt ||
+      phase == NativePhase.downloading ||
+      phase == NativePhase.importing ||
+      phase == NativePhase.extracting ||
+      phase == NativePhase.deploying ||
+      phase == NativePhase.uninstalling;
+
+  String get _statusLabel => switch (phase) {
+        NativePhase.installed => '原生产物已落位',
+        NativePhase.auditing => '正在体检…',
+        NativePhase.apt => '补齐原生运行库…',
+        NativePhase.downloading => '下载 arm64 build-tools…',
+        NativePhase.importing => '导入本地文件…',
+        NativePhase.extracting => '解包到 /opt/foa-native…',
+        NativePhase.deploying => '落位到 build-tools + 冒烟…',
+        NativePhase.uninstalling => '正在卸载…',
+        NativePhase.error => '失败',
+        NativePhase.idle => '原生后端未启用（可先体检）',
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    final a = audit;
+    final color = switch (phase) {
+      NativePhase.installed => const Color(0xFF3DDC84),
+      NativePhase.error => const Color(0xFFFF7A7A),
+      _ => Colors.blueAccent,
+    };
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  switch (phase) {
+                    NativePhase.installed => Icons.check_circle,
+                    NativePhase.error => Icons.error_outline,
+                    _ => Icons.speed,
+                  },
+                  color: color,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _statusLabel,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(99),
+                  ),
+                  child: Text(
+                    a == null
+                        ? '未体检'
+                        : (a.buildReady ? '可全原生构建' : '仍有模拟环节'),
+                    style: TextStyle(
+                        fontSize: 11, fontWeight: FontWeight.w600, color: color),
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 20),
+            if (phase == NativePhase.installed && info.isNotEmpty)
+              _kv('落位', info),
+            if (a != null) ...[
+              _kv('总览', a.overview),
+              _kv('dart 目标架构',
+                  a.dartTargetArch.isEmpty ? '未知' : a.dartTargetArch),
+              _kv('readelf',
+                  a.readelfAvailable ? '可用（DT_NEEDED 精确）' : '缺失（needed 为粗扫）'),
+              const SizedBox(height: 8),
+              const Divider(height: 1),
+              const SizedBox(height: 6),
+              for (final p in a.probes) _probeRow(p),
+              const SizedBox(height: 4),
+              Text(
+                a.buildReady
+                    ? '构建链上必须原生的几项（dart / 快照架构 / gen_snapshot / '
+                        'aapt2 / zipalign）均为 aarch64，理论上可去掉 QEMU。'
+                    : '构建链上仍有非原生环节（dart / 快照架构 / gen_snapshot / '
+                        'aapt2 / zipalign 任一未原生），这部分仍需 QEMU 转发。',
+                style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+              ),
+            ],
+            if (_busy) ...[
+              const SizedBox(height: 12),
+              LinearProgressIndicator(
+                minHeight: 6,
+                value: progress?.fraction,
+                borderRadius: const BorderRadius.all(Radius.circular(3)),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                switch (phase) {
+                  NativePhase.auditing =>
+                    '正在读取各二进制的 ELF 头与依赖（dart --version 最慢，约 1 分钟）',
+                  NativePhase.downloading =>
+                    'arm64 build-tools 约 3.2MB${mirrorName.isEmpty ? '' : ' · 源：$mirrorName'}',
+                  NativePhase.importing => '校验本地文件…',
+                  NativePhase.apt => '容器内 apt 安装 libstdc++6 / zlib1g',
+                  NativePhase.extracting => '解包 + 校验架构（必须 aarch64）',
+                  NativePhase.deploying => '备份 x64 原件为 .foa-x64 后覆盖',
+                  _ => '处理中…',
+                },
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
+            if (phase == NativePhase.error && error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SelectableText(error,
+                  style: const TextStyle(
+                      fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+            const SizedBox(height: 12),
+            Text(
+              '为什么看这个：当前构建链是「官方 x64 SDK + QEMU 动态翻译」，'
+              '每层模拟都有性能损耗。逐个把关键宿主二进制换成 aarch64 原生，'
+              '就能相应减少翻译层。\n'
+              '已原生：java（有 aarch64 JDK）、gradle/d8/R8（纯 JVM）、'
+              'dart（有 linux_arm64 发行版）。\n'
+              '可原生：aapt2 / aidl / zipalign / split-select（第三方 arm64 构建）。\n'
+              '唯一硬缺口：gen_snapshot（Google 不发布 arm64），只能取移植版，'
+              '且要注意它可能是 **bionic 链接**（Termux 产物），需要容器能看见 '
+              '/system / /apex 才能跑。\n'
+              '⚠️ 现阶段是**混合模式**（最小侵入）：本卡片只负责 build-tools 四件套'
+              '与可选 gen_snapshot，dart / flutter_tools 仍走 QEMU 转发——'
+              '两套后端共存，谁覆盖了谁就少一层翻译。\n'
+              '体检本身只读，不会修改任何文件。',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+            ),
+            const SizedBox(height: 16),
+            if (phase == NativePhase.downloading) ...[
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: onCancel,
+                  icon: const Icon(Icons.close, size: 18),
+                  label: const Text('取消下载'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFFFF7A7A),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: rootfsReady && !_busy ? onAudit : null,
+                icon: const Icon(Icons.search, size: 18),
+                label: Text(
+                    phase == NativePhase.auditing ? '体检中…' : (a == null ? '开始体检' : '重新体检')),
+              ),
+            ),
+            const SizedBox(height: 8),
+            if (phase == NativePhase.installed) ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _busy ? null : onUninstall,
+                      icon: const Icon(Icons.delete_outline, size: 18),
+                      label: const Text('卸载'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFFFF7A7A),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ] else ...[
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: rootfsReady && !_busy ? onInstall : null,
+                      icon: const Icon(Icons.download_outlined, size: 18),
+                      label: const Text('原生化 build-tools'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: rootfsReady && !_busy ? onInstallLocal : null,
+                      icon: const Icon(Icons.folder_open_outlined, size: 18),
+                      label: const Text('本地导入'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 8),
+            const Divider(height: 1),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'gen_snapshot（唯一硬缺口，无自动下载源）',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: rootfsReady && !_busy && !hasGenSnapshot
+                      ? onImportGenSnapshot
+                      : null,
+                  icon: Icon(
+                    hasGenSnapshot ? Icons.check_circle : Icons.file_upload_outlined,
+                    size: 18,
+                  ),
+                  label: Text(hasGenSnapshot ? '已原生化' : '本地导入'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: hasGenSnapshot
+                        ? const Color(0xFF3DDC84)
+                        : const Color(0xFFFFC46B),
+                  ),
+                ),
+              ],
+            ),
+            if (!rootfsReady) ...[
+              const SizedBox(height: 8),
+              const Text('请先在主页初始化 rootfs 环境',
+                  style: TextStyle(fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _probeRow(NativeProbe p) {
+    final c = p.native
+        ? const Color(0xFF3DDC84)
+        : (p.kind == NativeProbeKind.qemuWrapper
+            ? Colors.orangeAccent
+            : (p.kind == NativeProbeKind.missing
+                ? Colors.grey.shade600
+                : const Color(0xFFFF7A7A)));
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 6,
+            height: 6,
+            margin: const EdgeInsets.only(top: 5),
+            decoration: BoxDecoration(color: c, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 150,
+            child: Text(p.name,
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade300)),
+          ),
+          Expanded(
+            child: Text(p.summary,
+                style: TextStyle(
+                    fontSize: 11, fontFamily: 'monospace', color: c)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 100,
+              child: Text(k,
+                  style: TextStyle(color: Colors.grey.shade400, fontSize: 13)),
+            ),
+            Expanded(
+                child: Text(v,
+                    style: const TextStyle(
+                        fontSize: 12, fontFamily: 'monospace'))),
+          ],
+        ),
+      );
+}
+
+// ============================ AVF 能力卡片 ============================
+
+/// AVF（Android 虚拟化框架）能力检测卡。
+///
+/// ⚠️ 本卡片**只做能力告知，不做任何 VM 操作**。
+/// AVF 的虚拟机由特权系统服务（virtmgr / VirtualizationService）管理，
+/// 普通应用（untrusted_app 域）没有创建或驱动 VM 的公开 API。
+/// 这里能做的只有：探测设备是否具备条件 → 告诉用户"能不能走这条路"，
+/// 避免用户在硬件不支持时白折腾。
+///
+/// 详见《AVF集成可行性评估.md》
+class _AvfCard extends StatelessWidget {
+  final EnvInfo? env;
+
+  const _AvfCard({this.env});
+
+  @override
+  Widget build(BuildContext context) {
+    final e = env;
+    final supported = e?.avfSupported == true;
+    final installed = e?.avfTerminalInstalled == true;
+    final reason = e?.avfReason ?? '正在检测…';
+
+    final color = supported
+        ? (installed ? const Color(0xFF3DDC84) : const Color(0xFFFFC46B))
+        : Colors.grey.shade600;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.memory, color: color, size: 20),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text('AVF 虚拟化能力检测',
+                      style: TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.bold)),
+                ),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(99),
+                  ),
+                  child: Text(
+                    supported ? (installed ? '可用' : '部分可用') : '不支持',
+                    style: TextStyle(
+                        fontSize: 11, fontWeight: FontWeight.w600, color: color),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              reason,
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade400),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              '⏸ 本路线已暂停（2026-09-17）：实测设备用不了 AVF，故不再推进。'
+              '当前提速方向改为上面的「原生 arm64」——把构建链里的宿主二进制'
+              '逐个换成 aarch64 原生，减少 QEMU 转译层。\n\n'
+              'AVF 是什么：Android 13+ 的「Linux 开发环境」提供的真 Linux 内核'
+              '虚拟机（pKVM），没有 proot 的 syscall 翻译开销，构建速度优于当前方案。\n\n'
+              '⚠️ 为什么 App 不能自动用它：AVF 的虚拟机由系统特权服务管理，'
+              '普通应用没有创建/驱动 VM 的 API 权限。这条路线需要你手动操作：\n'
+              '  设置 → 开发者选项 → Linux 开发环境 → 启用\n'
+              '→ 在系统「终端」App 里进入 Debian VM\n'
+              '→ 在 VM 内自行安装 Flutter 环境后构建。\n\n'
+              '本卡片仅做能力告知，不代表本 App 可代为驱动 VM。',
+              style: TextStyle(
+                  fontSize: 11, height: 1.6, color: Colors.grey.shade500),
+            ),
+            if (supported && !installed) ...[
+              const SizedBox(height: 10),
+              const Divider(height: 1),
+              const SizedBox(height: 8),
+              const Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.lightbulb_outline,
+                      size: 14, color: Color(0xFFFFC46B)),
+                  SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '设备具备虚拟化能力，但未找到 Linux 开发环境入口。'
+                      '部分厂商 ROM 未开放该选项——可尝试在开发者选项中搜索'
+                      '「Linux」或升级系统。',
+                      style: TextStyle(
+                          fontSize: 11, color: Color(0xFFFFC46B)),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
