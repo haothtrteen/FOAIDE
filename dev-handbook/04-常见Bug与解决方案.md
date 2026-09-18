@@ -1430,6 +1430,71 @@ NDK_STUB_PRESENT / 解析出的版本 `28.2.13676358` 与插件源码一致）�
 **目录形态差异**（ndk 目录有无）。另外：能"让工具判定已装"时，
 就用最小桩替代真的去装——桩是可控的，自动补装不是。
 
+### Bug 428：precache 覆写 qemu 转发脚本——AOT 编译段 SIGILL（真机 47% 崩）
+
+**症状**（2026-09-18 真机 alpha.38，Bug 427 修复后推进到 AOT 编译段）：
+
+```
+Dart snapshot generator failed with exit code -4
+impellerc failure:
+Target android_aot_release_android-arm64 failed: Exception:
+  AOT snapshotter exited with code -4
+Target aot_android_asset_bundle failed: ShaderCompilerException:
+  Shader compilation of ".../ink_sparkle.frag" ... failed with exit code -4
+BUILD FAILED ... Running Gradle task 'assembleRelease'... 227.7s
+```
+
+**根因链**（三段）：
+1. `exit code -4` = SIGILL（128+4）。**两个不同工具**（`gen_snapshot`
+   AOT 编译器 + `impellerc` shader 编译器）同时挂、同一信号 →
+   强烈指向**架构不匹配**而非工具自身 bug；
+2. 实证架构：`android-arm64-release/**linux-x64**/gen_snapshot` 与
+   `linux-x64/impellerc` 均为 **x86-64 ELF**。路径里的 `linux-x64`
+   = **运行在 x86_64 宿主上**。这是 Flutter 官方长期现状（02 号文档
+   §7.1 已记录：Android gen_snapshot 全平台只有 x64 宿主版，
+   `flutter_cache.dart` 的 `_linuxBinaryDirs` 硬编码只下 `linux-x64`）；
+3. arm64 真机必须靠 **qemu 转发**（本仓库 `QemuCompat` 兼容层已有此
+   设计）。但 `artifacts.dart` L510-521 只对 **darwin_arm64** 做了 x64
+   回退、**linux_arm64 没有**（上游 TODO: flutter/flutter#152281），
+   于是 arm64 宿主上 Flutter 去 `linux-arm64/` 找 gen_snapshot——而
+   **`flutter precache` 会往该目录写它下载的真 x64 二进制**，
+   **覆盖掉兼容层先前放的 qemu 转发脚本**。
+
+**触发条件（真机实证）**：用户"**先应用 x64 兼容层、后下载 SDK**"——
+工具链卡片当时验证通过（"gen_snapshot 冒烟通过"），但后续 precache
+把 `linux-arm64/` 的转发脚本冲掉，构建时跑到真 x64 二进制 → SIGILL。
+
+**为什么旧逻辑修不回来**：包装脚本用
+`[ -f "$w" ] || gen "$w" "$f"` 判定——**「文件存在」即跳过**。precache
+覆写后文件**存在但内容是错的**，重应用兼容层也永远跳过 → 永久卡死。
+（幂等设计的反面：应判定"是否已是我们的产物"，而非"是否存在"。）
+
+**附带发现**：工具链卡片的 `GEN_SNAPSHOT` 冒烟检查也有漏洞——它只查
+输出里有无 `cannot execute`/`Exec format` 字样，而 **SIGILL 是运行时
+崩溃、输出为空**，被误判成"通过"，掩盖了问题。
+
+**解决**（alpha.39，两层）：
+1. **判定修正**：`engineWrapScript` / `_flutterWrapScript` /
+   `_sdkWrapScript` 全部改为「`head -c 2` 是否为 `#!`」判定——已是
+   转发脚本才跳过，被覆写/不存在则重建；
+2. **构建前自愈**：新增 `ToolchainEnsure.qemuCompatEnsure()`——检测
+   `linux-arm64/gen_snapshot` 是否仍为脚本形态，失效则幂等重建
+   （`engineWrapScript` 由私有转公开供复用）；BuildRunner 接入
+   （CA/init.gradle/NDK 之后）。冒烟检查同步修正（空输出或
+   rc ≥ 128 判为未就位）。
+
+**验证**：shell 四场景模拟（全新 WRAPPED=1 / 幂等重跑 =0 /
+precache 覆写后 =1 恢复为 `#!` / **旧逻辑同场景 =0 修不回来**）；
+`qemu_compat_test.dart` 固化（禁止 `[ -f "$w" ] || gen` 回归、
+必须 `#!` 检测、分诊识别 `exit code -4` 三种日志形态）。
+
+**教训**：这是**同一模式第四次重演**——"环境会被后续操作覆写，必须在
+构建前重新确保"（Bug 425 CA 证书 / Bug 426 init.gradle / Bug 427 NDK
+占位 / Bug 428 转发脚本）。凡是"点一次按钮配好环境"的设计，
+都要问一句：**后续哪个操作会把它冲掉？** 另外：幂等判定必须
+校验**产物内容特征**，`[ -f ]` 这种"存在性"判定在可被覆写的场景里
+是错误的不变量。
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
