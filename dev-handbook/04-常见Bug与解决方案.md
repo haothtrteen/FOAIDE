@@ -1277,6 +1277,44 @@ exit 69 / 第 5 次成功后源保留复用）。
 "这个值在哪一层产生"——shell 产生的必须转义（留 `$x` 给 shell 求值），
 Dart 产生的必须插值；纯文本拼接的 shell 命令至少要有文本断言单测。
 
+### Bug 425：容器无 CA 根证书——pub 对任何 https 源 100% 失败（真机三连卡 4%）
+
+**症状**（2026-09-18 真机 alpha.33/34/35 连续三个版本）：构建卡 4%
+（pub get 阶段）分钟级到 20 分钟，日志全是：
+
+```
+Got TLS error trying to find package archive at https://pub.flutter-io.cn
+（随后清华、中科大源同样 TLS error——多源轮换六连败 → exit 69）
+```
+
+**根因**（解包 rootfs 实证）：debian minbase rootfs **不含
+ca-certificates**——tar 内 `/etc/ssl`、CA 相关条目数为 **0**。dart 的
+TLS 证书校验读系统根证书，一个都没有 → **任何** https 源握手必失败。
+Bug 423 的多源轮换方向正确但对象错了：这不是"某个源不可达"，是
+"所有 https 都不可信"。
+
+**为什么三个信号共同掩盖根因**：
+1. gradle 依赖解析正常——JDK 自带 cacerts（不读系统 CA），给人
+   "容器 TLS 没问题"的假象；
+2. apt 安装正常——debian 源走 http（Bug 419 时代配的镜像），
+   根本不做 TLS；
+3. 错误文案 `Got TLS error` 与弱网丢握手包**一模一样**，此前
+   真机确实是 50KB/s 弱网（Bug 423 的真实案例），先入为主了。
+
+**解决**（alpha.36，三层）：
+1. `ToolchainEnsure.caCerts()` 构建前预检+自愈：已就位秒过 →
+   apt 在线装 ca-certificates（http 源可用）→ apt 失败时把 App
+   内置 Mozilla bundle（assets/ca/ca-bundle.crt，147 证书 220KB，
+   随包分发）直接写进容器 `/etc/ssl/certs/`（rootfs 树宿主可见）；
+2. proot 构建命令带 `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`
+   双保险（dart 显式读此环境变量，默认路径探测偏差也能兜住）；
+3. 分诊 hint 更新为"alpha.36 起自动确保根证书"语义。
+
+**教训**：自建最小 rootfs 时列一份"TLS 栈清单"——CA 证书、时钟
+（时间错导致证书 not-yet-valid）、DNS 解析；三个"看起来正常"的旁路
+信号（JDK 自带 cacerts / http 源 / 弱网历史）叠加时，先怀疑共同
+前提（系统级 TLS 材料），别在应用层（换源/重试）打转。
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
