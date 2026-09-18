@@ -4,7 +4,13 @@ import 'package:provider/provider.dart';
 
 import 'core/theme.dart';
 import 'env/env_installer.dart';
+import 'toolchain/build_notify.dart';
+import 'toolchain/build_page.dart';
 import 'ui/home_page.dart';
+
+/// 全局导航钥匙：通知点击回构建页（BuildNotify.onNavigate）用，
+/// BuildRunner 与通知路径不持有 BuildContext，只能走根 navigator。
+final GlobalKey<NavigatorState> foaNavigatorKey = GlobalKey<NavigatorState>();
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,8 +33,33 @@ void main() {
   runApp(const FoaApp());
 }
 
-class FoaApp extends StatelessWidget {
+class FoaApp extends StatefulWidget {
   const FoaApp({super.key});
+
+  @override
+  State<FoaApp> createState() => _FoaAppState();
+}
+
+class _FoaAppState extends State<FoaApp> {
+  @override
+  void initState() {
+    super.initState();
+    // alpha.31 构建通知：点通知回构建页。
+    // 两条路径：① App 前台，原生 onNewIntent 反向 invoke「navigate」；
+    // ② 冷启动点通知，Dart handler 未注册时原生先存 pendingNavigate，
+    //    这里首帧后主动拉取一次（takeNavigate）。
+    BuildNotify.ensureHandler();
+    BuildNotify.onNavigate = _openBuildPage;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (await BuildNotify.takePendingNavigate()) _openBuildPage();
+    });
+  }
+
+  void _openBuildPage() {
+    foaNavigatorKey.currentState?.push(
+      MaterialPageRoute(builder: (_) => const BuildPage()),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -39,6 +70,7 @@ class FoaApp extends StatelessWidget {
       ],
       child: Consumer<ThemeController>(
         builder: (context, tc, _) => MaterialApp(
+          navigatorKey: foaNavigatorKey,
           title: 'Flutter On Android',
           debugShowCheckedModeBanner: false,
           theme: FoaTheme.light(),

@@ -1,0 +1,404 @@
+import 'dart:async';
+import 'dart:io';
+
+import '../env/models.dart';
+import '../env/proot_bridge.dart';
+import '../filemanager/fs_browser_bridge.dart';
+import 'build_notify.dart';
+import 'build_progress.dart';
+import 'termux_backend.dart';
+import 'toolchain_ensure.dart';
+
+/// 构建会话状态机（构建页据其渲染）。
+enum BuildStatus { idle, building, done, error, cancelled }
+
+/// 构建执行器：全局单例，构建会话与构建页生命周期解耦。
+///
+/// 为什么抽单例（alpha.31）：原实现构建状态全是 BuildPage 的 State 字段，
+/// 离开页面即 dispose 杀构建——用户锁屏/切走必断，还可能留下持锁孤儿
+/// （Bug 420 的源头之一）。改为全局单例后：
+/// - 页面退出只解绑 UI 钩子（onUiChanged/onAutoScroll），轮询由单例的
+///   守护 timer 继续，进度同步喂前台服务通知（BuildNotify）；
+/// - 重进页面 attach 回来，日志/进度/产物无缝续显；
+/// - 原生 BuildService 前台服务保活 App 进程树，退出界面构建不中断。
+///
+/// 线程模型：所有方法都在主 isolate（与页面同）；poll 循环 500ms 一次，
+/// 通道往返是异步的，天然串行（上一轮未返回时 timer 回调排队）。
+class BuildRunner {
+  BuildRunner._();
+  static final BuildRunner I = BuildRunner._();
+
+  final ProotBridge bridge = ProotBridge();
+  final FileBrowserBridge _fb = FileBrowserBridge();
+
+  // ---- 会话状态（构建页读这些渲染）----
+  String? active; // 正在构建/已构建的项目名
+  BuildStatus status = BuildStatus.idle;
+  final List<String> lines = [];
+  String partial = '';
+  String? apkGuest; // 产物容器路径（rootfs 内）
+  final BuildProgressTracker prog = BuildProgressTracker();
+
+  /// 已构建耗时（秒），供"仍在运行/总耗时"展示。
+  int elapsedSec = 0;
+
+  /// 命中的修复建议（去重，最多展示 3 条——截取在 UI 层）。
+  final List<String> hints = [];
+
+  int _streamId = -1;
+  int _offset = 0;
+  DateTime? _startedAt;
+  Timer? _timer;
+
+  // ---- UI 钩子（页面 attach 时注入，dispose 置空；null = 构建在后台跑）----
+  void Function()? onUiChanged;
+  void Function()? onAutoScroll;
+
+  bool get building => status == BuildStatus.building;
+
+  // 通知节流：阶段与百分比都没变就不推（Kotlin 侧还有 800ms 限频兜底）
+  int _lastNotifPct = -1;
+  String _lastNotifStage = '';
+
+  static const int _maxLines = 3000;
+
+  void _ui() => onUiChanged?.call();
+  void _scroll() => onAutoScroll?.call();
+
+  /// 秒 → `mm:ss` / `h:mm:ss`（UI 层与通知共用）。
+  static String fmtDur(int sec) {
+    final h = sec ~/ 3600;
+    final m = (sec % 3600) ~/ 60;
+    final s = sec % 60;
+    final mm = m.toString().padLeft(2, '0');
+    final ss = s.toString().padLeft(2, '0');
+    return h > 0 ? '$h:$mm:$ss' : '$mm:$ss';
+  }
+
+  /// 「返回列表」：清会话到 idle（日志保留到下次构建 start 时 clear）。
+  void resetUi() {
+    if (building) return; // 构建中不允许（UI 上该按钮也不出现）
+    status = BuildStatus.idle;
+    active = null;
+    _ui();
+  }
+
+  /// shell 单引号转义（项目名可能含空格/特殊字符）。
+  static String _q(String s) => "'${s.replaceAll("'", "'\\''")}'";
+
+  static const String _projectsDir = '/root/projects';
+
+  // ============================ 启动构建 ============================
+
+  Future<void> start(String name, EnvInfo env, BuildBackend backend) async {
+    if (building) return; // 防重入（页面 UI 也不会同时给两个入口）
+    final bare = backend == BuildBackend.termux;
+    active = name;
+    status = BuildStatus.building;
+    lines.clear();
+    partial = '';
+    apkGuest = null;
+    prog.reset();
+    elapsedSec = 0;
+    _startedAt = DateTime.now();
+    _lastNotifPct = -1;
+    _lastNotifStage = '';
+    hints.clear();
+    _ui();
+
+    // shell 命令里的项目目录：proot = 容器路径；termux bare = 宿主路径
+    //（bare 执行不经 proot，容器路径 /root/projects 对宿主不存在）。
+    final projectsDir = bare ? '${env.rootfsPath}/root/projects' : _projectsDir;
+    final proj = '$projectsDir/${_q(name)}';
+
+    // termux 后端前置组件检查（缺了就快速失败，别等 flutter 脚本报错）：
+    // bionic Flutter（含 bin/flutter）与 bionic git——容器里的 git 是
+    // glibc 二进制，bare 直跑不了，不能用 ToolchainEnsure 兜底。
+    if (bare) {
+      final miss = <String>[];
+      final flDir = TermuxPaths.flutterHome(env);
+      if (!Directory(flDir).existsSync() ||
+          !File('$flDir/bin/flutter').existsSync()) {
+        miss.add('Flutter（bionic）');
+      }
+      if (!File('${TermuxPaths.prefix(env)}/bin/git').existsSync()) {
+        miss.add('git（bionic）');
+      }
+      if (miss.isNotEmpty) {
+        status = BuildStatus.error;
+        lines.add('✗ termux 后端缺组件：${miss.join('、')}');
+        lines.add('  请到「工具链」页 → Termux 卡片安装后再构建');
+        _ui();
+        return;
+      }
+    }
+
+    // 前置校验：不是 Flutter 项目就快速失败，省一次 2h 级长任务
+    final check = await bridge.exec(
+      'test -f $proj/pubspec.yaml && echo __OK__ || echo __NO__',
+      timeoutSec: 30,
+      bare: bare,
+    );
+    if (!check.stdout.contains('__OK__')) {
+      status = BuildStatus.error;
+      lines.add('✗ 不是 Flutter 项目：$proj/pubspec.yaml 不存在');
+      _ui();
+      return;
+    }
+
+    lines.add('▶ flutter build apk --release --target-platform=android-arm64');
+    lines.add('  目录：$projectsDir/$name');
+    lines.add('  后端：${bare ? 'Termux 裸原生（不经 proot）' : 'Proot 容器'}');
+    lines.add('');
+    _ui();
+
+    // 前置清理（Bug 420）：上次构建被强杀的孤儿 dart 进程仍持有 flutter
+    // 启动锁时，新构建会永远卡在 "Waiting for another flutter command..."。
+    // proot 清容器 SDK 锁；termux 清 prefix 锁（dart 路径两后端都匹配）。
+    final flutterDir = bare ? TermuxPaths.flutterHome(env) : '/opt/flutter';
+    final killed = await ToolchainEnsure().flutterUnlock(
+      bridge,
+      flutterDir,
+      bare: bare,
+    );
+    lines.add(killed > 0
+        ? '🧹 已清理残留 flutter 进程 $killed 个（启动锁已释放）'
+        : '🧹 无残留 flutter 进程，锁干净');
+    lines.add('');
+    _ui();
+
+    // flutter 工具硬依赖 git，缺失时先自动安装（幂等；已装秒过）。
+    // termux 后端跳过：前置检查已确保 bionic git 就位。
+    if (!bare) {
+      final gitErr = await ToolchainEnsure().git();
+      if (gitErr != null) {
+        status = BuildStatus.error;
+        lines.add('✗ $gitErr');
+        _ui();
+        return;
+      }
+    }
+
+    // gradle 发行包统一走腾讯镜像（Step 8）：老工程仍是官方源 URL，哈希
+    // 与 Step 3 预下载缓存不匹配会直连 services.gradle.org；幂等改写，
+    // 失败仅警告不阻断（构建仍可尝试直连）。
+    // termux 后端不经容器 shell，用 Dart 文件 IO 直接改写（rootfs 树内
+    // 文件宿主可见可写，与容器改写同一份文件）。
+    if (bare) {
+      final warn = _gradleMirrorFromDart(env, name);
+      if (warn != null) lines.add('⚠ $warn');
+    } else {
+      final mirrorErr = await ToolchainEnsure().projectGradleMirror(name);
+      if (mirrorErr != null) lines.add('⚠ $mirrorErr');
+    }
+
+    // aapt2 覆盖（仅 termux）：AGP 默认从 Maven 拉 x86_64 aapt2；termux
+    // aapt 组件装好后把 build 期的 aapt2 指回 prefix 里的 bionic arm64 版
+    //（-P 优先级高于 gradle.properties，不污染工程文件）。
+    String aapt2Override = '';
+    if (bare) {
+      final aapt2 = TermuxPaths.aapt2(env);
+      if (File(aapt2).existsSync()) {
+        aapt2Override = " -Pandroid.aapt2FromMavenOverride='$aapt2'";
+      }
+    }
+
+    // pub get 三次重试（Bug 420 第二层）：弱网下 pub 的 TLS 瞬断会让
+    // flutter build 内部的自动 pub get 直接 exit 69。提前独立 pub get
+    // 并重试，成功后 build 内部的自动 pub get 秒过（pubspec 未变）。
+    final flutterCmd =
+        bare ? "'${TermuxPaths.flutterHome(env)}/bin/flutter'" : 'flutter';
+    final envPart = bare ? TermuxPaths.envPrefix(env) : '';
+    final cmd = "cd $proj && $envPart"
+        'FLUTTER_ALLOW_ROOT=true '
+        'ok=0; for i in 1 2 3; do '
+        'if $flutterCmd pub get; then ok=1; break; fi; '
+        'sleep 3; done; '
+        '[ "\$ok" = 1 ] || exit 69; '
+        '$flutterCmd build apk --release '
+        '--target-platform=android-arm64$aapt2Override';
+    final stream = await bridge.execStream(cmd, bare: bare);
+    if (!stream.ok || stream.id <= 0) {
+      status = BuildStatus.error;
+      lines.add('✗ 启动失败：${stream.error ?? '未知错误'}');
+      _ui();
+      return;
+    }
+    _streamId = stream.id;
+    _offset = 0;
+
+    // 前台服务 + 常驻通知（alpha.31）：此后用户可自由退出页面/锁屏
+    BuildNotify.start('构建中 · $name');
+    BuildNotify.progress('正在启动构建…', 0);
+
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(milliseconds: 500), (_) => _poll());
+  }
+
+  /// termux 后端的 gradle wrapper 镜像改写：不经 shell，Dart 直接读写
+  ///（rootfs 树内文件宿主可见）。幂等；非 Flutter 工程静默跳过。
+  String? _gradleMirrorFromDart(EnvInfo env, String name) {
+    try {
+      final f = File('${env.rootfsPath}/root/projects/$name'
+          '/android/gradle/wrapper/gradle-wrapper.properties');
+      if (!f.existsSync()) return null;
+      final t = f.readAsStringSync();
+      if (t.contains('mirrors.cloud.tencent.com')) return null;
+      f.writeAsStringSync(t.replaceAll(
+          'services.gradle.org/distributions',
+          'mirrors.cloud.tencent.com/gradle'));
+      return null;
+    } catch (e) {
+      return 'gradle 镜像配置失败：$e';
+    }
+  }
+
+  // ============================ 轮询循环 ============================
+
+  /// 500ms 守护轮询：页面在时同步刷 UI，页面不在时只喂通知。
+  Future<void> _poll() async {
+    final poll = await bridge.execStreamPoll(_streamId, _offset);
+    if (!poll.ok) {
+      _timer?.cancel();
+      status = BuildStatus.error;
+      prog.markHalted();
+      lines.add('✗ 轮询失败：${poll.error ?? '未知错误'}');
+      lines.add('  进度已冻结在 ${prog.percent}%（任务已失联，请重试）');
+      _ui();
+      BuildNotify.finish('✗ 构建失联（exit 未知）· 点开查看日志');
+      return;
+    }
+    _appendChunk(poll.chunk);
+    _offset = poll.len;
+    // 进度插值：日志推进阶段，时间推进阶段内百分比
+    prog.tick();
+    final started = _startedAt;
+    if (started != null) {
+      elapsedSec = DateTime.now().difference(started).inSeconds;
+    }
+    if (!poll.running) {
+      _timer?.cancel();
+      await _finish(poll.exitCode);
+    } else {
+      _ui();
+      _notifyProgress();
+      _scroll();
+    }
+  }
+
+  void _appendChunk(String chunk) {
+    final clean = chunk.replaceAll(RegExp(r'\x1B\[[0-9;?]*[a-zA-Z]'), '');
+    partial += clean;
+    final parts = partial.split('\n');
+    partial = parts.removeLast();
+    for (final p in parts) {
+      // 进度条用 \r 原地刷新：只保留最后一段
+      final segs = p.split('\r');
+      final line = segs.last;
+      lines.add(line);
+      // 进度识别吃"清洗后"的行：ANSI 已去、\r 段已取末段
+      prog.feed(line);
+      _feedErrorBreakdown(line);
+    }
+    if (lines.length > _maxLines) {
+      lines.removeRange(0, lines.length - _maxLines);
+      lines[0] = '[日志截断，仅显示最近 $_maxLines 行]';
+    }
+  }
+
+  /// 通知进度（节流：阶段与百分比都没变就跳过）。
+  void _notifyProgress() {
+    final pct = prog.percent;
+    final stage = prog.stage.label;
+    if (pct == _lastNotifPct && stage == _lastNotifStage) return;
+    _lastNotifPct = pct;
+    _lastNotifStage = stage;
+    BuildNotify.progress('$stage · $pct% · 已用 ${fmtDur(elapsedSec)}', pct);
+  }
+
+  /// 从日志里提取"失败类型"，供进度条下方给出可执行的修复建议。
+  /// 只识别本仓库已知的失败模式（见 dev-handbook §十 工具链 / §十一 体积）。
+  void _feedErrorBreakdown(String line) {
+    final l = line.toLowerCase();
+    String? tip;
+    if (l.contains('exec format error')) {
+      tip = '架构不匹配：x64 工具未经 qemu 转发（工具链页 → x64 兼容层 → 重新应用）';
+    } else if (l.contains('shared libraries')) {
+      tip = '多架构运行库缺失：x64 兼容层 → 重新应用';
+    } else if (l.contains('no space left')) {
+      tip = '磁盘空间不足：清理 build/ 与 .gradle 缓存后重试';
+    } else if (l.contains('could not resolve') || l.contains('sslhandshake')) {
+      tip = '依赖下载失败：检查镜像源（工具链页 → Gradle 镜像）';
+    } else if (l.contains('tls error') || l.contains('failed to update packages')) {
+      tip = 'pub 拉取 TLS 失败（多为弱网瞬断）：构建已自动重试 3 次，'
+          '仍失败请切换网络后重试；若反复出现，检查「Gradle 镜像」页的源配置';
+    } else if (l.contains('waiting for another flutter command')) {
+      tip = 'Flutter 启动锁被占用：残留进程未清干净——完全杀掉 App 重开再试'
+          '（alpha.30 起构建前会自动清理）';
+    } else if (l.contains('snapshot not compatible')) {
+      tip = 'flutter_tools.snapshot 架构不匹配：x64 兼容层未接管 dart-sdk';
+    }
+    if (tip != null && !hints.contains(tip)) hints.add(tip);
+  }
+
+  Future<void> _finish(int? code) async {
+    if (code == 0 && active != null) await _locateApk(active!);
+    final ok = code == 0 && apkGuest != null;
+    if (ok) {
+      // 只有"成功且产物就位"才授予 100%，不动用插值
+      prog.markDone();
+    } else {
+      prog.markHalted();
+    }
+    status = ok ? BuildStatus.done : BuildStatus.error;
+    if (code == 0 && apkGuest == null) {
+      lines.add('✗ 构建成功但未找到 APK 产物');
+    } else if (code != 0) {
+      lines.add('✗ 构建失败（exit ${code ?? -1}）· 已运行 ${fmtDur(elapsedSec)}'
+          ' · 进度冻结在 ${prog.percent}%');
+    } else {
+      lines.add('');
+      lines.add('✓ 构建成功：$apkGuest');
+      lines.add('  总耗时 ${fmtDur(elapsedSec)}');
+    }
+    _ui();
+    _scroll();
+    // 结果通知（服务停、通知留给用户，点击回构建页）
+    BuildNotify.finish(ok
+        ? '✓ 构建成功 · 总耗时 ${fmtDur(elapsedSec)}'
+        : '✗ 构建失败（exit ${code ?? -1}）· 点开查看日志');
+  }
+
+  /// 在容器内查找 flutter-apk 产物（优先 app-release.apk）。
+  Future<void> _locateApk(String name) async {
+    final dir = '$_projectsDir/$name/build/app/outputs/flutter-apk';
+    final list = await _fb.browse(dir);
+    if (!list.ok) return;
+    final apks = list.entries
+        .where((e) => !e.isDir && e.name.endsWith('.apk'))
+        .toList();
+    if (apks.isEmpty) return;
+    FsBrowserEntry? pick;
+    for (final a in apks) {
+      if (a.name == 'app-release.apk') {
+        pick = a;
+        break;
+      }
+    }
+    pick ??= apks.first;
+    apkGuest = '$dir/${pick.name}';
+  }
+
+  /// 用户取消：杀流式进程 + 终态落日志 + 结果通知。
+  Future<void> cancel() async {
+    _timer?.cancel();
+    await bridge.execStreamStop(_streamId);
+    status = BuildStatus.cancelled;
+    prog.markHalted();
+    lines.add('');
+    lines.add('⏹ 已取消（用户中止）· 已运行 ${fmtDur(elapsedSec)}');
+    _ui();
+    _scroll();
+    BuildNotify.finish('⏹ 已取消 · 已运行 ${fmtDur(elapsedSec)}');
+  }
+}
