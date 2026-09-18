@@ -8,6 +8,7 @@ import '../env/proot_bridge.dart';
 import '../filemanager/fs_browser_bridge.dart';
 import 'build_notify.dart';
 import 'build_progress.dart';
+import 'qemu_compat.dart';
 import 'termux_backend.dart';
 import 'toolchain_ensure.dart';
 
@@ -312,6 +313,13 @@ class BuildRunner {
     required String envPart,
     required String aapt2Override,
   }) {
+    // Bug 433：pub get 会触发 Flutter 重新下载引擎构件，把 linux-arm64/
+    // 下的转发脚本盖回真 x64 二进制（真机表现：AOT 跑到 54% 后
+    // shaders/*.frag 编译 SIGILL，exit -4）。因此在 pub get 之后、
+    // flutter build 之前，于**同一条 shell 命令内**再断言一次转发层。
+    final reassert = QemuCompat.wrapReassertScript
+        .replaceAll('@ENGINE@', QemuCompat.engineDir)
+        .replaceAll('@QEMU@', QemuCompat.qemuBin);
     return "cd $proj && $envPart"
         'FLUTTER_ALLOW_ROOT=true '
         'ok=0; '
@@ -323,6 +331,8 @@ class BuildRunner {
         'then ok=1; break 2; fi; sleep 3; done; done; '
         '[ "\$ok" = 1 ] || exit 69; '
         'export PUB_HOSTED_URL=\$src; '
+        // Bug 433 转发层再断言（pub get 后、build 前，同一 shell）
+        '{ $reassert ; } 2>&1 | tail -n 2; '
         '$flutterCmd build apk --no-shrink --release '
         '--target-platform=android-arm64$aapt2Override';
   }

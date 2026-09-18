@@ -112,10 +112,41 @@ class _TerminalPageState extends State<TerminalPage> {
       return;
     }
 
-    final bare = await _pickBackend(env);
+    final bare = await _pickBackend(env).timeout(
+      const Duration(seconds: 10),
+      onTimeout: () => !env.rootfsInstalled,
+    );
     _useBare = bare;
 
-    final r = await _bridge.ptyStart(bare: bare);
+    // Bug 433：ptyStart 原先没有任何超时——原生侧一旦卡在
+    // ProcessBuilder.start()（proot 启动要 fork+exec 并加载
+    // LD_LIBRARY_PATH 下的大库，弱机/首次可能很久）或 executor
+    // 线程被占住，Dart 侧 await 就永远不返回，界面永久停在
+    // 「正在启动终端…」且没有任何线索。这里加超时，把"卡住"
+    // 变成"可读的失败 + 诊断提示"。
+    PtyStart r;
+    try {
+      r = await _bridge
+          .ptyStart(bare: bare)
+          .timeout(const Duration(seconds: 45));
+    } on TimeoutException {
+      if (!mounted) return;
+      setState(() {
+        _starting = false;
+        _error = '启动终端超时（45 秒无响应）。\n'
+            '可能原因：${bare ? '宿主 shell 未就绪' : 'proot 容器未安装或不完整'}。\n'
+            '可尝试：① 回主页确认「初始化环境」已完成；'
+            '② 在「构建」页用另一后端跑一次；③ 返回重进本页。';
+      });
+      return;
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _starting = false;
+        _error = '启动终端失败：$e';
+      });
+      return;
+    }
     if (!mounted) return;
 
     if (!r.ok) {

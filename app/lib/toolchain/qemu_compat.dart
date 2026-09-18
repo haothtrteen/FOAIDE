@@ -93,6 +93,65 @@ done
 echo "FLUTTER_WRAPPED=$n"
 ''';
 
+  /// Bug 433：构建命令内联的**转发层再断言**脚本（压缩版，无 precache）。
+  ///
+  /// 为什么需要它：`buildCommand` 在 `flutter build` 之前先跑
+  /// `flutter pub get`。pub get 在依赖状态变化时会触发 Flutter 的
+  /// **构件重新下载**，把 `linux-arm64/<tool>` 写回真 x64 二进制——
+  /// 盖掉构建前 `qemuCompatEnsure` 刚放好的转发脚本（上游 artifacts.dart
+  /// 未对 linux_arm64 做 x64 回退，见 flutter/flutter#152281）。
+  ///
+  /// 于是真机表现为：前置检查全过 → AOT 编译跑到 54% → shader 编译
+  /// 阶段 `impellerc` SIGILL（`Dart snapshot generator failed with
+  /// exit code -4` / `shaders/ink_sparkle.frag failed with exit code -4`）。
+  /// 这正是 Bug 429 在「pub get 插队」场景下的复发。
+  ///
+  /// 兜底不变量：**在真正调用 flutter build 的同一条 shell 命令里、
+  /// 紧邻其前**再断言一次。此处已确认构件存在（前置检查过了），
+  /// 所以不需要 precache 分支，脚本很小、秒级完成。
+  static const String wrapReassertScript = r'''
+E=@ENGINE@
+[ -d "$E" ] || exit 0
+gen() {
+  cat > "$1" <<FOAWRAP
+#!/bin/sh
+# FOA x86_64 -> qemu-user wrapper (auto-generated)
+d=\$(dirname "\$0")
+if [ -d "\$d/lib64" ]; then
+  LD_LIBRARY_PATH="\$d/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH
+fi
+exec @QEMU@ -L / "$2" "\$@"
+FOAWRAP
+  chmod 755 "$1"
+}
+put() {
+  [ -f "$1" ] || return 0
+  [ -x "$1" ] || return 0
+  m=$(dd if="$1" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  case "$m" in 7f454c46*3e) ;; *) return 0 ;; esac
+  if [ -f "$2" ] && head -c 2 "$2" 2>/dev/null | grep -q '#!'; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$2")"
+  gen "$2" "$1"
+  n=$((n+1))
+}
+n=0
+for d in "$E"/android-*/linux-x64; do
+  [ -d "$d" ] || continue
+  a="${d%/linux-x64}/linux-arm64"
+  for f in "$d"/*; do put "$f" "$a/${f##*/}"; done
+done
+for hd in "$E"/linux-*/; do
+  hd="${hd%/}"; [ -d "$hd" ] || continue
+  case "$hd" in */linux-x64) ;; *) continue ;; esac
+  ha="${hd%/linux-x64}/linux-arm64"
+  for f in "$hd"/*; do put "$f" "$ha/${f##*/}"; done
+done
+echo "REASSERT=$n"
+''';
+
   /// 引擎产物同步：若尚未下载 → flutter precache --android（走 flutter-io.cn），
   /// 再为每个 android-*/linux-x64 生成 linux-arm64/ 转发脚本。
   ///

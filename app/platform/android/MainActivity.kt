@@ -993,16 +993,33 @@ class MainActivity : FlutterActivity() {
             val built = buildProotCmd("")
             val base = built.cmd ?: return built.error!!
             /*
-             * buildProotCmd 的末尾是 /bin/sh -c "<boot><command>"，
-             * 交互式终端要的是**不带 -c 的登录 shell**。这里截掉尾部
-             * 4 项（"/bin/sh"、"-c"、boot+command）重新收尾：
+             * buildProotCmd 的末尾是 `/usr/bin/env -i ... /bin/sh -c "<boot><command>"`，
+             * 交互式终端要的是**不带 -c 的登录 shell**。这里从末尾的
+             * `-c` 往前**连同它的 `/bin/sh` 前缀一起**截掉，再重新收尾。
+             *
+             * ⚠️ Bug 433：此前只截到 `-c` 之前（base.subList(0, tailIdx)），
+             * 于是 head 末尾残留一个孤立的 `/bin/sh`。重新拼接后实际传给
+             * proot 的是：
+             *     ... /bin/sh  /usr/bin/env -i HOME=... /bin/sh -c "boot; exec /bin/sh -i"
+             * 即外层 sh 把 `/usr/bin/env` 当**脚本文件路径**去执行（还要把
+             * 后续参数当作位置参数），必然起不来；PTY 里没有任何输出 →
+             * 界面永久停在「正在启动终端…」（真机 2026-09-19 反馈）。
+             * 正确做法：截掉 `-c` 时把紧邻其前的 `/bin/sh` 也一并去掉。
+             *
              * 保留 proot 参数与绑定，改成 `-i` 交互 shell；
              * boot 注入（resolv.conf 修复 + foa-env.sh）本身需要执行，
              * 因此退一步用 `-c "<boot>exec /bin/sh -i"` —— exec 让
              * shell 顶替掉外层进程，fd 0/1/2 已绑定 tty，交互体验不受影响。
              */
             val tailIdx = base.indexOfLast { it == "-c" }
-            val head = if (tailIdx > 0) base.subList(0, tailIdx) else base
+            var headEnd = if (tailIdx > 0) tailIdx else base.size
+            // 若 `-c` 前紧邻 `/bin/sh`（或其它 sh 路径），一并截掉
+            if (headEnd - 1 >= 0 &&
+                (base[headEnd - 1] == "/bin/sh" || base[headEnd - 1].endsWith("/sh"))
+            ) {
+                headEnd -= 1
+            }
+            val head = base.subList(0, headEnd)
             val boot = "if ! grep -qE '^nameserver (223\\.5\\.5\\.5|119\\.29\\.29\\.29|8\\.8\\.8\\.8|114\\.114\\.114\\.114|1\\.1\\.1\\.1)' /etc/resolv.conf 2>/dev/null; then printf 'nameserver 223.5.5.5\\nnameserver 119.29.29.29\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; fi; [ -f /etc/profile.d/foa-env.sh ] && . /etc/profile.d/foa-env.sh; "
             argv.addAll(head)
             /*
