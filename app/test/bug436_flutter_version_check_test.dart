@@ -1,7 +1,6 @@
 import 'dart:io';
 
 import 'package:flutter_on_android/toolchain/build_runner.dart';
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Bug 436：构建前出现 `Command exited with code 128: fetch --tags` /

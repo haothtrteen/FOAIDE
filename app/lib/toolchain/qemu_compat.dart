@@ -152,6 +152,74 @@ done
 echo "REASSERT=$n"
 ''';
 
+  /// Bug 438：构建前的 qemu 链路预检。
+  ///
+  /// 真机症状：shader 阶段 exit -4（SIGILL），且 flutter 打出
+  /// `impellerc failure: ` **后面为空**——`result.stderr` 是空字符串。
+  /// 同时 `gen_snapshot` 也是 exit -4。两个**不同的** x64 程序在同一个
+  /// qemu 下同时静默崩，说明问题在 qemu 链路本身，不在某个程序。
+  ///
+  /// 这类崩溃的麻烦在于**没有任何输出**，无法从 flutter 日志反推。
+  /// 所以构建前主动跑一遍分层诊断，把每一步的真实结果写进构建日志：
+  ///   1. qemu 本体能否执行（--version）
+  ///   2. qemu 能否跑 x64 动态链接器
+  ///   3. qemu 能否跑一个 x64 真二进制（用 gen_snapshot --help）
+  ///   4. 转发脚本链是否完整（脚本 → 目标 ELF 架构）
+  ///
+  /// 输出前缀 `QEMU_CHAIN_` 便于在日志里定位。
+  static const String buildPreflightScript = r'''
+[ -x @QEMU@ ] || { echo "QEMU_CHAIN_NONE=1"; exit 0; }
+echo "QEMU_CHAIN_VER=$(  @QEMU@ --version 2>&1 | head -1 )"
+ld=/lib64/ld-linux-x86-64.so.2
+if [ -f "$ld" ]; then
+  @QEMU@ -L / "$ld" --version > /dev/null 2>&1
+  lrc=$?
+  if [ "$lrc" = 0 ]; then
+    echo "QEMU_CHAIN_LOADER=ok"
+  else
+    # 132=128+4 即 SIGILL；139=128+11 即 SIGSEGV
+    echo "QEMU_CHAIN_LOADER=fail rc=$lrc"
+  fi
+else
+  echo "QEMU_CHAIN_LOADER=missing"
+fi
+# 跑一个真实的 x64 二进制：优先用 impellerc（真机实际崩的那个）
+for tool in @ENGINE@/linux-arm64/impellerc @ENGINE@/android-arm64-release/linux-arm64/gen_snapshot; do
+  [ -x "$tool" ] || { echo "QEMU_CHAIN_PROBE=$(basename "$tool")=missing"; continue; }
+  # 转发脚本指向的源
+  src=$(grep -o '"[^"]*linux-x64[^"]*"' "$tool" 2>/dev/null | tail -1 | tr -d '"')
+  [ -n "$src" ] || src="$tool"
+  # rc 必须在命令紧邻处捕获。注意：`out=$(cmd | head -2)` 之后 $? 是
+  # **head** 的退出码，不是 cmd 的——管道会吞掉真实状态。所以先写临时
+  # 文件再读，才能拿到被调程序的真实信号退出码。
+  tf=/tmp/.foa_probe_out
+  : > "$tf"
+  "$tool" --help > "$tf" 2>&1
+  rc=$?
+  out=$(head -2 "$tf" 2>/dev/null)
+  rm -f "$tf"
+  if [ -n "$out" ]; then
+    echo "QEMU_CHAIN_PROBE=$(basename "$tool")=ok rc=$rc"
+  else
+    case "$rc" in
+      132) s=SIGILL ;;
+      139) s=SIGSEGV ;;
+      126) s=CANNOT_EXEC ;;
+      127) s=NOT_FOUND ;;
+      0)   s=EMPTY_OUTPUT ;;
+      *)   s="rc=$rc" ;;
+    esac
+    echo "QEMU_CHAIN_PROBE=$(basename "$tool")=FAIL:$s out=EMPTY"
+  fi
+  if [ -f "$src" ]; then
+    m=$(dd if="$src" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    echo "QEMU_CHAIN_SRC=$(basename "$src")=$m"
+  fi
+  break
+done
+echo "QEMU_CHAIN_DONE=1"
+''';
+
   /// 引擎产物同步：若尚未下载 → flutter precache --android（走 flutter-io.cn），
   /// 再为每个 android-*/linux-x64 生成 linux-arm64/ 转发脚本。
   ///

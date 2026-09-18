@@ -358,6 +358,14 @@ exit 0
     // Bug 436：跳过 flutter 内部的 git fetch --tags 版本检查
     final stampFix = refreshVersionCheckStamp
         .replaceAll('@CACHE@', '${QemuCompat.flutterHome}/bin/cache');
+    // Bug 438：构建前诊断——把「qemu 能否运行 x64」这件最基础的事实
+    // 打进构建日志。真机上 shader 阶段 exit -4（SIGILL）且 stderr 为空
+    // （flutter 打印 `impellerc failure: ` 后面什么都没有），说明进程被
+    // 信号杀死、来不及输出。这种静默崩溃无法从 flutter 的日志反推原因，
+    // 必须在构建前**主动**测一遍 qemu 链路并记录结果。
+    final diag = QemuCompat.buildPreflightScript
+        .replaceAll('@ENGINE@', QemuCompat.engineDir)
+        .replaceAll('@QEMU@', QemuCompat.qemuBin);
     return "cd $proj && $envPart"
         'FLUTTER_ALLOW_ROOT=true '
         // Bug 436：proot 路径原先没设该变量（只有 pub get 那行内联了
@@ -365,6 +373,8 @@ exit 0
         // profile.d/foa-env.sh 里有，但 proot -c 直接执行 sh 不读 profile。
         'FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn '
         'sh -c ${_shq(stampFix)} 2>&1 | tail -n 1; '
+        // Bug 438：qemu 链路预检（输出 QEMU_CHAIN_* 供真机排障）
+        'sh -c ${_shq(diag)} 2>&1 | tail -n 12; '
         'ok=0; '
         'for src in https://pub.flutter-io.cn '
         'https://mirrors.tuna.tsinghua.edu.cn/dart-pub '
