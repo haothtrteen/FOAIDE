@@ -453,6 +453,9 @@ class AndroidSdkInstaller {
       throw DownloadException('写入 Android SDK 许可失败：${lic.stderr}');
     }
 
+    // NDK 占位（Bug 427，2026-09-18 真机 24% SIGILL）
+    await ensureNdkStub(bridge);
+
     onPhase?.call('validating');
     // 用 diagnose 精确报缺失路径（不再笼统"关键组件缺失"，Bug 417）
     final miss = await diagnose(bridge);
@@ -467,6 +470,54 @@ class AndroidSdkInstaller {
     // 清理下载缓存（4 个 zip 约 320MB）
     await bridge.exec('rm -f /opt/foa-dl/*.zip', timeoutSec: 60);
     return v ?? 'Android SDK 已安装';
+  }
+
+  /// NDK 占位确保（Bug 427 根因修复，2026-09-18 真机 24% SIGILL）。
+  ///
+  /// 症状：真机构建到「配置 Gradle」24% 报
+  /// `Process 'command '/opt/android-sdk/cmdline-tools/latest/bin/
+  /// sdkmanager'' finished with non-zero exit value 132`（132 = 128+4 =
+  /// SIGILL），位置是根 build.gradle.kts 的 `evaluationDependsOn(":app")`。
+  ///
+  /// 根因链：Flutter gradle 插件 `FlutterPluginUtils.forceNdkDownload()`
+  /// 在 `finalizeDsl` 里判定——项目 `ndkVersion = flutter.ndkVersion`
+  /// （默认 28.2.13676358）不在 `installedNdkVersions` 中，且
+  /// `sdkManagerPath != null`、gradle 非 offline → 主动调 **sdkmanager
+  /// --install "ndk;<版本>"** 自动补装 NDK。而 sdkmanager 是 sh 脚本
+  /// `exec "$JAVACMD"` 起 JVM，**Android arm64 上标准 Linux JDK 的 JIT
+  /// 触达设备不支持的指令 → SIGILL**（JVM 在 Android 上运行的已知冲突，
+  /// 与 sdkmanager 自身架构无关）。沙箱能过是因为构建机人工放了
+  /// `ndk/28.2.13676358/source.properties`（真 NDK 改名占位），插件
+  /// 判定"已装"直接 return，从不调 sdkmanager。
+  ///
+  /// 修复：写入最小 NDK 占位——Flutter 只检查
+  /// `ndk/<version>/source.properties` **文件存在**（android_sdk.dart
+  /// `hasNdkVersion`），NDK 目录名的即版本号。demo 项目零 native 代码
+  /// （无 CMakeLists），占位即可让插件跳过 sdkmanager；同时避免拖
+  /// 2.2GB 真 NDK 进包（本机构建不需要 NDK 工具链）。
+  ///
+  /// 版本号动态解析：从 Flutter gradle 插件源码读 `ndkVersion` 默认值，
+  /// SDK 升级自动跟随，不硬编码。幂等，已存在真 NDK 时跳过不覆盖。
+  static Future<void> ensureNdkStub(ProotBridge bridge) async {
+    // 版本号优先从 Flutter 插件源码解析（SDK 升级自动跟随），失败回退默认值；
+    // 字符串拼接处避免行内注释，全部 \\$ 转义留给 shell 求值（Bug 424 同类风险）
+    const script = 'V=\$(sed -n "s/.*ndkVersion: String = \\"([^\\"]*)\\".*/\\1/p" '
+        '/opt/flutter/packages/flutter_tools/gradle/src/main/kotlin/'
+        'FlutterExtension.kt 2>/dev/null | head -1); '
+        '[ -n "\$V" ] || V=28.2.13676358; '
+        'if [ -f $sdkHome/ndk/\$V/source.properties ]; then '
+        'echo NDK_STUB_PRESENT; exit 0; fi; '
+        'mkdir -p $sdkHome/ndk/\$V && '
+        'printf "Pkg.Desc = Android NDK\\nPkg.Revision = %s\\n" "\$V" '
+        '> $sdkHome/ndk/\$V/source.properties && '
+        '[ -f $sdkHome/ndk/\$V/source.properties ] && echo NDK_STUB_OK';
+    final r = await bridge.exec(script, timeoutSec: 60);
+    if (!r.stdout.contains('NDK_STUB_OK') &&
+        !r.stdout.contains('NDK_STUB_PRESENT')) {
+      // 不阻断安装：占位失败时插件仍会尝试 sdkmanager，真机会报 SIGILL——
+      // 分诊 hint 已覆盖该症状（提示重装 Android SDK 组件）
+      return;
+    }
   }
 
   /// 国内优先分级探测：国内全部不可达才回退境外。

@@ -72,6 +72,30 @@ class ToolchainEnsure {
     }
   }
 
+  /// Android SDK NDK 占位确保（Bug 427 根因修复，2026-09-18 真机 24%）。
+  ///
+  /// 兜住"已装 SDK 的老用户"：工具链安装流程里已调
+  /// [AndroidSdkInstaller.ensureNdkStub]，但老版本装好的 SDK 不会自动
+  /// 补——构建前再确保一次（幂等，已存在秒过），避免插件调 sdkmanager
+  /// 触发 arm64 JIT SIGILL（exit 132）。详见 ensureNdkStub 文档。
+  ///
+  /// 仅在 SDK 目录存在时执行（未装 SDK 的项目走不到 gradle 阶段）。
+  /// 失败不阻断构建。
+  Future<String?> ndkStub({bool bare = false}) async {
+    if (bare) return null; // termux 后端 SDK 布局不同（未投产）
+    try {
+      final probe = await _bridge.exec(
+        'test -d /opt/android-sdk && echo SDK_YES || echo SDK_NO',
+        timeoutSec: 30,
+      );
+      if (!probe.stdout.contains('SDK_YES')) return null;
+      await AndroidSdkInstaller.ensureNdkStub(_bridge);
+      return null;
+    } catch (e) {
+      return 'NDK 占位检查失败：$e';
+    }
+  }
+
   /// 容器 init.gradle 旧版注入自愈（Bug 426 根因修复，2026-09-18）。
   ///
   /// 场景：真机工具链「一键应用」曾写入注入型 init.gradle

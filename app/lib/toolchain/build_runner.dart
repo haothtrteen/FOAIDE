@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
+
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import '../filemanager/fs_browser_bridge.dart';
@@ -178,6 +180,13 @@ class BuildRunner {
       // was added"。检测到旧版则覆写为 beforeSettings 前插形态。
       final gErr = await ToolchainEnsure().gradleInitSanitize(env: env);
       if (gErr != null) lines.add('⚠ $gErr（不阻断构建）');
+
+      // Bug 427 根因修复：Flutter gradle 插件会主动调 sdkmanager 补装
+      // NDK（项目 ndkVersion 不在已装列表时），而 sdkmanager 在 Android
+      // arm64 上启 JVM 触发 JIT SIGILL（exit 132，真机 24% 配置 Gradle
+      // 崩）。构建前写入最小 NDK 占位使插件判定"已装"直接跳过。
+      final nErr = await ToolchainEnsure().ndkStub();
+      if (nErr != null) lines.add('⚠ $nErr（不阻断构建）');
     }
 
     lines.add('▶ flutter build apk --no-shrink --release'
@@ -413,6 +422,13 @@ class BuildRunner {
 
   /// 从日志里提取"失败类型"，供进度条下方给出可执行的修复建议。
   /// 只识别本仓库已知的失败模式（见 dev-handbook §十 工具链 / §十一 体积）。
+  ///
+  /// [exposeFeedForTest] 为仅测试可见的转发入口：分诊表是纯文本匹配逻辑，
+  /// 沙箱出包不走 BuildRunner、analyze 覆盖不到运行时识别，只能靠单测
+  /// 固化（同 Bug 424 的 buildCommand 文本断言思路）。
+  @visibleForTesting
+  void debugFeedForTest(String line) => _feedErrorBreakdown(line);
+
   void _feedErrorBreakdown(String line) {
     final l = line.toLowerCase();
     String? tip;
@@ -426,6 +442,13 @@ class BuildRunner {
       tip = '多架构运行库缺失：x64 兼容层 → 重新应用';
     } else if (l.contains('no space left')) {
       tip = '磁盘空间不足：清理 build/ 与 .gradle 缓存后重试';
+    } else if (l.contains('exit value 132') ||
+        l.contains('sigill') ||
+        l.contains('sdkmanager')) {
+      tip = 'sdkmanager 崩溃（exit 132 = SIGILL）：Flutter 插件自动补装 '
+          'NDK 时在 Android arm64 上启 JVM 触发非法指令。alpha.38 起构建前'
+          '自动写 NDK 占位使插件跳过补装（Bug 427）。若本条仍出现：到'
+          '「工具链」页卸载并重装 Android SDK 组件后重试';
     } else if (l.contains('prefer settings repositories') ||
         l.contains('was added by settings file')) {
       tip = 'Gradle 仓库注入与 Flutter 新模板 PREFER_SETTINGS 冲突：'
