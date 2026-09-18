@@ -1138,6 +1138,77 @@ https://storage.flutter-io.cn` 即为生效标志。
 
 ---
 
+### Bug 420：构建卡死在 4%（startup lock 等待 + pub TLS 瞬断）
+
+**症状**（2026-09-18 真机，proot 后端 my_demo 构建）：
+```
+Waiting for another flutter command to release the startup lock...
+Flutter assets will be downloaded from https://storage.flutter-io.cn...
+Got TLS error trying to find package args at https://pub.flutter-io.cn.
+Failed to update packages.
+✗ 构建失败（exit 69）· 已运行 09:06 · 进度冻结在 4%
+```
+**原因**（两层叠加）：
+1. **启动锁被孤儿进程持有**：上次构建被强杀（App 被杀/取消）后，容器内
+   dart 进程（flutter_tools/pub 的宿主）存活，flock 锁不释放；proot 不隔离
+   PID、minbase 无 ps/pkill，新构建无限等待。9:06 大半耗在这里；
+2. **pub get TLS 瞬断**：弱网（35KB/s）下 pub.flutter-io.cn 握手失败，
+   flutter build 内部的自动 pub get 无重试，直接 exit 69。
+
+**解决**（alpha.30，均在 `_startBuild` 前置段）：
+1. `ToolchainEnsure.flutterUnlock()`：/proc 遍历 + builtin kill 杀
+   cmdline 含 `dart-sdk/bin/dart` 的进程 + 删 `bin/cache/lockfile`。
+   ⚠️ 匹配串在脚本文本里必须拆写（`PAT='dart-sdk/bin/''dart'`，shell 层
+   拼接），否则 sh -c 的 cmdline 含完整串会**自杀**；只杀 dart 不动
+   gradle daemon（java，可复用）；
+2. 构建命令前置独立 `pub get` 三次重试（`ok=0; for i in 1 2 3; ...`），
+   全败 exit 69；成功后 build 内部自动 pub get 秒过；
+3. `_feedErrorBreakdown` 增加 `tls error` / `waiting for another flutter
+   command` 两条可执行修复建议。
+
+**教训**：
+- 「进度条冻结在 N%」≠ 进程卡死——先看 exit code（69 = pub 网络失败），
+  进度条只反映日志阶段，进程已死时它只是不再动；
+- 强杀构建（execStreamStop/App 被杀）杀的是 proot 主进程，容器内子进程树
+  （dart/gradle）可能存活——**任何持锁型工具链，重入前都要做孤儿清理**；
+- 弱网下任何"无重试的在线步骤"都是失败点，pub get 这种幂等操作
+  直接套三次重试即可。
+
+### Bug 421：下载卡死在 80.2/91.8MB（熔断检查是死逻辑 + 响应头无超时）
+
+**症状**（2026-09-18 真机，Termux JDK deb 在线下载，镜像"Termux 官方"）：
+```
+openjdk-17  80.2 MB / 91.8 MB   ← 长时间冻结，无报错、不换源、不重试
+```
+**原因**（两层叠加，均在 `sdk_downloader.dart`）：
+1. **卡死熔断是死逻辑**：`stallTimeout`（15s 无数据 → 换镜像）的检查写在
+   读流 `await for` 循环体内——只有数据到达时才执行。服务端 hang
+   （TCP 连接还在、一个字节都不吐）时，循环**挂起在等待下一个事件上**，
+   检查代码永远轮不到执行，熔断形同虚设。80.2MB 处连接被对端静默挂起，
+   就此冻结到天荒地老；
+2. **`req.close()` 无响应头超时**：`connectionTimeout` 只管三次握手；
+   握手成功后服务器不回响应头，请求同样永久挂起（另一条隐性死路）。
+
+**解决**（alpha.30，`_downloadSegment`）：
+1. 卡死熔断改由 `Stream.timeout` 驱动：
+   `await for (final chunk in resp.timeout(stallTimeout))` ——
+   **事件间隔**超 15s 即抛 TimeoutException → 走既有重试/换源链路。
+   看门狗由 `Stream.timeout` 独立计时，不依赖数据到达；
+2. 新增 `respHeaderTimeout = 20s`：`await req.close().timeout(respHeaderTimeout)`，
+   响应头 hang 也熔断；
+3. 慢速熔断（10s 窗口 <64KB/s 涓流，alpha.29 已加）保留，与卡死熔断
+   互补：卡死=无数据，涓流=有数据但太慢。
+
+**教训**：
+- **看门狗必须独立于被监视的数据流驱动**——"检查写在循环体内"只有
+  循环体被执行时才生效，而数据停止时循环体恰恰不执行。这是异步流
+  超时最典型的死逻辑写法，Dart 里正确姿势是 `Stream.timeout`（每来
+  一个事件重置计时器，超时即抛）；
+- `connectionTimeout ≠ 响应头超时`：握手成功后到首字节响应之间
+  是另一段无保护窗口，`HttpClientRequest.close()` 本身永不超时；
+- 测试难以覆盖"服务端 hang"场景（真机弱网才暴露），代码评审时
+  对"循环体内做超时检查"的模式要保持警惕。
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
