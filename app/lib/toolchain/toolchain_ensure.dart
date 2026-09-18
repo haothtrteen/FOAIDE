@@ -337,15 +337,40 @@ class ToolchainEnsure {
       timeoutSec: 30,
     );
     if (!(check.exitCode == 0 && check.stdout.contains('GIT_OK'))) {
+      // Bug 435（2026-09-19 真机截图）：本路径原先**没有** dpkg 自愈，
+      // 而 AptTools.ensure 有。于是「兼容层卸载失败」留下的 dpkg 半安装
+      // 中间态会在这里炸成
+      //   E: dpkg was interrupted, you must manually run 'dpkg --configure -a'
+      // 用户看到的是「自动安装 git 失败」——**错误信息指向 git，真因却在
+      // dpkg 状态**，完全没法顺着排查。执行路径上凡是调 apt 的地方，
+      // 都必须先修复 dpkg 状态，不能只在"我想到的那条"路径上加。
+      //
+      // 另一个坑：apt-get update 也会被 dpkg 中间态拦住。原先
+      // `apt-get update && apt-get install git` 用 && 串联，update 一失败
+      // install 根本不执行，报错还停在 update 的输出上。
+      final repair = await _bridge.exec(
+        '${AptTools.repairDpkg}echo DPKG_REPAIRED',
+        timeoutSec: 600,
+      );
+      if (!repair.stdout.contains('DPKG_REPAIRED')) {
+        // 自愈本身失败不直接放弃——仍试一次安装，失败时把两段输出一起给
+        // 用户，避免"修复命令挂了所以什么都装不了"这种更差的结果。
+      }
+
       final install = await _bridge.exec(
         'DEBIAN_FRONTEND=noninteractive apt-get update -qq '
-        '&& DEBIAN_FRONTEND=noninteractive apt-get install -y -qq '
-        '--no-install-recommends git',
+        '-o Acquire::Retries=3 2>&1 | tail -n 20\n'
+        'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq '
+        '--no-install-recommends -o Acquire::Retries=3 git 2>&1 | tail -n 30\n'
+        'command -v git >/dev/null 2>&1 && echo GIT_INSTALLED',
         timeoutSec: 900,
       );
-      if (install.exitCode != 0) {
+      if (!(install.exitCode == 0 &&
+          install.stdout.contains('GIT_INSTALLED'))) {
         final out = install.stderr.isNotEmpty ? install.stderr : install.stdout;
-        return '自动安装 git 失败：\n${_tail(out)}';
+        return '自动安装 git 失败：\n${_tail(out)}\n'
+            '（已尝试自动修复 dpkg 中断状态；仍失败可到「终端」手动执行 '
+            'dpkg --configure -a 后重试）';
       }
     }
 

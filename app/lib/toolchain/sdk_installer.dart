@@ -114,6 +114,28 @@ fi
 [ -f /etc/hosts ] || printf '127.0.0.1 localhost\\n::1 localhost ip6-localhost ip6-loopback\\n127.0.1.1 foa\\n' > /etc/hosts
 ''';
 
+  /// Bug 435：dpkg 半安装中间态自愈——从 [ensure] 里抽出来供其它 apt
+  /// 路径复用（原先是 ensure 内联，git 安装路径没有，导致同一故障在
+  /// git 路径上重复出现）。
+  ///
+  /// 触发场景：任一次 apt 安装被中断（超时/取消/杀掉进程）后，dpkg
+  /// 数据库留下未完成事务，之后所有 apt 调用都会直接报
+  /// `E: dpkg was interrupted, you must manually run 'dpkg --configure -a'`
+  /// ——**连 `apt-get update` 都过不去**，用户看到的却是"自动安装 git 失败"，
+  /// 完全指不到真因。
+  ///
+  /// 三步（幂等，且每步失败都不阻断后续——修复本身不该成为新的失败点）：
+  ///   1. 清陈旧锁文件（exec 超时/取消杀进程后残留；proot 单线程无并发风险）
+  ///   2. `dpkg --configure -a` 补完未完成的解包/配置
+  ///   3. `apt-get -f install` 修复破损依赖
+  static const String repairDpkg = '''
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \\
+/var/cache/apt/archives/lock /var/lib/apt/lists/lock
+DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 | tail -n 20
+DEBIAN_FRONTEND=noninteractive apt-get -f install -y -qq \\
+--no-install-recommends 2>&1 | tail -n 20
+''';
+
   static Future<void> ensure(ProotBridge bridge) async {
     final check = await bridge.exec(
       'command -v xz >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 '
@@ -129,17 +151,10 @@ fi
     // "Syntax error: ";" unexpected"（用户真机抓到的第 78 行语法错误）。
     // Bug 409 修复（2026-09-17 真机抓到）：此前失败的安装尝试把 dpkg 数据库留在
     // 半安装中间态，apt 报 "E: dpkg was interrupted, you must manually run
-    // 'dpkg --configure -a'"。恢复三步（幂等、失败不阻断后续命令）：
-    //   1. 清陈旧锁文件（exec 超时/取消杀进程后残留；proot 单线程执行无并发风险）
-    //   2. dpkg --configure -a 补完未完成的解包/配置
-    //   3. apt-get -f install 修复破损依赖
+    // 'dpkg --configure -a'"。自愈步骤见 [repairDpkg]（Bug 435 抽出复用）。
     final r = await bridge.exec(
       '$_fixAccounts\n'
-      'rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock '
-      '/var/cache/apt/archives/lock /var/lib/apt/lists/lock\n'
-      'DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 | tail -n 20\n'
-      'DEBIAN_FRONTEND=noninteractive apt-get -f install -y -qq '
-      '--no-install-recommends 2>&1 | tail -n 20\n'
+      '$repairDpkg'
       'apt-get update -qq -o Acquire::Retries=3 2>&1 | tail -n 30\n'
       'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq '
       '--no-install-recommends -o Acquire::Retries=3 xz-utils unzip 2>&1 | tail -n 40\n'

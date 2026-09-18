@@ -336,7 +336,7 @@ class BuildRunner {
         '[ "\$ok" = 1 ] || exit 69; '
         'export PUB_HOSTED_URL=\$src; '
         // Bug 433 转发层再断言（pub get 后、build 前，同一 shell）
-        'sh -c ' + _shq(reassert) + ' 2>&1 | tail -n 2; '
+        'sh -c ${_shq(reassert)} 2>&1 | tail -n 2; '
         '$flutterCmd build apk --no-shrink --release '
         '--target-platform=android-arm64$aapt2Override';
   }
