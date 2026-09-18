@@ -1245,6 +1245,38 @@ openjdk-17  80.2 MB / 91.8 MB   ← 长时间冻结，无报错、不换源、�
 **教训**：网络重试要区分"瞬断"（同源重试有效）与"持续不可达"
 （必须换源）；弱网下 TLS 握手是第一个牺牲品。
 
+### Bug 424：多源轮换转义笔误——`$flutterCmd` 展开为空，`pub: not found` ×6
+
+**症状**（2026-09-18 真机 alpha.33，my_demo 构建 19 秒即败）：
+
+```
+/bin/sh: 1: pub: not found     × 6（正好 3 源 × 2 次）
+✗ 构建失败（exit 69）· 已运行 00:19
+```
+
+**原因**：Bug 423 的多源轮换是 shell 循环拼在 Dart 字符串里，写循环时
+把 shell 循环变量（`\$src`/`\$ok`，**必须**转义否则 Dart 插值）和 Dart
+侧的 flutter 路径混在同一行，顺手把 `\$flutterCmd` 也转义了——shell 里
+没有这个变量 → 展开为空 → 命令变成 `PUB_HOSTED_URL=$src pub get` 裸跑，
+`pub` 找不到，6 连败后 `exit 69`。末行的 build 命令用的是正确插值
+（`$flutterCmd`），所以 bug 只在 pub get 段。
+
+**为什么沙箱没拦住**：沙箱出包走本地 shell 直跑 flutter，不经过
+BuildRunner；analyze 只查语法、test 是单测不真跑构建——shell 字符串
+拼接的运行时行为只有真机执行才暴露（"我保证语法正确、真机验证"策略
+的已知盲区）。
+
+**解决**（alpha.34）：① `\$flutterCmd` → `$flutterCmd`（Dart 插值）；
+② 命令拼接提取为 `BuildRunner.buildCommand()` 纯函数，新增
+`build_runner_test.dart` 用文本断言固化转义边界（shell 变量必须保留
+`$src`/`$ok` 形态、flutter 命令必须以字面出现）——这是沙箱能拦住此类
+bug 的唯一层；③ shell 行为双分支模拟验证（假 flutter 函数：全败 6 次
+exit 69 / 第 5 次成功后源保留复用）。
+
+**教训**：同一行混用「shell 层变量」与「Dart 层值」时，逐个问
+"这个值在哪一层产生"——shell 产生的必须转义（留 `$x` 给 shell 求值），
+Dart 产生的必须插值；纯文本拼接的 shell 命令至少要有文本断言单测。
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
