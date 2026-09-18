@@ -307,6 +307,37 @@ class BuildRunner {
   ///   shell 里没有这个变量 → 展开为空 → `pub: not found` ×6 → exit 69
   ///   （alpha.33 真机实翻车）。同一行混用两层变量时，逐个问
   ///   「这个值在哪一层产生」。
+  /// 刷新 flutter 的「版本检查时间戳」，跳过它内部的 `git fetch --tags`。
+  ///
+  /// Bug 436（2026-09-19 真机）：每次构建都出现
+  /// ```
+  /// Command exited with code 128: fetch --tags
+  /// error: RPC failed; HTTP 504 curl 22 ... fatal: the remote end hung up
+  /// ```
+  /// 并在「准备构建环境」停留很久（4% 就耗掉近 2 分钟）。
+  ///
+  /// 真因**不在我们的镜像配置**——git URL 重写规则实测正确
+  /// （`git ls-remote --get-url` 确认已改写到 gitclone 镜像），
+  /// 而是 flutter 工具自身的版本新鲜度检查：
+  /// `VersionFreshnessValidator.checkAgeConsideredUpToDate = 3 days`，
+  /// 距上次检查超过 3 天就会重新 `_fetchRemoteFrameworkCommitDate()`
+  /// （内部即 `git fetch --tags`）。真机上该请求 504，flutter 吞掉异常
+  /// 继续跑（`VersionCheckError` 是 best-effort），**但用户要先等满超时**。
+  ///
+  /// stamp 文件 `<cache>/flutter_version_check.stamp` 是公开的缓存协议
+  /// （JSON，字段 `lastTimeVersionWasChecked`）。构建前把它刷新成当前时间，
+  /// flutter 就会认为「刚检查过」而跳过网络请求——这是官方机制内的用法，
+  /// 不修改 SDK 源码、不影响其它行为。
+  ///
+  /// 失败静默：这个优化本身不该成为新的失败点。
+  static const String refreshVersionCheckStamp = r'''
+C=@CACHE@
+S="$C/flutter_version_check.stamp"
+mkdir -p "$C" 2>/dev/null
+printf '{\n  "lastTimeVersionWasChecked": "%s"\n}\n' "$(date '+%Y-%m-%d %H:%M:%S.%6N')" > "$S" 2>/dev/null
+exit 0
+''';
+
   static String buildCommand({
     required String proj,
     required String flutterCmd,
@@ -324,8 +355,16 @@ class BuildRunner {
     final reassert = QemuCompat.wrapReassertScript
         .replaceAll('@ENGINE@', QemuCompat.engineDir)
         .replaceAll('@QEMU@', QemuCompat.qemuBin);
+    // Bug 436：跳过 flutter 内部的 git fetch --tags 版本检查
+    final stampFix = refreshVersionCheckStamp
+        .replaceAll('@CACHE@', '${QemuCompat.flutterHome}/bin/cache');
     return "cd $proj && $envPart"
         'FLUTTER_ALLOW_ROOT=true '
+        // Bug 436：proot 路径原先没设该变量（只有 pub get 那行内联了
+        // PUB_HOSTED_URL），导致引擎/资产下载回落到官方地址。
+        // profile.d/foa-env.sh 里有，但 proot -c 直接执行 sh 不读 profile。
+        'FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn '
+        'sh -c ${_shq(stampFix)} 2>&1 | tail -n 1; '
         'ok=0; '
         'for src in https://pub.flutter-io.cn '
         'https://mirrors.tuna.tsinghua.edu.cn/dart-pub '

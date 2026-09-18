@@ -276,30 +276,62 @@ loader=no
 if [ -f /lib64/ld-linux-x86-64.so.2 ] && /usr/bin/qemu-x86_64-static -L / /lib64/ld-linux-x86-64.so.2 --version >/dev/null 2>&1; then loader=yes; fi
 echo "LOADER=$loader"
 # 引擎转发层 + 分步验证 3：包装后的 gen_snapshot 可跑通 --help
-gs=@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot
-if [ -x "$gs" ]; then
-  # Bug 428：先确认是转发脚本（#! 开头）——若是真 x64 二进制，在 arm64
-  # 上会 SIGILL（崩溃无输出），旧逻辑只查错误字样会把静默崩溃误判为通过
-  if head -c 2 "$gs" 2>/dev/null | grep -q '#!'; then
-    out=$( "$gs" --help 2>&1 | head -3 )
-    rc=$?
-    case "$out" in
-      *'cannot execute'*|*'Exec format'*|*'error while loading shared libraries'*) echo "GEN_SNAPSHOT=no" ;;
-      *)
-        # SIGILL 时进程被信号杀死（rc=132/-4 或输出为空）：判为未就位
-        if [ -z "$out" ] || [ "$rc" -ge 128 ] 2>/dev/null; then
-          echo "GEN_SNAPSHOT=no"
-        else
-          echo "GEN_SNAPSHOT=yes"
-        fi
-        ;;
-    esac
-  else
-    echo "GEN_SNAPSHOT=no"
+#
+# Bug 437：原先只测 android-arm64-release/linux-arm64/gen_snapshot，
+# 漏掉了 **顶层 linux-arm64/ 的 impellerc**——而真机 AOT 崩的恰恰是它
+# （`impellerc failure:` / shader 编译 exit -4）。REASSERT=0（转发层完好）
+# 却仍崩，就是因为**这个工具从来没被验证过**。
+# 现在逐个测：顶层与各 android-*/ 下的 impellerc / gen_snapshot 都要过。
+smoke() {
+  # $1=工具路径 $2=标签  => 输出 "<标签>=yes|no"，失败时附一行诊断
+  #
+  # Bug 437：失败时必须输出**具体原因**。原先只输出 yes/no，
+  # 真机上无法区分「脚本缺失」「目标 x64 二进制被覆盖」「依赖库找不到」
+  # 「SIGILL」——而这四种的修法完全不同。诊断信息才是这条命令的价值。
+  t="$1"; n="$2"
+  if [ ! -x "$t" ]; then echo "$n=no"; echo "  $n: 文件不存在或不可执行"; return; fi
+  if ! head -c 2 "$t" 2>/dev/null | grep -q '#!'; then
+    echo "$n=no"
+    echo "  $n: 不是转发脚本（真 x64 二进制，arm64 上必 SIGILL）"
+    return
   fi
-else
-  echo "GEN_SNAPSHOT=no"
-fi
+  o=$( "$t" --help 2>&1 | head -5 )
+  r=$?
+  case "$o" in
+    *'cannot execute'*|*'Exec format'*)
+      echo "$n=no"; echo "  $n: Exec format error（qemu 未生效或未安装）"; return ;;
+    *'error while loading shared libraries'*|*'No such file'*)
+      echo "$n=no"; echo "  $n: 依赖库缺失 → ${o%%$'\n'*}"; return ;;
+    *'Permission denied'*)
+      echo "$n=no"; echo "  $n: 无执行权限"; return ;;
+  esac
+  if [ -z "$o" ]; then
+    echo "$n=no"; echo "  $n: 无输出（rc=$r）——多为 SIGILL（qemu 跑 x64 失败）"
+    return
+  fi
+  if [ "$r" -ge 128 ] 2>/dev/null; then
+    echo "$n=no"; echo "  $n: 信号退出 rc=$r（128+n，n=4 即 SIGILL）"; return
+  fi
+  echo "$n=yes"
+  echo "  $n: 正常"
+}
+# Bug 437：逐个冒烟——gen_snapshot（AOT）+ impellerc（shader）都在真机崩过
+smoke @ENGINE@/android-arm64-release/linux-arm64/gen_snapshot GEN_SNAPSHOT
+smoke @ENGINE@/linux-arm64/impellerc IMPELLERC
+smoke @ENGINE@/linux-arm64/font-subset FONT_SUBSET
+# Bug 437：报告转发脚本指向的目标是否仍是 x64 ELF（被 pub get 覆盖会变成
+# arm64 或损坏文件，此时脚本还在、REASSERT 也是 0，但一跑就崩）
+for pair in \
+  "@ENGINE@/linux-arm64/impellerc:@ENGINE@/linux-x64/impellerc" \
+  "@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot:@ENGINE@/android-arm64-release/linux-x64/gen_snapshot" ; do
+  s="${pair%%:*}"; d="${pair##*:}"
+  [ -f "$d" ] || { echo "TARGET_MISSING=$(basename "$s") 目标 $d 不存在"; continue; }
+  m=$(dd if="$d" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  case "$m" in
+    7f454c46*3e) ;;
+    *) echo "TARGET_BAD=$(basename "$s") 目标不是 x86_64 ELF（magic=$m）→ 已被覆盖" ;;
+  esac
+done
 # Flutter 工具链转发（dart 已被 qemu 接管才不会有 Snapshot 不兼容）
 if [ -f @FLUTTER@/bin/cache/dart-sdk/bin/dart.foa-real ]; then
   echo "DART=yes"
@@ -401,18 +433,39 @@ echo UNINSTALL_OK
     if (qemu.isEmpty) return null;
     final loaderOk = kv('LOADER') == 'yes';
     final genOk = kv('GEN_SNAPSHOT') == 'yes';
+    // Bug 437：impellerc / font-subset 也纳入判定——它们才是真机 AOT
+    // 阶段实际执行、也确实崩过的工具
+    final impOk = kv('IMPELLERC') == 'yes';
+    final fsOk = kv('FONT_SUBSET') == 'yes';
     final dartOk = kv('DART') == 'yes';
     final aaptOk = kv('AAPT2') == 'yes';
     final gradleOk = kv('GRADLE') == 'yes';
 
-    return [
-      'qemu ${qemu.split(' ').last}',
-      loaderOk ? 'x86_64 动态链接器可运行' : '多架构库缺失',
-      dartOk ? 'flutter 工具链已转发' : 'flutter 工具链未转发（装 Flutter 后重新应用）',
-      genOk ? 'gen_snapshot 冒烟通过' : '引擎产物未同步（装 Flutter 后重新应用）',
-      aaptOk ? 'aapt2 已接管' : 'SDK 工具未接管',
-      gradleOk ? 'AGP 已指向本地 aapt2' : 'gradle 未配置',
-    ].join(' · ');
+    // Bug 437：收集失败工具的诊断行（以两个空格开头的续行），
+    // 以及转发目标被覆盖的告警——这些才是真机排障的关键信息
+    final diags = <String>[];
+    for (final line in r.stdout.split('\n')) {
+      final t = line.trimRight();
+      if (t.startsWith('  ') && t.trim().isNotEmpty) {
+        diags.add(t.trim());
+      } else if (t.startsWith('TARGET_BAD=') || t.startsWith('TARGET_MISSING=')) {
+        diags.add(t);
+      }
+    }
+
+    final buf = StringBuffer()
+      ..write('qemu ${qemu.split(' ').last}')
+      ..write(loaderOk ? ' · x86_64 动态链接器可运行' : ' · 多架构库缺失')
+      ..write(dartOk ? ' · flutter 工具链已转发' : ' · flutter 工具链未转发（装 Flutter 后重新应用）')
+      ..write(genOk ? ' · gen_snapshot 冒烟通过' : ' · gen_snapshot 不可用')
+      ..write(impOk ? ' · impellerc 冒烟通过' : ' · impellerc 不可用（AOT 会在 shader 阶段崩）')
+      ..write(fsOk ? ' · font-subset 冒烟通过' : ' · font-subset 不可用')
+      ..write(aaptOk ? ' · aapt2 已接管' : ' · SDK 工具未接管')
+      ..write(gradleOk ? ' · AGP 已指向本地 aapt2' : ' · gradle 未配置');
+    if (diags.isNotEmpty) {
+      buf.write('\n诊断详情：\n${diags.map((d) => '  • $d').join('\n')}');
+    }
+    return buf.toString();
   }
 
   // ---------------- 安装 / 应用 ----------------

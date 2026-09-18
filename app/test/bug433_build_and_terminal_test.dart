@@ -51,14 +51,20 @@ void main() {
     });
 
     test('再断言不得引入新的 pub get / precache（避免递归与耗时）', () {
-      final start = cmd.indexOf("sh -c '");
-      final end = cmd.lastIndexOf('build apk');
-      expect(start, greaterThan(0), reason: '必须以 sh -c 形式内嵌');
-      final seg = cmd.substring(start, end);
-      expect(seg.contains('pub get'), isFalse,
+      // 直接检查再断言脚本本体——比在拼好的命令里按 "sh -c '" 切片稳，
+      // 因为 Bug 436 之后命令里还有其它 sh -c 片段（版本检查 stamp），
+      // 按位置切片会切错对象。
+      const s = QemuCompat.wrapReassertScript;
+      expect(s.contains('pub get'), isFalse,
           reason: '再断言脚本内不得再跑 pub get');
-      expect(seg.contains('precache'), isFalse,
+      expect(s.contains('precache'), isFalse,
           reason: '前置检查已确保构件存在，再断言不该 precache');
+    });
+
+    test('命令里注入的再断言脚本确实是 wrapReassertScript', () {
+      // 机械保障：命令里必须出现该脚本的特征串
+      expect(cmd.contains('REASSERT='), isTrue);
+      expect(QemuCompat.wrapReassertScript.contains('REASSERT='), isTrue);
     });
 
     test('用 sh -c 而非 { ... ; } 分组（后者遇尾部换行会报语法错）', () {
