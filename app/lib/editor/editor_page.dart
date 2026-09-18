@@ -3,6 +3,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../core/theme.dart';
 import 'code_editor.dart';
+import 'editor_last_file.dart';
 import 'file_tree.dart';
 import 'fs_bridge.dart';
 
@@ -46,7 +47,29 @@ class _EditorPageState extends State<EditorPage> {
     final p = widget.initialPath;
     if (p != null && p.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _openFile(p));
+    } else if ((widget.initialDir ?? '').isNotEmpty) {
+      // alpha.34 代码区融合：工作台「代码」直达编辑器时自动恢复——
+      // 优先上次编辑的文件，无记录（或已删除）回退 lib/main.dart
+      WidgetsBinding.instance.addPostFrameCallback((_) => _restoreLast());
     }
+  }
+
+  /// 恢复上次编辑位置：EditorLastFile 记录 → lib/main.dart 兜底。
+  /// 先探测可读再打开（不弹"读取失败"toast——恢复失败静默降级）。
+  Future<void> _restoreLast() async {
+    final dir = widget.initialDir!;
+    final last = await EditorLastFile.get(dir);
+    if (last != null && last.isNotEmpty) {
+      final probe = await widget.bridge.read(last);
+      if (probe.ok) {
+        if (mounted) await _openFile(last);
+        return;
+      }
+    }
+    // 无记录（或上次文件已删）→ lib/main.dart 兜底；再没有就空态展示
+    final fallbackPath = '$dir/lib/main.dart';
+    final fallback = await widget.bridge.read(fallbackPath);
+    if (fallback.ok && mounted) await _openFile(fallbackPath);
   }
 
   // ---------------- 文件操作 ----------------
@@ -67,6 +90,9 @@ class _EditorPageState extends State<EditorPage> {
       _initialContent = r.content;
       _dirty = false;
     });
+    // 记住最后打开的文件（alpha.34）：下次直达编辑器自动恢复此位置
+    final dir = widget.initialDir;
+    if (dir != null && dir.isNotEmpty) EditorLastFile.set(dir, path);
     // 若从 Drawer（竖屏侧边栏）打开文件，收起抽屉让编辑器全屏可见
     final scaffold = Scaffold.maybeOf(context);
     if (scaffold != null && scaffold.isDrawerOpen) {

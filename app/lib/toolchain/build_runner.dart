@@ -146,7 +146,24 @@ class BuildRunner {
       return;
     }
 
-    lines.add('▶ flutter build apk --release --target-platform=android-arm64');
+    // proot 后端补一项 Flutter 存在性检查（termux 已在上方前置检查里
+    // 覆盖）：快速失败给引导，别等 shell 报 `flutter: not found`
+    if (!bare) {
+      final probe = await bridge.exec(
+        'test -x /opt/flutter/bin/flutter && echo __OK__ || echo __NO__',
+        timeoutSec: 30,
+      );
+      if (!probe.stdout.contains('__OK__')) {
+        status = BuildStatus.error;
+        lines.add('✗ 容器内未找到 Flutter SDK（/opt/flutter/bin/flutter）');
+        lines.add('  请到「工具链」页安装 Flutter 后再打包');
+        _ui();
+        return;
+      }
+    }
+
+    lines.add('▶ flutter build apk --no-shrink --release'
+        ' --target-platform=android-arm64');
     lines.add('  目录：$projectsDir/$name');
     lines.add('  后端：${bare ? 'Termux 裸原生（不经 proot）' : 'Proot 容器'}');
     lines.add('');
@@ -211,19 +228,12 @@ class BuildRunner {
     final flutterCmd =
         bare ? "'${TermuxPaths.flutterHome(env)}/bin/flutter'" : 'flutter';
     final envPart = bare ? TermuxPaths.envPrefix(env) : '';
-    final cmd = "cd $proj && $envPart"
-        'FLUTTER_ALLOW_ROOT=true '
-        'ok=0; '
-        'for src in https://pub.flutter-io.cn '
-        'https://mirrors.tuna.tsinghua.edu.cn/dart-pub '
-        'https://mirrors.ustc.edu.cn/dart-pub; do '
-        'for i in 1 2; do '
-        'if PUB_HOSTED_URL=\$src \$flutterCmd pub get; '
-        'then ok=1; break 2; fi; sleep 3; done; done; '
-        '[ "\$ok" = 1 ] || exit 69; '
-        'export PUB_HOSTED_URL=\$src; '
-        '$flutterCmd build apk --release '
-        '--target-platform=android-arm64$aapt2Override';
+    final cmd = buildCommand(
+      proj: proj,
+      flutterCmd: flutterCmd,
+      envPart: envPart,
+      aapt2Override: aapt2Override,
+    );
     final stream = await bridge.execStream(cmd, bare: bare);
     if (!stream.ok || stream.id <= 0) {
       status = BuildStatus.error;
@@ -240,6 +250,62 @@ class BuildRunner {
 
     _timer?.cancel();
     _timer = Timer.periodic(const Duration(milliseconds: 500), (_) => _poll());
+  }
+
+  /// 拼接构建命令：pub 多源轮换（Bug 423）+ flutter build（迭代包
+  /// --no-shrink 跳过 R8，双轨策略——最终版发布包才用 R8）。
+  ///
+  /// 转义边界（Bug 424 教训，单测固化在 build_runner_test.dart）：
+  /// - `\$src` / `\$ok` **必须**转义——shell for 循环变量，值在 shell 层
+  ///   产生，Dart 插值会变成字面字符串；
+  /// - `$flutterCmd` **必须** Dart 插值——值在 Dart 层产生，误转义后
+  ///   shell 里没有这个变量 → 展开为空 → `pub: not found` ×6 → exit 69
+  ///   （alpha.33 真机实翻车）。同一行混用两层变量时，逐个问
+  ///   「这个值在哪一层产生」。
+  static String buildCommand({
+    required String proj,
+    required String flutterCmd,
+    required String envPart,
+    required String aapt2Override,
+  }) {
+    return "cd $proj && $envPart"
+        'FLUTTER_ALLOW_ROOT=true '
+        'ok=0; '
+        'for src in https://pub.flutter-io.cn '
+        'https://mirrors.tuna.tsinghua.edu.cn/dart-pub '
+        'https://mirrors.ustc.edu.cn/dart-pub; do '
+        'for i in 1 2; do '
+        'if PUB_HOSTED_URL=\$src $flutterCmd pub get; '
+        'then ok=1; break 2; fi; sleep 3; done; done; '
+        '[ "\$ok" = 1 ] || exit 69; '
+        'export PUB_HOSTED_URL=\$src; '
+        '$flutterCmd build apk --no-shrink --release '
+        '--target-platform=android-arm64$aapt2Override';
+  }
+
+  /// 清理构建缓存（flutter clean，工作台打包配置卡的快捷操作）：
+  /// 返回 null = 成功，否则返回错误文案。构建中拒绝（防清掉正在
+  /// 使用的 build 目录）。
+  Future<String?> clean(String name, EnvInfo env, BuildBackend backend) async {
+    if (building) return '正在构建中，不能清理缓存';
+    final bare = backend == BuildBackend.termux;
+    final projectsDir = bare ? '${env.rootfsPath}/root/projects' : _projectsDir;
+    final flutterDir = bare ? TermuxPaths.flutterHome(env) : '/opt/flutter';
+    final flutterCmd =
+        bare ? "'$flutterDir/bin/flutter'" : 'flutter';
+    final envPart = bare ? TermuxPaths.envPrefix(env) : '';
+    final r = await bridge.exec(
+      'cd $projectsDir/${_q(name)} && $envPart'
+      'FLUTTER_ALLOW_ROOT=true $flutterCmd clean',
+      timeoutSec: 300,
+      bare: bare,
+    );
+    if (r.exitCode != 0) {
+      final out = (r.stdout.isNotEmpty ? r.stdout : r.stderr).trim();
+      return 'flutter clean 失败（exit ${r.exitCode}）'
+          '${out.isEmpty ? '' : '：${out.split('\n').last}'}';
+    }
+    return null;
   }
 
   /// termux 后端的 gradle wrapper 镜像改写：不经 shell，Dart 直接读写
@@ -330,6 +396,10 @@ class BuildRunner {
     String? tip;
     if (l.contains('exec format error')) {
       tip = '架构不匹配：x64 工具未经 qemu 转发（工具链页 → x64 兼容层 → 重新应用）';
+    } else if (l.contains(': not found')) {
+      tip = '命令缺失（sh: xxx: not found）：容器组件不全——到「工具链」页'
+          '核对 Flutter / JDK / SDK 组件后重试（alpha.33 的 pub: not found '
+          '属构建器自身 bug，alpha.34 已修）';
     } else if (l.contains('shared libraries')) {
       tip = '多架构运行库缺失：x64 兼容层 → 重新应用';
     } else if (l.contains('no space left')) {

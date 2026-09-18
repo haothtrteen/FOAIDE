@@ -246,7 +246,7 @@ class _BuildPageState extends State<BuildPage> {
                 const SizedBox(height: 8),
                 Text(
                   '1. 项目位于容器 /root/projects（需已装 JDK / Android SDK / Flutter SDK / 构建镜像，见「工具链」页）\n'
-                  '2. 点击项目 → flutter build apk --release（arm64，日志流式输出，可随时取消）\n'
+                  '2. 点击项目 → flutter build apk --no-shrink --release（arm64，日志流式输出，可随时取消）\n'
                   '3. 构建成功 → 一键拉起系统安装器安装 APK',
                   style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
                 ),
@@ -329,7 +329,7 @@ class _BuildPageState extends State<BuildPage> {
                     leading: const Icon(Icons.folder),
                     title: Text(p.name,
                         style: const TextStyle(fontWeight: FontWeight.w600)),
-                    subtitle: const Text('flutter build apk --release'),
+                    subtitle: const Text('flutter build apk --no-shrink --release'),
                     trailing: ready
                         ? FilledButton.tonalIcon(
                             onPressed: () => _startBuild(p.name),

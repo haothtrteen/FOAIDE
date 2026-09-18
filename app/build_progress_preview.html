@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>FOA 构建 APK · 进度条设计预览</title>
+<style>
+  :root{
+    --bg:#0A0D11; --panel:#11151B; --log:#0C0F13; --line:rgba(255,255,255,.12);
+    --txt:#D6DEE8; --dim:#8A93A0; --dimmer:#5A626E;
+    --blue:#4C8DFF; --green:#3DDC84; --red:#FF7A7A; --amber:#FFC46B;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;padding:28px 20px 40px;
+    background:radial-gradient(1200px 600px at 20% -10%,#16202e 0%,var(--bg) 60%);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    color:var(--txt);-webkit-font-smoothing:antialiased;
+  }
+  h1{font-size:19px;margin:0 0 4px;letter-spacing:.3px}
+  .sub{color:var(--dim);font-size:12.5px;margin-bottom:26px;line-height:1.7}
+  .sub code{background:rgba(255,255,255,.07);padding:1px 5px;border-radius:4px;font-size:11.5px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:20px;max-width:1400px}
+  .phone{
+    background:#000;border:1px solid var(--line);border-radius:18px;overflow:hidden;
+    box-shadow:0 18px 46px rgba(0,0,0,.5);
+  }
+  .bar{
+    display:flex;align-items:center;gap:10px;padding:11px 14px;
+    border-bottom:1px solid var(--line);background:#12161C;
+  }
+  .bar .back{color:var(--dim);font-size:17px;line-height:1}
+  .bar .title{font-size:14px;font-weight:600}
+  .body{padding:12px}
+  .prog{
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:12px 14px;margin-bottom:10px;
+  }
+  .row1{display:flex;align-items:center;gap:8px;margin-bottom:9px}
+  .stage{flex:1;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pct{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+  .track{height:8px;border-radius:4px;background:rgba(255,255,255,.10);overflow:hidden}
+  .fill{height:100%;border-radius:4px;transition:width .35s linear}
+  .meta{display:flex;align-items:center;gap:5px;margin-top:9px;font-size:11px;color:var(--dim)}
+  .meta .note{color:var(--dimmer);font-style:italic}
+  .spinner{
+    width:12px;height:12px;border-radius:50%;border:2px solid rgba(76,141,255,.25);
+    border-top-color:var(--blue);animation:spin .8s linear infinite;flex:none
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .log{
+    background:var(--log);border:1px solid var(--line);border-radius:12px;
+    padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:11.5px;line-height:1.55;color:var(--txt);height:172px;overflow:hidden;
+    white-space:pre-wrap;word-break:break-all;
+  }
+  .log .g{color:var(--green)} .log .r{color:var(--red)} .log .d{color:#6C7684}
+  .hint{
+    margin-top:9px;padding-top:9px;border-top:1px solid var(--line);
+    font-size:11px;color:var(--amber);display:flex;gap:6px;align-items:flex-start;line-height:1.5
+  }
+  .fab{
+    position:relative;float:right;margin:-46px 22px 0 0;width:32px;height:32px;border-radius:50%;
+    background:#2A3038;border:1px solid var(--line);display:flex;align-items:center;
+    justify-content:center;color:var(--txt);font-size:14px
+  }
+  .cap{margin:10px 2px 0;font-size:11.5px;color:var(--dim);line-height:1.6}
+  .cap b{color:var(--txt)}
+  .tag{display:inline-block;font-size:10px;padding:1.5px 7px;border-radius:99px;margin-left:6px;vertical-align:1px}
+  .tag.b{background:rgba(76,141,255,.16);color:var(--blue)}
+  .tag.g{background:rgba(61,220,132,.16);color:var(--green)}
+  .tag.r{background:rgba(255,122,122,.16);color:var(--red)}
+</style>
+</head>
+<body>
+<h1>构建 APK · 进度条（四态）</h1>
+<div class="sub">
+  进度来源：<code>flutter build apk</code> 不输出百分比 → 日志关键词做<b>阶段识别</b>（单调不回退）
+  ＋ 阶段内 <code>1−e^(−t/τ)</code> 时间插值（渐近、永不封顶）。只有真正成功才授予 100%。<br>
+  下面四态均为 <code>build_page.dart</code> 中 <code>_buildProgressPanel()</code> 的真实渲染逻辑。
+</div>
+
+<div class="grid">
+
+  <!-- 1. 构建中 -->
+  <div class="phone">
+    <div class="bar"><span class="back">←</span><span class="title">构建 APK</span></div>
+    <div class="body">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px">
+        <span style="color:var(--amber)">⏳</span>
+        <span style="font-weight:600;flex:1">foa-demo</span>
+        <span style="background:rgba(76,141,255,.16);color:var(--blue);padding:5px 12px;border-radius:8px;font-size:12px">■ 取消</span>
+      </div>
+      <div class="prog">
+        <div class="row1">
+          <div class="spinner"></div>
+          <span class="stage" style="color:var(--blue)">编译资源（aapt2）</span>
+          <span class="pct" style="color:var(--blue)">68%</span>
+        </div>
+        <div class="track"><div class="fill" style="width:68%;background:var(--blue)"></div></div>
+        <div class="meta">🕐 已用 07:42 <span class="note">构建为长任务（首次 15~30 分钟），后台仍在运行</span></div>
+      </div>
+      <div class="log"><span class="d">Running Gradle task 'assembleRelease'...</span>
+<span class="d">&gt; Task :app:compileFlutterBuildRelease</span>
+<span class="d">Target android_aot_release_android-arm64</span>
+<span class="d">&gt; Task :app:mergeReleaseResources</span>
+&gt; Task :app:processReleaseResources
+&gt; Task :app:packageReleaseResources
+<span class="d">still running...</span></div>
+      <div class="fab">↓</div>
+      <div style="clear:both"></div>
+    </div>
+  </div>
+  <div class="cap" style="grid-column:1/-1;margin-top:-6px">
+    <b>① 构建中</b><span class="tag b">最关键的态</span> 纺锤表明"活着"，<b>百分比</b>表明"走到哪"，<b>阶段名</b>表明"在干什么"，
+    <b>已用时间</b>每秒在跳——三重"没卡死"证据。日志区右上角的 ↓ 只在用户手动上滑后出现，不打断但可一键回到底部。
+  </div>
+
+  <!-- 2. 成功 -->
+  <div class="phone">
+    <div class="bar"><span class="back">←</span><span class="title">构建 APK</span></div>
+    <div class="body">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px">
+        <span style="color:var(--green)">✓</span>
+        <span style="font-weight:600;flex:1">foa-demo</span>
+        <span style="border:1px solid var(--line);color:var(--txt);padding:5px 12px;border-radius:8px;font-size:12px;margin-right:8px">安装</span>
+        <span style="background:rgba(76,141,255,.16);color:var(--blue);padding:5px 12px;border-radius:8px;font-size:12px">返回列表</span>
+      </div>
+      <div class="prog">
+        <div class="row1">
+          <span class="stage" style="color:var(--green)">构建完成</span>
+          <span class="pct" style="color:var(--green)">100%</span>
+        </div>
+        <div class="track"><div class="fill" style="width:100%;background:var(--green)"></div></div>
+        <div class="meta">🕐 耗时 18:24</div>
+      </div>
+      <div class="log"><span class="g">✓ Built build/app/outputs/flutter-apk/app-release.apk (87.4MB)</span>
+
+<span class="g">✓ 构建成功：/root/projects/foa-demo/build/app/outputs/flutter-apk/app-release.apk</span>
+  <span class="d">总耗时 18:24</span></div>
+    </div>
+  </div>
+  <div class="cap" style="grid-column:1/-1;margin-top:-6px">
+    <b>② 成功</b><span class="tag g">唯一能到 100% 的态</span>
+    进度条变绿走到头，同时给出总耗时。成功标记只由"退出码 0 <b>且</b> 产物文件确实存在"授予——不会出现"进度 100% 但其实没产物"的假成功。
+  </div>
+
+  <!-- 3. 失败 -->
+  <div class="phone">
+    <div class="bar"><span class="back">←</span><span class="title">构建 APK</span></div>
+    <div class="body">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px">
+        <span style="color:var(--red)">!</span>
+        <span style="font-weight:600;flex:1">foa-demo</span>
+        <span style="border:1px solid var(--line);color:var(--dim);padding:5px 12px;border-radius:8px;font-size:12px;margin-right:8px">安装</span>
+        <span style="background:rgba(76,141,255,.16);color:var(--blue);padding:5px 12px;border-radius:8px;font-size:12px">返回列表</span>
+      </div>
+      <div class="prog">
+        <div class="row1">
+          <span class="stage" style="color:var(--red)">构建中断于：编译资源（aapt2）</span>
+          <span class="pct" style="color:var(--red)">67%</span>
+        </div>
+        <div class="track"><div class="fill" style="width:67%;background:var(--red)"></div></div>
+        <div class="meta">🕐 耗时 03:11</div>
+        <div class="hint">💡 <span>架构不匹配：x64 工具未经 qemu 转发（工具链页 → x64 兼容层 → 重新应用）</span></div>
+      </div>
+      <div class="log"><span class="r">&gt; Task :app:mergeReleaseResources FAILED</span>
+error: cannot execute binary file: Exec format error
+<span class="d">...</span>
+<span class="r">✗ 构建失败（exit 1）· 已运行 03:11 · 进度冻结在 67%</span></div>
+    </div>
+  </div>
+  <div class="cap" style="grid-column:1/-1;margin-top:-6px">
+    <b>③ 失败</b><span class="tag r">进度冻结，不再骗人</span>
+    失败时进度<b>停止爬升</b>并变红，停在真实中断点。日志里的已知错误模式（Exec format error / 缺库 / 磁盘满 / 下载失败 / 快照不兼容）
+    会被翻译成可执行的修复建议，直接显示在进度条下方，不用用户去翻 1000 行日志。
+  </div>
+
+  <!-- 4. 取消 -->
+  <div class="phone">
+    <div class="bar"><span class="back">←</span><span class="title">构建 APK</span></div>
+    <div class="body">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px">
+        <span style="color:var(--red)">■</span>
+        <span style="font-weight:600;flex:1">foa-demo</span>
+        <span style="border:1px solid var(--line);color:var(--dim);padding:5px 12px;border-radius:8px;font-size:12px;margin-right:8px">安装</span>
+        <span style="background:rgba(76,141,255,.16);color:var(--blue);padding:5px 12px;border-radius:8px;font-size:12px">返回列表</span>
+      </div>
+      <div class="prog">
+        <div class="row1">
+          <span class="stage" style="color:var(--red)">已取消</span>
+          <span class="pct" style="color:var(--red)">31%</span>
+        </div>
+        <div class="track"><div class="fill" style="width:31%;background:var(--red)"></div></div>
+        <div class="meta">🕐 耗时 04:58</div>
+      </div>
+      <div class="log"><span class="d">Target android_aot_release_android-arm64</span>
+<span class="d">...</span>
+
+<span class="r">⏹ 已取消（用户中止）· 已运行 04:58</span></div>
+    </div>
+  </div>
+  <div class="cap" style="grid-column:1/-1;margin-top:-6px">
+    <b>④ 取消</b><span class="tag r">用户主动中止</span>
+    <code>execStreamStop</code> 走 SIGTERM → 短等 → 强杀，同时关闭输出流，避免 gradle daemon 持有管道导致进程泄漏。进度同样冻结，不再继续爬。
+  </div>
+
+</div>
+
+<div class="sub" style="margin-top:30px;max-width:1400px">
+  <b style="color:var(--txt)">阶段权重怎么来的（累计百分比）</b><br>
+  准备 0→4% ｜ 解析依赖 4→14% ｜ 配置 Gradle 14→26% ｜ 编译 Dart 内核 26→40% ｜
+  AOT(gen_snapshot) 40→58% ｜ 编译资源(aapt2) 58→72% ｜ Kotlin/dex(R8) 72→86% ｜
+  打包签名 86→96% ｜ 校验产物 96→99%<br>
+  Gradle 配置与 aapt2 资源编译被刻意分配了较大权重——这两段在 aarch64 上走 qemu 最慢，占比最大。
+</div>
+</body>
+</html>

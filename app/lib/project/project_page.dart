@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../editor/editor_page.dart';
-import '../editor/file_tree.dart';
 import '../editor/fs_bridge.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
@@ -18,11 +17,12 @@ import '../toolchain/termux_backend.dart';
 /// 布局模仿 FusionApp 风格：左侧抽屉切换「概览 / 代码 / 清单 / 打包」，
 /// AppBar 副标题跟随当前区。各职责：
 /// - 概览：项目元信息（pubspec + android 清单解析）+ 快捷入口；
-/// - 代码：项目根文件树，点文件进编辑器（EditorPage 定位到项目目录）；
+/// - 代码：直达编辑器（alpha.34 融合——文件树在编辑器抽屉/左栏内，
+///   自动恢复上次编辑文件，无记录回退 lib/main.dart；不再停留文件树页）；
 /// - 清单：应用名称 / 包名 / 版本名 / 版本代码 / 权限（版本可编辑，
 ///   写回 pubspec 的 version 行——applicationId/label 只读防误改）；
 /// - 打包：BuildRunner 单例的构建面板（同一会话与构建页/通知互通，
-///   前台服务保活照常生效）。
+///   前台服务保活照常生效）+ 清理构建缓存（flutter clean）。
 ///
 /// 与 BuildPage 的关系：BuildPage 仍是通知回跳/直达构建的完整页面；
 /// 本页是"项目为中心"的工作台视图。构建状态都在 BuildRunner 全局单例，
@@ -278,12 +278,6 @@ class _ProjectPageState extends State<ProjectPage> {
                       child: CircularProgressIndicator(strokeWidth: 2))
                   : const Icon(Icons.save_outlined),
             ),
-          if (_section == _Section.code)
-            IconButton(
-              tooltip: '在编辑器中打开',
-              onPressed: _openEditor,
-              icon: const Icon(Icons.open_in_new),
-            ),
         ],
       ),
       drawer: _buildDrawer(),
@@ -355,8 +349,14 @@ class _ProjectPageState extends State<ProjectPage> {
                   child: InkWell(
                     borderRadius: BorderRadius.circular(10),
                     onTap: () {
-                      setState(() => _section = s);
                       Navigator.of(context).pop(); // 收起抽屉
+                      if (s == _Section.code) {
+                        // alpha.34 代码区融合：不进工作台停留区，直达
+                        // 编辑器（文件树在编辑器抽屉/左栏，少一次跳转）
+                        _openEditor();
+                        return;
+                      }
+                      setState(() => _section = s);
                     },
                     child: Padding(
                       padding: const EdgeInsets.symmetric(
@@ -525,6 +525,8 @@ class _ProjectPageState extends State<ProjectPage> {
 
   // ============================ 代码 ============================
 
+  /// 直达编辑器（抽屉「代码」与概览「写代码」共用）：文件树在编辑器的
+  /// 抽屉/左栏内，自动恢复上次编辑的文件（无记录回退 lib/main.dart）。
   void _openEditor() {
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => EditorPage(
@@ -533,43 +535,24 @@ class _ProjectPageState extends State<ProjectPage> {
     ));
   }
 
+  /// 兜底视图（alpha.34 起抽屉「代码」直达编辑器，此分支正常不可达）。
   Widget _buildCode() {
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
-          child: Row(
-            children: [
-              Icon(Icons.folder_outlined,
-                  size: 15, color: Colors.grey.shade500),
-              const SizedBox(width: 6),
-              Text('项目根：${widget.projectName}/',
-                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
-              const Spacer(),
-              TextButton.icon(
-                onPressed: _openEditor,
-                icon: const Icon(Icons.open_in_new, size: 15),
-                label: const Text('编辑器', style: TextStyle(fontSize: 12)),
-              ),
-            ],
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.code, size: 44, color: Color(0xFF3DDC84)),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: _openEditor,
+            icon: const Icon(Icons.open_in_new, size: 16),
+            label: const Text('打开编辑器'),
           ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: FileTree(
-            bridge: _fb,
-            initialDir: '/root/projects/${widget.projectName}',
-            onOpenFile: (path) {
-              Navigator.of(context).push(MaterialPageRoute(
-                builder: (_) => EditorPage(
-                  initialDir: '/root/projects/${widget.projectName}',
-                  initialPath: path,
-                ),
-              ));
-            },
-          ),
-        ),
-      ],
+          const SizedBox(height: 8),
+          Text('文件树在编辑器左侧抽屉内',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+        ],
+      ),
     );
   }
 
@@ -760,7 +743,8 @@ class _ProjectPageState extends State<ProjectPage> {
                           fontSize: 15, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
                   Text(
-                    'flutter build apk --release --target-platform=android-arm64\n'
+                    'flutter build apk --no-shrink --release'
+                    ' --target-platform=android-arm64\n'
                     '后端：${_backend == BuildBackend.termux ? 'Termux 裸原生（不经 proot）' : 'Proot 容器'}',
                     style: TextStyle(
                         fontSize: 12,
@@ -768,11 +752,36 @@ class _ProjectPageState extends State<ProjectPage> {
                         color: Colors.grey.shade500, height: 1.6),
                   ),
                   const SizedBox(height: 12),
-                  FilledButton.icon(
-                    onPressed: _startBuild,
-                    icon: const Icon(Icons.play_arrow, size: 18),
-                    label: const Text('开始打包'),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: _startBuild,
+                          icon: const Icon(Icons.play_arrow, size: 18),
+                          label: const Text('开始打包'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _cleaning ? null : _cleanCache,
+                          icon: _cleaning
+                              ? const SizedBox(
+                                  width: 16, height: 16,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2))
+                              : const Icon(Icons.cleaning_services,
+                                  size: 16),
+                          label: const Text('清理缓存',
+                              style: TextStyle(fontSize: 13)),
+                        ),
+                      ),
+                    ],
                   ),
+                  const SizedBox(height: 6),
+                  Text('缓存导致的"玄学失败"先清再试（flutter clean）',
+                      style: TextStyle(
+                          fontSize: 11, color: Colors.grey.shade600)),
                 ],
               ),
             ),
@@ -801,6 +810,24 @@ class _ProjectPageState extends State<ProjectPage> {
     }
     await BuildRunner.I.start(widget.projectName, env, _backend);
     if (mounted) setState(() {});
+  }
+
+  bool _cleaning = false;
+
+  /// 清理构建缓存（flutter clean）：BuildRunner.clean 统一两后端命令，
+  /// 结果 SnackBar 反馈。构建中按钮已禁用（方法内再拦一层）。
+  Future<void> _cleanCache() async {
+    final env = _env;
+    if (env == null || _cleaning) return;
+    setState(() => _cleaning = true);
+    final err =
+        await BuildRunner.I.clean(widget.projectName, env, _backend);
+    if (!mounted) return;
+    setState(() => _cleaning = false);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(err ?? '已清理 build/ 与 .dart_tool（flutter clean）'),
+      duration: Duration(seconds: err == null ? 2 : 4),
+    ));
   }
 
   Widget _buildResultCard(BuildRunner r) {
