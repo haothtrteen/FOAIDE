@@ -1991,6 +1991,71 @@ Debian 源（`qemu-user-static` 装不上），宿主加 arm64 外来架构后
 
 ---
 
+### Bug 435：清理数据重装后构建报 `E: dpkg was interrupted`
+
+**症状**（2026-09-19 真机截图，构建中断于「准备构建环境」0%）：
+
+```
+✗ 自动安装 git 失败：
+E: dpkg was interrupted, you must manually run
+   'dpkg --configure -a' to correct the problem.
+```
+
+**这是 Bug 434 的下游后果。** 卸载兼容层时 apt 在 essential 拒绝下
+中途失败 → dpkg 数据库留下未完成事务 → 之后**任何** apt 调用都被
+拦下，**包括 `apt-get update`**。用户"清理数据重装"后发现构建还是
+不行，看起来像新 bug，其实是一条因果链。
+
+**真正的缺陷不在"有没有自愈代码"**——`AptTools.ensure` 里早就写好
+了三步自愈，是 Bug 409 加的。问题在于：
+
+> **自愈只加在了我想到的那条路径上。**
+
+`ToolchainEnsure.git()` 直接 `apt-get update && apt-get install git`，
+**没有**自愈。于是同一个故障在 git 路径上原样重现，而且报错文案指向
+git ——用户完全不可能顺着"自动安装 git 失败"去想到 dpkg 状态有问题。
+**错误信息指错了方向，比没有错误信息更浪费时间。**
+
+**修复**：
+
+1. 把 `AptTools.ensure` 里内联的三步自愈抽成公共常量
+   `AptTools.repairDpkg`（清锁 → `dpkg --configure -a` → `apt-get -f install`），
+   `ensure` 改为引用，**消灭两份会各自漂移的实现**。
+2. `git()` 在 apt 之前先跑 `repairDpkg`；自愈本身失败**不放弃**安装
+   （仍给一次机会，避免"修复命令挂了所以什么都装不了"这种更差结果）。
+3. 原先 `apt-get update && apt-get install git` 用 `&&` 串联，dpkg
+   中间态下 update 一失败 install 根本不执行，报错还停在 update 输出上。
+   改为**换行分隔的两条独立命令**（Bug 404 同款：行尾换行，不能用行首 `;`）。
+4. 安装成功判定改用显式哨兵 `GIT_INSTALLED`，不再只看退出码
+   （proot exec 的退出码语义不可靠，Bug 404 起已确立此规约）。
+5. 失败文案**带上真因和自救手段**：
+   `（已尝试自动修复 dpkg 中断状态；仍失败可到「终端」手动执行 dpkg --configure -a 后重试）`
+
+**教训一（全称命题，第三次出现）**：Bug 429 是"要检查**全称**而非点名"，
+Bug 433 ① 是"检查点与使用点之间**时序**上还会有别的动作"，这次是
+**"我在某处修过"≠"所有执行路径都被修复"**。三者同源：**都要问一句
+"这个前提，是不是在所有该成立的地方都成立了"**。凡是调用 apt 的地方
+都是"dpkg 状态干净"这个前提的消费者，前提必须在**每条路径**上成立。
+
+**教训二（错误信息的指向性）**：`自动安装 git 失败` + `dpkg was
+interrupted` 这两句话放在一起，用户的注意力必然被"git"吸走。**报错
+文案指向的位置，必须是真的要动手的位置**。做不到时，至少要把真因
+一并列出。
+
+**验证**：`test/bug435_dpkg_interrupted_test.dart`（12 项）——断言
+`repairDpkg` 三步齐全、每步不阻断后续、`ensure` 改为复用常量（不再有
+第二份内联副本）、`git()` 里自愈位置早于 `apt-get update` 与
+`apt-get install`、自愈与安装之间无 `return`/`throw`、update 不与
+install 用 `&&` 串联、成功判定用哨兵、失败文案包含 `dpkg --configure -a`。
+
+**写测试时的坑**：`git()` 体**注释里**为解释本 bug 提到了
+`apt-get update` / `apt-get install` / `return`，导致 `indexOf` 和
+`firstWhere` 全部命中注释，三条断言反向失败。**定位代码位置的断言
+必须先剔除注释行**——这个坑在 Bug 432 的测试里也踩过一次，
+是同一类错误的第二次出现。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
