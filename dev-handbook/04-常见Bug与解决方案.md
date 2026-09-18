@@ -1899,6 +1899,98 @@ bug 形态**——用户只能截图，开发者只能猜。
 
 ---
 
+### Bug 434：x64 兼容层卸载失败——`PURGE_FAILED rc=100`
+
+**症状**（2026-09-19 真机截图）：
+
+```
+x64 兼容层卸载失败：PURGE_FAILED rc=100
+E: Essential packages were removed and -y was used
+   without --allow-remove-essential.
+```
+
+**先说好消息**：`PURGE_FAILED rc=100` 这行**是我们自己的兜底在正常工作**。
+上一轮修 Bug 429 时把 `purge ... | tail || true` 改成了显式捕获退出码，
+所以这次失败被如实报出来了。在此之前，同样的情况会**静默假成功**——
+用户以为卸干净了，实际 qemu 还在，兼容层还在拦工具链。**这个报错本身
+是一次观测性修复的兑现。**
+
+**根因**：卸载脚本原本一条命令批量删：
+
+```sh
+apt-get purge -y -qq qemu-user-static libc6:amd64 libstdc++6:amd64 \
+  libgcc-s1:amd64 zlib1g:amd64 libatomic1:amd64
+```
+
+apt 的依赖求解逻辑是：`qemu-user-static` 被标记删除后，那些
+`:amd64` 运行库就变成**「随它一起装进来的、没有别的主人的依赖」**，
+于是被**级联删除**。而宿主是 arm64 + amd64 外来架构的混装状态，
+在这套视角下 `libc6` 属于 **essential 包**，`-y` 不允许删 essential
+→ apt 整体拒绝 → rc=100。
+
+**一半成功比彻底失败更麻烦**：apt 中途失败**不回滚**。当时 qemu 本体
+已经被删了一部分，运行库有的删了有的没删，最终状态是个半拉子——
+既不是"装着"，也不是"卸了"。用户看到报错，但真实状态无法从报错
+推断。
+
+**修复**：拆成三步，让每步的失败语义独立。
+
+```sh
+# ① 只 purge qemu 本体（不带 :amd64 运行库）
+apt-get purge -y -qq qemu-user-static > /tmp/foa_purge.log 2>&1
+rc=$?
+if [ "$rc" != 0 ]; then
+  echo "PURGE_FAILED rc=$rc"; tail -n 15 /tmp/foa_purge.log; exit 2
+fi
+# ② 运行库逐个删，单个失败只记录不中断
+libs_fail=""
+for p in libatomic1:amd64 zlib1g:amd64 libgcc-s1:amd64 libstdc++6:amd64 libc6:amd64; do
+  dpkg -l "$p" 2>/dev/null | grep -q '^ii' || continue
+  if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "$p" >> /tmp/foa_purge.log 2>&1; then
+    libs_fail="$libs_fail $p"
+  fi
+done
+[ -n "$libs_fail" ] && echo "PURGE_LIBS_PARTIAL:$libs_fail"
+[ -x @QEMU@ ] && { echo QEMU_STILL_PRESENT; exit 3; }
+dpkg --remove-architecture amd64 2>/dev/null || true
+echo UNINSTALL_OK
+```
+
+关键点：
+- **运行库删不掉不是致命错误**，它们可能被别的包依赖；兼容层是否
+  卸干净，判据是「**qemu 本体没了 + 转发层已还原**」（后者由脚本前段
+  完成），与运行库残留无关。
+- Dart 侧判定相应调整：`PURGE_FAILED` / `QEMU_STILL_PRESENT` 抛异常，
+  `PURGE_LIBS_PARTIAL` **只写 stderr 提示保留清单**。否则"卸不干净"
+  会被误报成"卸载失败"，用户又要怀疑没生效——**观测性修复不能反过来
+  制造误报**。
+- 逐个删之前先 `dpkg -l | grep -q '^ii'` 探测，跳过未安装的包（对未装
+  的包 purge 会返回非零，会污染 `libs_fail`）。
+
+**教训一（apt 多架构）**：**多架构环境下 `apt purge` 的包列表顺序与
+分组不是中性的**。promote 成「一条命令批量删」会把无主依赖推断放大成
+级联删除，进而踩 essential 保护。凡是跨架构删包，都要先想清楚"删掉
+这个之后，谁变成无主"。
+
+**教训二（失败原子性）**：`apt` 这类包管理器**失败不回滚**，所以
+"一条大命令"的失败态是**未知的中间态**，无法写进文档、无法让用户
+照着排查。把操作拆成**语义独立的小步**，每步要么干净成功要么干净
+失败的，才谈得上可诊断。这与 Bug 433 ① 的教训同源——**都是"把多个
+动作捆在一个原子单元里"惹的祸**，一个捆在 shell 命令里，一个捆在
+apt 事务里。
+
+**验证**：`test/bug434_uninstall_test.dart`（10 项）——断言 purge 命令
+不混运行库、运行库走逐个循环、循环体内不含 `exit`、`exit 2` 只属于
+qemu 本体失败路径、`PURGE_LIBS_PARTIAL` 不触发异常而走 stderr 提示。
+
+**注**：本想用 arm64 容器真机复现 rc=100，但沙箱内容器访问不了
+Debian 源（`qemu-user-static` 装不上），宿主加 arm64 外来架构后
+镜像源返回 404。已在 x86_64 容器里复现到 `OLD_RC=100`（机制确认），
+完整链路待真机验证。**复现环境受限时，明确区分"机制已确认"与
+"端到端已验证"，不要混为一谈。**
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
