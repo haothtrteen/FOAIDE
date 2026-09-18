@@ -64,13 +64,35 @@ class CodeEditorState extends State<CodeEditor> {
   List<SyntaxIssue> _issues = const [];
   bool _checking = false;
 
-  // ---- 字号缩放（alpha.32）----
+  // ---- 字号缩放（alpha.32，Bug 432 重做）----
   /// 当前字号；initState 异步恢复上次偏好（捏合/按钮调整后持久化）。
   double _fontSize = EditorFontPrefs.def;
 
-  /// 捏合起点字号（onScaleStart 快照，onScaleUpdate 按手势 scale 乘算）。
+  /// 捏合起点字号（onScaleStart 快照，onScaleUpdate 按手势倍率乘算）。
   double _scaleBase = EditorFontPrefs.def;
   bool _scaleActive = false;
+
+  /// 捏合判定的间距变化阈值（相对量）。
+  ///
+  /// Bug 432 背景：不能直接用 `ScaleUpdateDetails.scale`——它是**各向同性**
+  /// 的欧氏距离比（见 Flutter scale.dart 的 _pointerScaleFactor =
+  /// _currentSpan / _initialSpan，span 取两指到质心的 hypot 平均）。
+  /// 双指自然持机时两指在 y 轴错开，上下滑动过程中两指上下异步（人手指
+  /// 不可能同步）就会让 hypot 距离变化 → scale 偏离 1.0 → 字号被误改。
+  ///
+  /// 实测（复刻 Flutter 的 span 公式）：竖直排列的两指，滑动滞后 2px
+  /// 造成 1.72% 漂移、滞后 10px 造成 8.56% 漂移；而水平并排的两指同样
+  /// 滞后只漂移 0.70% / 3.81%。这就是用户报告的
+  /// 「上下划能放大缩小，左右划不能，和几根手指没关系」。
+  ///
+  /// 因此改为只用**轴向间距**（horizontalScale / verticalScale）判断，
+  /// 并要求间距变化超过本阈值才算缩放；否则一律视为平移，放行给
+  /// 编辑器滚动/光标。0.15 对应 >15% 的间距变化——实测两指异步 10px
+  /// 时轴向倍率偏移约 10%，仍在阈值内，留有安全裕度。
+  static const double _kSpanSlop = 0.15;
+
+  /// 手势是否已被判定为缩放；捏合中途为真，回位后复位。
+  bool _scaleEngaged = false;
 
   @override
   void initState() {
@@ -360,20 +382,45 @@ class CodeEditorState extends State<CodeEditor> {
                 // （CodeController 的 theme 参数已废弃），不包 CodeTheme 则
                 // highlight 产出的 span 无样式 → 语法高亮"不生效"
                 //
-                // alpha.32：外层 GestureDetector 双指捏合缩放字号——
-                // 单指手势完全放行给 CodeField（光标/滚动/长按选择），
-                // pointerCount>=2 才接管；缩放结果在 onScaleEnd 持久化。
+                // alpha.32 引入双指捏合缩放字号；Bug 432 修正为
+                // 只认轴向间距变化，避免双指上下滑动被误判成缩放
+                // （详见 _kSpanSlop 附近的说明）。
                 child: GestureDetector(
                   onScaleStart: (d) {
-                    if (d.pointerCount >= 2) {
-                      _scaleBase = _fontSize;
-                      _scaleActive = true;
-                    }
+                    if (d.pointerCount < 2) return;
+                    _scaleBase = _fontSize;
+                    _scaleEngaged = false;
+                    _scaleActive = true;
                   },
                   onScaleUpdate: (d) {
                     if (!_scaleActive || d.pointerCount < 2) return;
-                    final v = (_scaleBase * d.scale).clamp(
-                        EditorFontPrefs.min, EditorFontPrefs.max);
+                    // 轴向倍率：只取真正在「捏」的那个轴。
+                    // ScaleUpdateDetails.scale 是各向同性欧氏比，会把
+                    // 双指滑动（异步位移）误算成缩放，故不使用。
+                    final fx = d.horizontalScale;
+                    final fy = d.verticalScale;
+                    final dx = (fx - 1.0).abs();
+                    final dy = (fy - 1.0).abs();
+                    // 未判定为缩放前，先检查是否真的在捏合：
+                    // 任一轴向间距变化超过 slop 才认账。
+                    if (!_scaleEngaged) {
+                      if (dx < _kSpanSlop && dy < _kSpanSlop) return;
+                      _scaleEngaged = true;
+                    } else if (dx < _kSpanSlop * 0.5 && dy < _kSpanSlop * 0.5) {
+                      // 已判定为缩放，但间距又回到基准附近——说明刚才那次
+                      // 越界只是双指滑动过程中的异步尖峰，而非真捏合。
+                      // 撤销本次缩放并停止响应，避免"闪一下又弹回"。
+                      _scaleEngaged = false;
+                      if ((_fontSize - _scaleBase).abs() >= 0.5) {
+                        setState(() => _fontSize = _scaleBase);
+                      }
+                      return;
+                    }
+                    // 选变化更显著的那个轴作为缩放倍率。
+                    final factor = dx >= dy ? fx : fy;
+                    if (factor <= 0) return;
+                    final v = (_scaleBase * factor)
+                        .clamp(EditorFontPrefs.min, EditorFontPrefs.max);
                     // 0.5px 以下不刷，避免高频 setState
                     if ((v - _fontSize).abs() >= 0.5) {
                       setState(() => _fontSize = v);
@@ -382,6 +429,7 @@ class CodeEditorState extends State<CodeEditor> {
                   onScaleEnd: (_) {
                     if (_scaleActive) {
                       _scaleActive = false;
+                      _scaleEngaged = false;
                       EditorFontPrefs.save(_fontSize);
                     }
                   },

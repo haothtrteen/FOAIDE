@@ -72,7 +72,9 @@ void main() {
 
     test('双指捏合缩放必须保留（单指手势要留给 CodeField）', () {
       expect(src.contains('onScaleStart'), isTrue);
-      expect(src.contains('pointerCount >= 2'), isTrue,
+      // Bug 432 起改为早返回式守卫：单指直接 return，放行给 CodeField
+      // 的光标/滚动/长按选择。
+      expect(src.contains('pointerCount < 2'), isTrue,
           reason: '单指手势必须放行给 CodeField 的光标/滚动/长按选择');
       expect(src.contains('onScaleEnd'), isTrue,
           reason: 'onScaleEnd 里要持久化字号');
