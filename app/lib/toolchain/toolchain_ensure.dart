@@ -121,6 +121,24 @@ class ToolchainEnsure {
   ///
   /// [bare]（termux 后端）不经 qemu，直接返回 null。
   /// 返回 null=就位/无需处理，非 null=错误文案（记录但不阻断构建）。
+  /// x64 兼容层构建前全量确保（Bug 428 / 429 根因修复）。
+  ///
+  /// **设计原则（Bug 429 教训）**：不做"点名检查"。凡是 `linux-x64/` 下的
+  /// x86_64 ELF，`linux-arm64/` 就必须有同名 `#!` 转发脚本——**遍历全量
+  /// 比对，不从已知工具清单里挑**。理由：
+  /// - Flutter 每次升级可能新增宿主工具（历史上有 gen_snapshot、
+  ///   impellerc、font-subset、const_finder…，上游随时可能再加）；
+  /// - 点名检查（初版只查 gen_snapshot）会漏掉 impellerc 等 → 自愈
+  ///   误判"一切正常" → 构建照旧 SIGILL。
+  /// 全量比对让"未知的新工具"自动被覆盖，无需预见它们叫什么。
+  ///
+  /// 检查逻辑：对每个 `android-*/linux-x64/<file>`（x86_64 ELF）：
+  /// 验证 `android-*/linux-arm64/<file>` 存在且以 `#!` 开头；任一不满足
+  /// 即重跑 [QemuCompat.engineWrapScript]（该脚本本身已是全量遍历，
+  /// 幂等）。SDK 侧（build-tools/platform-tools）同样全量比对。
+  ///
+  /// [bare]（termux 后端）不经 qemu，直接返回 null。
+  /// 返回 null=就位/无需处理，非 null=错误文案（记录但不阻断构建）。
   Future<String?> qemuCompatEnsure({EnvInfo? env, bool bare = false}) async {
     if (bare) return null;
     try {
@@ -131,21 +149,81 @@ class ToolchainEnsure {
       );
       if (!probe.stdout.contains('QEMU_YES')) return null;
 
-      // 检查引擎目录的转发脚本是否仍是脚本形态（被 precache 覆写则重包装）
-      final chk = await _bridge.exec(
-        'gs=${QemuCompat.engineDir}/android-arm64-release/linux-arm64/gen_snapshot; '
-        'if [ -e "\$gs" ] && head -c 2 "\$gs" 2>/dev/null | grep -q "#!"; then '
-        'echo WRAP_OK; '
-        'elif [ -e "\$gs" ]; then echo WRAP_STALE; '
-        'else echo WRAP_MISSING; fi',
-        timeoutSec: 30,
-      );
-      if (chk.stdout.contains('WRAP_OK')) return null;
+      const E = QemuCompat.engineDir;
+      const S = QemuCompat.sdkHome;
 
-      // 转发脚本缺失或被覆写 → 重跑引擎包装（幂等，只补缺/纠错）
+      // ---- 全量比对：遍历所有 linux-x64 下 x86_64 ELF，逐个校验对应
+      //      linux-arm64 转发脚本存在且为 #! 脚本。输出缺失清单。 ----
+      final chk = await _bridge.exec(
+        'miss=""; n=0; ok=0; '
+        // 引擎层：android-*/linux-x64 → android-*/linux-arm64
+        'for d in $E/android-*/linux-x64; do '
+        '  [ -d "\$d" ] || continue; '
+        '  a="\${d%/linux-x64}/linux-arm64"; '
+        '  for f in "\$d"/*; do '
+        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+        // 仅 x86_64 ELF（魔数 7f454c46 + e_machine 3e）
+        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+        '    n=\$((n+1)); w="\$a/\${f##*/}"; '
+        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
+        '      ok=\$((ok+1)); '
+        '    else miss="\$miss engine:\${f##*/}"; fi; '
+        '  done; '
+        'done; '
+        // Bug 429：顶层宿主工具目录（$E/linux-x64 → $E/linux-arm64）
+        // impellerc / font-subset / flutter_tester 等宿主工具在此，
+        // arm64 宿主按 HostArtifact 取 linux-arm64/<name>，不包装则 SIGILL
+        'for hd in $E/linux-*/; do '
+        '  hd="\${hd%/}"; [ -d "\$hd" ] || continue; '
+        '  case "\$hd" in */linux-x64) ;; *) continue ;; esac; '
+        '  ha="\${hd%/linux-x64}/linux-arm64"; '
+        '  for f in "\$hd"/*; do '
+        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+        '    n=\$((n+1)); w="\$ha/\${f##*/}"; '
+        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
+        '      ok=\$((ok+1)); '
+        '    else miss="\$miss host:\${f##*/}"; fi; '
+        '  done; '
+        'done; '
+        // SDK 层：build-tools/* 与 platform-tools 顶层 x86_64 ELF（原地包装制）
+        'for d in $S/build-tools/* $S/platform-tools; do '
+        '  [ -d "\$d" ] || continue; '
+        '  for f in "\$d"/*; do '
+        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+        '    case "\$f" in *.foa-real) continue ;; esac; '
+        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+        '    n=\$((n+1)); '
+        '    if head -c 2 "\$f" 2>/dev/null | grep -q "#!"; then '
+        '      ok=\$((ok+1)); '
+        '    else miss="\$miss sdk:\${f##*/}"; fi; '
+        '  done; '
+        'done; '
+        'echo "WRAP_CHECK n=\$n ok=\$ok miss=\$miss"',
+        timeoutSec: 120,
+      );
+      final out = chk.stdout;
+      if (out.contains('n=0')) return null; // 无 x64 产物（未 precache）→ 无事
+      if (out.contains('n=') && !out.contains('miss= ') && out.contains('miss=')) {
+        // 全部就位（miss 为空）
+        final line = out.split('\n').firstWhere(
+              (l) => l.startsWith('WRAP_CHECK'),
+              orElse: () => '',
+            );
+        final okCount = RegExp(r'ok=(\d+)').firstMatch(line)?.group(1);
+        final nCount = RegExp(r'n=(\d+)').firstMatch(line)?.group(1);
+        if (okCount != null && nCount != null && okCount == nCount) {
+          return null;
+        }
+      }
+
+      // 有不就位的 → 全量重建（engineWrapScript 本身遍历全量、幂等）
       final r = await _bridge.exec(
         QemuCompat.engineWrapScript
-            .replaceAll('@ENGINE@', QemuCompat.engineDir)
+            .replaceAll('@ENGINE@', E)
             .replaceAll('@FLUTTER@', QemuCompat.flutterHome)
             .replaceAll('@QEMU@', QemuCompat.qemuBin),
         timeoutSec: 2400,
@@ -154,15 +232,55 @@ class ToolchainEnsure {
         return 'x64 兼容层引擎转发重建失败（precache 失败），'
             '请到「工具链」页重新应用 x64 兼容层';
       }
-      // 复核
-      final v = await _bridge.exec(
-        'gs=${QemuCompat.engineDir}/android-arm64-release/linux-arm64/gen_snapshot; '
-        'head -c 2 "\$gs" 2>/dev/null | grep -q "#!" '
-        '&& echo FIXED || echo STILL_BAD',
-        timeoutSec: 30,
+      // SDK 侧重建
+      await _bridge.exec(
+        QemuCompat.sdkWrapScript
+            .replaceAll('@SDK@', S)
+            .replaceAll('@QEMU@', QemuCompat.qemuBin),
+        timeoutSec: 600,
       );
-      if (v.stdout.contains('FIXED')) return null;
-      return 'x64 兼容层引擎转发重建后仍异常（gen_snapshot 非转发脚本），'
+
+      // 复核：再跑一次全量比对，仍缺则如实报告缺口名
+      final v = await _bridge.exec(
+        'miss=""; n=0; ok=0; '
+        'for d in $E/android-*/linux-x64; do '
+        '  [ -d "\$d" ] || continue; '
+        '  a="\${d%/linux-x64}/linux-arm64"; '
+        '  for f in "\$d"/*; do '
+        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+        '    n=\$((n+1)); w="\$a/\${f##*/}"; '
+        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
+        '      ok=\$((ok+1)); else miss="\$miss \${f##*/}"; fi; '
+        '  done; '
+        'done; '
+        'for hd in $E/linux-*/; do '
+        '  hd="\${hd%/}"; [ -d "\$hd" ] || continue; '
+        '  case "\$hd" in */linux-x64) ;; *) continue ;; esac; '
+        '  ha="\${hd%/linux-x64}/linux-arm64"; '
+        '  for f in "\$hd"/*; do '
+        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+        '    n=\$((n+1)); w="\$ha/\${f##*/}"; '
+        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
+        '      ok=\$((ok+1)); else miss="\$miss host:\${f##*/}"; fi; '
+        '  done; '
+        'done; '
+        'echo "VERIFY n=\$n ok=\$ok miss=\$miss"',
+        timeoutSec: 120,
+      );
+      final vline = v.stdout.split('\n').firstWhere(
+            (l) => l.startsWith('VERIFY'),
+            orElse: () => '',
+          );
+      final vOk = RegExp(r'ok=(\d+)').firstMatch(vline)?.group(1);
+      final vN = RegExp(r'n=(\d+)').firstMatch(vline)?.group(1);
+      if (vOk != null && vN != null && vOk == vN) return null;
+      final vMiss = RegExp(r'miss=(.*)$').firstMatch(vline)?.group(1)?.trim();
+      return 'x64 兼容层转发层重建后仍有缺口'
+          '${vMiss == null || vMiss.isEmpty ? '' : '：$vMiss'}，'
           '请到「工具链」页重新应用 x64 兼容层';
     } catch (e) {
       return 'x64 兼容层构建前检查失败：$e';

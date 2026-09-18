@@ -25,6 +25,7 @@ import 'package:highlight/languages/yaml.dart' as hl_yaml;
 
 import 'completion.dart';
 import 'dart_syntax_checker.dart';
+import 'hint_prefs.dart';
 import '../env/proot_bridge.dart';
 
 /// 代码编辑器：语法高亮 + 行号 + 等宽字体 + 轻量补全/语法检查。
@@ -83,6 +84,39 @@ class CodeEditorState extends State<CodeEditor> {
     EditorFontPrefs.load().then((v) {
       if (mounted && v != _fontSize) setState(() => _fontSize = v);
     });
+    // Bug 431：字号功能早就可用（状态栏 A-/A+ 与双指捏合），但用户反馈
+    // 「要一个手指不动另一个手指动才能缩放，得单独出教程」——是发现性问题。
+    // 首次进入给一次短提示，比写教程有效。仅提示一次，且延迟到布局完成。
+    _maybeHintFontScale();
+  }
+
+  /// 首次进入编辑器时提示字号调节方式（只弹一次，见 HintPrefs）。
+  Future<void> _maybeHintFontScale() async {
+    try {
+      if (await HintPrefs.seen(HintPrefs.editorFont)) return;
+      await HintPrefs.markSeen(HintPrefs.editorFont);
+      if (!mounted) return;
+      // 等首帧渲染完再弹，避免与布局/键盘动画抢焦点
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      messenger?.showSnackBar(
+        SnackBar(
+          duration: const Duration(seconds: 5),
+          content: const Text(
+            '字号调节：点底部状态栏的 A− / A+ 即可；'
+            '双指捏合也能缩放，戳中间数字可恢复默认。',
+            style: TextStyle(fontSize: 12.5),
+          ),
+          action: SnackBarAction(
+            label: '知道了',
+            onPressed: () => messenger.hideCurrentSnackBar(),
+          ),
+        ),
+      );
+    } catch (_) {
+      // 提示失败不影响任何编辑功能
+    }
   }
 
   @override
@@ -546,7 +580,16 @@ class CodeEditorState extends State<CodeEditor> {
   }
 
   /// 字号步进按钮（±1，夹在 min/max）。
+  ///
+  /// 可发现性修复：原先图标仅 14px、灰色、贴在内边距 5px 上，
+  /// 手机上看不清也难点（远小于 44px 的最小可点尺寸），用户甚至以为
+  /// 「只能靠双指捏合缩放」。现在图标放大到 17px、用正文色提高对比，
+  /// 左右各留 8px 内边距，实际可点区域约 33x24——状态栏高度所限已是
+  /// 上限，故再加一条 tooltip 之外的可见提示（见 _maybeShowFontHint）。
   Widget _fontButton(IconData icon, String tip, double delta) {
+    final atLimit = delta < 0
+        ? _fontSize <= EditorFontPrefs.min
+        : _fontSize >= EditorFontPrefs.max;
     return Tooltip(
       message: tip,
       child: InkWell(
@@ -559,8 +602,12 @@ class CodeEditorState extends State<CodeEditor> {
           EditorFontPrefs.save(_fontSize);
         },
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-          child: Icon(icon, size: 14, color: Colors.grey),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          child: Icon(
+            icon,
+            size: 17,
+            color: atLimit ? Colors.grey.shade700 : Colors.grey.shade300,
+          ),
         ),
       ),
     );

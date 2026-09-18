@@ -44,6 +44,48 @@ void main() {
     });
   });
 
+  group('QemuCompat.engineWrapScript · Bug 429 宿主工具目录覆盖', () {
+    const s = QemuCompat.engineWrapScript;
+
+    test('必须覆盖顶层 linux-x64 宿主工具目录（impellerc 所在）', () {
+      // Bug 429：impellerc / font-subset / flutter_tester 等宿主工具在
+      // 引擎根下的 linux-x64/（不在 android-*/ 里）。artifacts.dart 的
+      // HostArtifact.impellerc 取 engineDir/<hostPlatform>/impellerc，
+      // arm64 宿主 → linux-arm64/impellerc，不包装则 shader 编译 SIGILL。
+      expect(
+        RegExp(r'for\s+hd\s+in\s+"\$E"/linux-\*/').hasMatch(s),
+        isTrue,
+        reason: '必须遍历顶层 linux-*/ 目录，否则 impellerc 永不被包装',
+      );
+      expect(s.contains(r'ha="${hd%/linux-x64}/linux-arm64"'), isTrue);
+    });
+
+    test('两个层次都要有：android-*/linux-x64（引擎）+ 顶层 linux-x64（宿主）', () {
+      expect(RegExp(r'for\s+d\s+in\s+"\$E"/android-\*/linux-x64').hasMatch(s),
+          isTrue,
+          reason: '引擎层 gen_snapshot');
+      expect(RegExp(r'for\s+hd\s+in\s+"\$E"/linux-\*/').hasMatch(s),
+          isTrue,
+          reason: '宿主层 impellerc/font-subset');
+    });
+
+    test('全量遍历而非点名清单（新工具自动纳入，无需预见）', () {
+      // 不应出现硬编码的工具名清单（这正是 Bug 428→429 反复翻车的原因）
+      final hits = RegExp(r'for\s+\w+\s+in\s+"\$\w+"?/\*?').allMatches(s).length;
+      expect(hits >= 4, isTrue,
+          reason: 'engineWrapScript 内目录通配遍历应覆盖引擎层与宿主层，实际 $hits 处');
+      // 正向确认各处通配遍历都指向目录本身而不是某个具体文件
+      for (final dir in [r'"$d"', r'"$hd"']) {
+        expect(s.contains('for f in $dir/*'), isTrue,
+            reason: '缺少 $dir 目录的全量文件遍历');
+      }
+      // 反向：不得出现「按名字逐个处理」的写死清单
+      expect(RegExp(r'for\s+\w+\s+in\s+(gen_snapshot|impellerc|font-subset)')
+          .hasMatch(s), isFalse,
+          reason: '一旦写死工具名，新工具又要人工补——必须用 * 通配');
+    });
+  });
+
   group('QemuCompat verify · 冒烟误判修复', () {
     test('冒烟前先确认是转发脚本（真 x64 二进制 SIGILL 无输出会误判通过）', () {
       // verify 脚本不在公开 API，通过 engineWrapScript 的同族特征间接固化：

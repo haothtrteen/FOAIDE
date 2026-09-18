@@ -30,6 +30,9 @@ android/key.properties
 # rootfs tarball（体积大）
 # ============================================================
 assets/tools/proot*
+# PTY 中继器（Bug 430）：本仓库自有源码编译产物，由
+# tools/build_pty_shim.sh 生成（源码在 platform/android/pty/foa_pty.c）
+assets/tools/foa_pty
 assets/rootfs/*.tar.*
 assets/rootfs/*.tgz
 # jniLibs 中的 proot（由 setup_android.sh 从 assets 生成，不重复入库）

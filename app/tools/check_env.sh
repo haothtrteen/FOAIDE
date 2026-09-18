@@ -53,6 +53,28 @@ else
   bad "缺少 $P2 —— 与 proot 一起分发，运行 ./tools/fetch_assets.sh proot"
 fi
 
+# PTY 中继器（Bug 430，可交互终端）：本仓库自有源码的编译产物。
+# 它不进 git，必须由 build_pty_shim.sh 生成后才能打进 APK——缺了它
+# 终端页会报「PTY 中继器未落位」，且**构建本身不会失败**（assets 目录
+# 整体被 pubspec 收录），所以这里必须显式查。
+PTY="assets/tools/foa_pty"
+if [[ -f "$PTY" ]]; then
+  if command -v file >/dev/null 2>&1; then
+    if file "$PTY" | grep -q 'ARM aarch64'; then
+      ok "foa_pty 存在且为 aarch64（$(du -h "$PTY" | cut -f1)）"
+    else
+      bad "foa_pty 架构可疑：$(file "$PTY")（需要 aarch64）"
+    fi
+  else
+    warn "foa_pty 存在（无 file 命令，跳过架构校验）"
+  fi
+  # 可执行位必须就绪：APK 内 assets 不保留权限，靠 Kotlin 侧 chmod，
+  # 但 bin 自身在源码树里保持 755 便于本地测
+  [[ -x "$PTY" ]] || warn "foa_pty 无执行位（本地测试受影响；APK 内由 Kotlin 侧 setExecutable 兜底）"
+else
+  bad "缺少 $PTY —— 运行 ./tools/build_pty_shim.sh（需 NDK）；可交互终端依赖它"
+fi
+
 echo "== 2. jniLibs（proot 双保险路径） =="
 if [[ -f android/app/src/main/jniLibs/arm64-v8a/libproot.so ]]; then
   ok "jniLibs/libproot.so 已就位"

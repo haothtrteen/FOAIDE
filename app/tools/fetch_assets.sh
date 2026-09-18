@@ -280,6 +280,25 @@ case "${1:-all}" in
   all|*)  fetch_proot; fetch_rootfs ;;
 esac
 
+# PTY 中继器（Bug 430，可交互终端）：本仓库自有源码，不下载而是本地编译。
+# 这里顺带尝试一次——有 NDK 就编出来，没有只提示（不阻断，因为纯构建
+# 不一定需要真机终端；但缺它设备上终端页会用不了）。
+if [[ ! -f "$TOOLS_DIR/foa_pty" ]]; then
+  echo ""
+  echo "→ 尝试编译 PTY 中继器（可交互终端用）…"
+  if [[ -x "$APP_DIR/tools/build_pty_shim.sh" ]]; then
+    if "$APP_DIR/tools/build_pty_shim.sh" >/tmp/foa_pty_build.log 2>&1; then
+      echo "   ✅ assets/tools/foa_pty 已生成"
+    else
+      echo "   ⚠️  编译失败（多半是没有 NDK）——详见 /tmp/foa_pty_build.log"
+      echo "       仅影响设备上的可交互终端；不影响 proot/rootfs 准备。"
+      echo "       NDK 就绪后单独运行：./tools/build_pty_shim.sh"
+    fi
+  else
+    echo "   ⚠️  未找到 tools/build_pty_shim.sh，跳过"
+  fi
+fi
+
 echo ""
 echo "目录内容:"
 ls -lh "$TOOLS_DIR" "$ROOTFS_DIR" | grep -v '^total\|^$'

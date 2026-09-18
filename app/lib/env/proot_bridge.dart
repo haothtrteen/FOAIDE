@@ -60,4 +60,51 @@ class ProotBridge {
     final raw = await _channel.invokeMethod('installRootfs');
     return InstallResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }
+
+  // ---------------- Bug 430 · 可交互 PTY 终端 ----------------
+
+  /// 启动一个真正的 pty 会话（foa_pty 中继器 → proot/宿主 shell）。
+  /// bare=true 走宿主 /system/bin/sh（Termux 裸原生后端）。
+  Future<PtyStart> ptyStart(
+      {bool bare = false, int cols = 80, int rows = 24}) async {
+    final raw = await _channel.invokeMethod('ptyStart', {
+      'bare': bare,
+      'cols': cols,
+      'rows': rows,
+    });
+    return PtyStart.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  /// 把按键/粘贴文本写进 pty（原样透传，0x03 等控制字节照发）。
+  Future<bool> ptyWrite(int id, String text) async {
+    final raw = await _channel.invokeMethod('ptyWrite', {
+      'id': id,
+      'text': text,
+    });
+    return (raw as Map<Object?, Object?>?)?['ok'] == true;
+  }
+
+  /// 轮询增量屏幕输出（offset = 上次返回的 len）。
+  Future<PtyPoll> ptyPoll(int id, int offset) async {
+    final raw = await _channel.invokeMethod('ptyPoll', {
+      'id': id,
+      'offset': offset,
+    });
+    return PtyPoll.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  Future<bool> ptyStop(int id) async {
+    final raw = await _channel.invokeMethod('ptyStop', {'id': id});
+    return (raw as Map<Object?, Object?>?)?['ok'] == true;
+  }
+
+  /// 终端尺寸变化：vim/top 等全屏程序据此重排。
+  Future<bool> ptyResize(int id, {required int cols, required int rows}) async {
+    final raw = await _channel.invokeMethod('ptyResize', {
+      'id': id,
+      'cols': cols,
+      'rows': rows,
+    });
+    return (raw as Map<Object?, Object?>?)?['ok'] == true;
+  }
 }

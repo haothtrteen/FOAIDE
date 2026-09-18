@@ -144,12 +144,37 @@ for d in "$E"/android-*/linux-x64; do
     n=$((n+1))
   done
 done
+# ---- Bug 429：顶层宿主工具目录（$E/linux-x64 → $E/linux-arm64）----
+# impellerc / font-subset / flutter_tester 等**宿主工具**在引擎根下的
+# linux-x64/（不在 android-*/ 里）。artifacts.dart 的 HostArtifact.
+# impellerc 取 engineDir/<hostPlatform>/impellerc，arm64 宿主 →
+# linux-arm64/impellerc。不包装则 shader 编译直接 SIGILL（真机 57%
+# "impellerc failure"）。同样全量遍历、按 #! 判定、幂等。
+for hd in "$E"/linux-*/; do
+  hd="${hd%/}"
+  [ -d "$hd" ] || continue
+  case "$hd" in */linux-x64) ;; *) continue ;; esac
+  ha="${hd%/linux-x64}/linux-arm64"
+  mkdir -p "$ha"
+  for f in "$hd"/*; do
+    [ -f "$f" ] || continue
+    [ -x "$f" ] || continue
+    m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    case "$m" in 7f454c46*3e) ;; *) continue ;; esac
+    w="$ha/${f##*/}"
+    if [ -f "$w" ] && head -c 2 "$w" 2>/dev/null | grep -q '#!'; then
+      continue
+    fi
+    gen "$w" "$f"
+    n=$((n+1))
+  done
+done
 echo "ENGINE_DIRS=$n"
 ''';
 
   /// Android SDK 工具接管：build-tools / platform-tools 顶层 x86_64 ELF
   /// 原地改名 .foa-real，生成 qemu 转发脚本。
-  static const String _sdkWrapScript = r'''
+  static const String sdkWrapScript = r'''
 S=@SDK@
 [ -d "$S" ] || { echo SDK_MISSING; exit 0; }
 gen() {
@@ -376,7 +401,7 @@ echo UNINSTALL_OK
     if (se.ok && se.stdout.contains('YES')) {
       onPhase?.call('sdk');
       final sn = await bridge.exec(
-        _sdkWrapScript.replaceAll('@SDK@', sdkHome).replaceAll('@QEMU@', qemuBin),
+        sdkWrapScript.replaceAll('@SDK@', sdkHome).replaceAll('@QEMU@', qemuBin),
         timeoutSec: 300,
       );
       if (!sn.ok) {
@@ -488,7 +513,7 @@ echo UNINSTALL_OK
       final c = await bridge.exec('[ -x $qemuBin ] && echo YES', timeoutSec: 30);
       if (!c.ok || !c.stdout.contains('YES')) return;
       await bridge.exec(
-        _sdkWrapScript.replaceAll('@SDK@', sdkHome).replaceAll('@QEMU@', qemuBin),
+        sdkWrapScript.replaceAll('@SDK@', sdkHome).replaceAll('@QEMU@', qemuBin),
         timeoutSec: 300,
       );
       await _writeGradleOverride(env.rootfsPath);
