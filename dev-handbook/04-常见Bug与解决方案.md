@@ -1369,6 +1369,67 @@ settings 仓 / 改写已有仓库 url），**allprojects/settingsEvaluated
 配置文件在沙箱与真机形态漂移时，"沙箱好的"不构成免检理由，要把
 "形态差异"本身当作排查对象。
 
+### Bug 427：Flutter 插件自动补装 NDK → sdkmanager 在 arm64 上 JIT SIGILL（真机 24% 崩）
+
+**症状**（2026-09-18 真机 alpha.37，Bug 426 修好后的下一个卡点）：
+「配置 Gradle」24% 崩，两次表现一致（首跑 2m36s、次跑 34s）：
+
+```
+FAILURE: Build failed with an exception.
+* Where: Build file '/root/projects/my_demo/android/build.gradle.kts' line: 19
+* What went wrong:
+  A problem occurred configuring project ':app'.
+  > Process 'command '/opt/android-sdk/cmdline-tools/latest/bin/sdkmanager''
+    finished with non-zero exit value 132
+    (this value may indicate that the process was terminated with the SIGILL signal)
+```
+
+**根因链**（三段）：
+1. 报错行 `build.gradle.kts:19` 是模板的
+   `subprojects { project.evaluationDependsOn(":app") }`——触发 :app 配置
+   时崩，不是模板自身问题；
+2. 崩的是 **Flutter gradle 插件主动调 sdkmanager**：
+   `FlutterPluginUtils.forceNdkDownload()` 在 `finalizeDsl` 里判定
+   「项目 `ndkVersion = flutter.ndkVersion`（默认 28.2.13676358）不在
+   `installedNdkVersions` 中，且 `sdkManagerPath != null`、非 offline」
+   → 执行 `sdkmanager --install "ndk;<版本>"` 自动补装 NDK；
+3. **sdkmanager 在 Android arm64 上必崩**：它是 sh 脚本
+   `exec "$JAVACMD" -classpath ... SdkManagerCli`，即起一个**标准 Linux
+   JDK 的 JVM**——Linux 发行版 JDK 的 JIT 在 Android 内核/设备上会触达
+   不支持的指令，SIGILL（132 = 128+4）。这与 sdkmanager 自身架构无关
+   （它是脚本 + jar，架构无关），是 **JVM-on-Android** 的已知冲突。
+
+**为什么沙箱没翻车**：沙箱构建机 `/data/user/work/sdk/ndk/28.2.13676358/`
+**存在**（内含真 NDK + 改名后的 source.properties），插件第一步判定
+"已装"直接 return，**从不调 sdkmanager**。真机工具链只装了四个组件
+（platform-tools / platforms / build-tools / cmdline-tools），**没有 ndk
+目录**——差异仅此一处，又是"沙箱与真机形态漂移"。
+
+**解决**（alpha.38，两层）：
+1. `AndroidSdkInstaller.ensureNdkStub()`：写入最小 NDK 占位——
+   Flutter 只检查 `ndk/<version>/source.properties` **文件存在**
+   （android_sdk.dart `hasNdkVersion`）+ 目录名即版本号（
+   gradle.dart `_getInstalledNdkVersionsForGradle` 扫 ndk 子目录）。
+   版本号从插件源码 `FlutterExtension.kt` 运行时解析（SDK 升级自动跟随）。
+   **不下载 2.2GB 真 NDK**——demo 项目零 native 代码（无 CMakeLists），
+   占位即可让插件跳过补装，也不把 NDK 工具链拖进包；
+2. 双入口接入：工具链安装流程（licenses 之后）+ `ToolchainEnsure.ndkStub()`
+   构建前自愈（兜住已装 SDK 的老用户，幂等）；分诊 hint 识别
+   `exit value 132` / `sigill` / `sdkmanager` 指向本 Bug。
+
+**验证**：shell 逻辑双分支模拟（首跑 NDK_STUB_OK / 二跑幂等
+NDK_STUB_PRESENT / 解析出的版本 `28.2.13676358` 与插件源码一致）；
+`build_runner_ndk_test.dart` 固化分诊识别（132 + sigill 两条）。
+真机预期：24% 后进入 gradle 任务执行段（编译 + 打包）。
+
+**教训**：Android 上跑 JVM 工具（sdkmanager / gradle daemon / kotlinc）
+有一条隐性红线——**JIT 生成的指令设备可能不支持**（SIGILL），而这类
+崩溃的报错位置（模板某行）与真因（三方插件自动补装行为 + JVM 环境）
+相隔极远。排查手法：从报错**进程名**入手，反查"谁在什么条件下会调
+它"（本例 `forceNdkDownload` 的三个前置条件），再对比沙箱与真机的
+**目录形态差异**（ndk 目录有无）。另外：能"让工具判定已装"时，
+就用最小桩替代真的去装——桩是可控的，自动补装不是。
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
