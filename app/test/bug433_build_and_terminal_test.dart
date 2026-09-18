@@ -51,13 +51,22 @@ void main() {
     });
 
     test('再断言不得引入新的 pub get / precache（避免递归与耗时）', () {
-      final start = cmd.indexOf('E=');
+      final start = cmd.indexOf("sh -c '");
       final end = cmd.lastIndexOf('build apk');
+      expect(start, greaterThan(0), reason: '必须以 sh -c 形式内嵌');
       final seg = cmd.substring(start, end);
       expect(seg.contains('pub get'), isFalse,
           reason: '再断言脚本内不得再跑 pub get');
       expect(seg.contains('precache'), isFalse,
           reason: '前置检查已确保构件存在，再断言不该 precache');
+    });
+
+    test('用 sh -c 而非 { ... ; } 分组（后者遇尾部换行会报语法错）', () {
+      // 脚本末尾带换行，`\n ; }` 在 dash/bash 下都非法。
+      expect(cmd.contains("sh -c '"), isTrue,
+          reason: '必须用 sh -c 内嵌多行脚本');
+      expect(RegExp(r'\{\s*\$?reassert').hasMatch(cmd), isFalse,
+          reason: '不得用 { script ; } 分组');
     });
   });
 

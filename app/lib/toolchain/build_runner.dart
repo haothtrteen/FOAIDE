@@ -317,6 +317,10 @@ class BuildRunner {
     // 下的转发脚本盖回真 x64 二进制（真机表现：AOT 跑到 54% 后
     // shaders/*.frag 编译 SIGILL，exit -4）。因此在 pub get 之后、
     // flutter build 之前，于**同一条 shell 命令内**再断言一次转发层。
+    //
+    // 注意：不能用 `{ script ; }` 分组——脚本末尾带换行，`\n ; }` 在
+    // dash/bash 下都是语法错误。改用 `sh -c '...'` 独立执行，既避开
+    // 分组问题，也把它的输出隔离（只留最后 2 行，避免刷屏）。
     final reassert = QemuCompat.wrapReassertScript
         .replaceAll('@ENGINE@', QemuCompat.engineDir)
         .replaceAll('@QEMU@', QemuCompat.qemuBin);
@@ -332,10 +336,15 @@ class BuildRunner {
         '[ "\$ok" = 1 ] || exit 69; '
         'export PUB_HOSTED_URL=\$src; '
         // Bug 433 转发层再断言（pub get 后、build 前，同一 shell）
-        '{ $reassert ; } 2>&1 | tail -n 2; '
+        'sh -c ' + _shq(reassert) + ' 2>&1 | tail -n 2; '
         '$flutterCmd build apk --no-shrink --release '
         '--target-platform=android-arm64$aapt2Override';
   }
+
+  /// 单引号包裹一段 shell 片段（内部单引号用 '\'' 转义）。
+  /// 用于把多行脚本安全地塞进 `sh -c '...'`。
+  static String _shq(String s) =>
+      "'${s.replaceAll("'", "'\\''")}'";
 
   /// 清理构建缓存（flutter clean，工作台打包配置卡的快捷操作）：
   /// 返回 null = 成功，否则返回错误文案。构建中拒绝（防清掉正在
