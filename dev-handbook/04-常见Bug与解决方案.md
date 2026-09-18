@@ -714,7 +714,12 @@ Termux 构建 proot 时把 `P_tmpdir` 硬编码为 `/data/data/com.termux/files/
 
 一键完成四步（对应需求文档的「提前下载 Gradle + 配置国内镜像源」）：
 1. **环境变量** → host 侧直接写 rootfs 真实文件 `/etc/profile.d/foa-env.sh` + `~/.bashrc`（PUB_HOSTED_URL / FLUTTER_STORAGE_BASE_URL / ANDROID_HOME / JAVA_HOME / GRADLE_USER_HOME / PATH 追加 /opt/flutter/bin）；
-2. **Maven 镜像** → `~/.gradle/init.gradle` 写入阿里云三仓（public/google/gradle-plugin），`allprojects` + `settingsEvaluated` 双保险（settings 的 pluginManagement 和 dependencyResolutionManagement 也要覆盖，单写 allprojects 对 AGP 9 不够）；
+2. **Maven 镜像** → `~/.gradle/init.gradle` 写入阿里云三仓
+   （public/google/gradle-plugin）。⚠️ 形态已随 Bug 426 改版（alpha.37）：
+   **beforeSettings 前插 settings 仓**（settings 仓库正是被 prefer 的
+   对象，加仓库合法）。旧版 `allprojects + settingsEvaluated` 双保险
+   是**错误指导**——Flutter 新模板 settings.gradle.kts 走 PREFER_SETTINGS
+   模式拒绝 project 级仓库，真机 22% 配置 Gradle 必败（见 Bug 426）；
 3. **wrapper 镜像** → 递归改写 `/root/projects` 下所有项目的 `gradle-wrapper.properties` distributionUrl 为腾讯云镜像；
 4. **Gradle 预下载** → `gradle-9.3.1-all.zip`（224MB）下载到 wrapper 缓存目录，首次构建不再访问国外源。
 
@@ -1314,6 +1319,55 @@ Bug 423 的多源轮换方向正确但对象错了：这不是"某个源不可�
 （时间错导致证书 not-yet-valid）、DNS 解析；三个"看起来正常"的旁路
 信号（JDK 自带 cacerts / http 源 / 弱网历史）叠加时，先怀疑共同
 前提（系统级 TLS 材料），别在应用层（换源/重试）打转。
+
+### Bug 426：init.gradle 仓库注入顶撞 Flutter 新模板 PREFER_SETTINGS——22% 配置 Gradle 必败
+
+**症状**（2026-09-18 真机 alpha.36，Bug 425 修复后 pub get 已通、卡点
+顺移到 Gradle 配置段 22%）：日志在配置阶段爆出：
+
+```
+Error resolving plugin [id: 'dev.flutter.flutter-plugin-loader', version: '1.0.0']
+> Build was configured to prefer settings repositories over project
+  repositories but repository 'maven' was added by settings file
+（plugin-loader 解析失败 → 构建中断）
+```
+
+**根因**：真机容器 `/root/.gradle/init.gradle` 由工具链「一键应用」
+写入（`MirrorConfigurator._initGradleContent()`），是**注入型**：
+`allprojects { repositories { maven 阿里云×3 } }` +
+`settingsEvaluated { pluginManagement/dependencyResolutionManagement
+注入 }`。Flutter 新模板 `settings.gradle.kts`（app 模板自 alpha 起用
+KTS 新形态）经 flutter-plugin-loader 走 **PREFER_SETTINGS** 仓库模式——
+该模式拒绝任何 project 级仓库，`allprojects` 注入的 `maven` 仓正好
+踩雷，报错里的 `'maven'` 就是注入仓的显示名。
+
+**为什么沙箱没翻车**：沙箱构建机 `/root/.gradle/init.gradle` 早已是
+**beforeSettings 前插形态**（只在 settings 仓库里加镜像仓、无
+allprojects/settingsEvaluated）——settings 仓库正是被 prefer 的对象，
+怎么加都不违规。同一套 skill 流程，沙箱正常、真机必败，差异只在
+init.gradle 一份文件的形态。
+
+**解决**（alpha.37，三层）：
+1. `MirrorConfigurator.initGradleContent()` 重写为 beforeSettings
+   前插版（方法一并公开）：与沙箱验证形态对齐，镜像仓前插最前命中
+   即停，模板自带 google()/mavenCentral() 自动成为兜底；
+2. `ToolchainEnsure.gradleInitSanitize()` 构建前自愈：检测容器
+   init.gradle 含 `allprojects`/`settingsEvaluated` 特征 → 用新版
+   覆写（host 直写 rootfs 树，与 caCerts 同 IO 路径）；自愈失败只
+   记 warning 不阻断（用户可能已手动修正）；
+3. 分诊 hint 新增 `prefer settings repositories` 条目（指向工具链页
+   重跑「一键应用」）。
+
+**验证**：新增 `mirror_configurator_test.dart` 文本断言（禁止
+allprojects/settingsEvaluated 注入、必须 beforeSettings、镜像域名
+齐全、无 project 级 repositories 裸注入——断言前剥离注释行，注释里
+提关键词不算）。真机预期：22% 之后正常进入 Gradle 任务段。
+
+**教训**：全局 gradle 钩子改仓库有两个安全形态（beforeSettings 前插
+settings 仓 / 改写已有仓库 url），**allprojects/settingsEvaluated
+注入是死路**——Flutter 新模板 PREFER_SETTINGS 一票否决。同一份
+配置文件在沙箱与真机形态漂移时，"沙箱好的"不构成免检理由，要把
+"形态差异"本身当作排查对象。
 
 ## 十二、提交 Bug 记录模板
 
