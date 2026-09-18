@@ -60,8 +60,10 @@ class PtySession(
     var bytesOut = 0L
 
     /** 从屏幕输出里刮出的「当前工作目录」提示（供 UI 显示）。 */
+    // ⚠️ Bug 440：初值必须用**双引号**的空字符串 ""，不是单引号 ''。
+    // '' 是空字符字面量，Kotlin 会直接报 Empty character literal 编译失败。
     @Volatile
-    var lastCwdHint: String = ''
+    var lastCwdHint: String = ""
 
     fun write(text: String) {
         try {

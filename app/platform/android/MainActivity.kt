@@ -346,7 +346,14 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
         }
         try {
-            File(File(filesDir, "tmp")).listFiles()?.forEach { f ->
+            // ⚠️ 这里必须写成 `java.io.File(filesDir, "tmp")` 的函数调用形式。
+            // 写成 `File(File(...))` 时，Kotlin 会把外层 `File` 解析成
+            // **File 类的构造器引用**（不是 java.io.File 的工厂函数），
+            // 于是报 "None of the following candidates is applicable"
+            // 并连带 listFiles/name/delete 全部 Unresolved（Bug 440）。
+            // 显式限定 java.io.File 可消除歧义。
+            val tmpDir = java.io.File(filesDir, "tmp")
+            tmpDir.listFiles()?.forEach { f ->
                 if (f.name.startsWith("pty-size-")) f.delete()
             }
         } catch (_: Exception) {
@@ -1075,14 +1082,23 @@ class MainActivity : FlutterActivity() {
 
             Thread {
                 PtyRegistry.pump(proc.inputStream, session)
-                val finished = proc.waitFor()
+                // ⚠️ Bug 440：Process.waitFor() 返回的是**退出码 Int**，
+                // 不是 Boolean。原先写 `val finished = proc.waitFor()` 再
+                // `if (finished) ...` 编译不过（Int 不能当条件）。
+                // 这里直接取退出码：waitFor() 正常返回即代表进程已结束，
+                // 抛出 InterruptedException（线程被中断）才走 -500 兜底。
+                val code = try {
+                    proc.waitFor()
+                } catch (_: InterruptedException) {
+                    -500
+                }
                 // waitFor() 返回后仍可能有少量输出在管道里，给读取线程
                 // 一点时间把尾巴抽干，避免最后几行丢失。
                 try {
                     Thread.sleep(60)
                 } catch (_: InterruptedException) {
                 }
-                session.exitCode = if (finished) proc.exitValue() else -500
+                session.exitCode = code
                 session.finished = true
             }.apply { name = "foa-pty-$id" }.start()
 
