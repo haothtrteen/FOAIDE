@@ -1495,6 +1495,176 @@ precache 覆写后 =1 恢复为 `#!` / **旧逻辑同场景 =0 修不回来**）
 校验**产物内容特征**，`[ -f ]` 这种"存在性"判定在可被覆写的场景里
 是错误的不变量。
 
+### Bug 429：只包装"引擎层"漏了"顶层宿主工具"——impellerc shader 编译 SIGILL（真机 84.2s 崩）
+
+**症状**（2026-09-18 真机 alpha.39，Bug 428 修复后）：
+
+```
+Running Gradle task 'assembleRelease'... 84.2s
+Dart snapshot generator failed with exit code -4
+Shader compilation of ".../ink_sparkle.frag" ... failed with exit code -4
+BUILD FAILED in 1m 23s
+```
+
+**用户反馈原话（本次的关键）**：
+
+> 报错，这个它要用的东西不能全自动设置好吗？万一用户有什么新东西调用会不会还报错
+
+这句话精准指出 Bug 428 修复的**方法本身**有问题——不是"这次漏了哪个文件"，
+而是"**点名检查**"这个策略必然持续漏。
+
+**根因**：Flutter 引擎的 x64 宿主工具分布在**两个层次**：
+
+| 层次 | 路径 | 内容 | Bug 428 是否覆盖 |
+|---|---|---|---|
+| 引擎层 | `android-*/linux-x64/` | 每个 ABI 各一份 `gen_snapshot`（6 个） | ✅ 已覆盖 |
+| **顶层宿主层** | `linux-x64/`（引擎根下） | `impellerc`、`font-subset`、`flutter_tester`、`gen_snapshot`、3 个 `.so`（7 个） | ❌ **从未包装** |
+
+`artifacts.dart` 的 `HostArtifact.impellerc` 取
+`engineDir/<hostPlatform>/impellerc` → arm64 宿主解析为
+`linux-arm64/impellerc`。该目录在未做宿主层包装时不存在这些工具，
+**shader 编译直接 SIGILL**（`impellerc` 正是 ShaderCompilerException
+的元凶，与 AOT snapshotter 是两个独立工具、同时挂）。
+
+**为什么 Bug 428 的修法没能覆盖**：`qemuCompatEnsure` 的检查是
+**点名式**的——只查 `linux-arm64/gen_snapshot` 一个文件。工具集一变
+（或用户用了之前没碰过的功能，比如首次触发 shader 编译），就再次漏。
+
+**解决**（alpha.40，改为全量校验）：
+
+1. `engineWrapScript` 增加**顶层宿主工具目录**包装段：
+   `for hd in "$E"/linux-*/` → `ha="${hd%/linux-x64}/linux-arm64"`，
+   同样按 `#!` 判定、同样幂等；
+2. `ToolchainEnsure.qemuCompatEnsure()` 重写为**全量比对**，三层遍历：
+   - 引擎层 `android-*/linux-x64` → `android-*/linux-arm64`
+   - 宿主层 `linux-x64` → `linux-arm64`
+   - SDK 层 `build-tools/*`、`platform-tools`（原地 `.foa-real` 制）
+   
+   对每个 x86_64 ELF（魔数 `7f454c46` + `e_machine=3e`）校验其对应
+   `linux-arm64/` 同名文件存在**且 `#!` 开头**；输出 `n=`/`ok=`/`miss=`
+   统计，任一不就位则整层重建并复核。
+3. 关键设计原则落为测试：**禁止点名清单，必须通配遍历**
+   （`qemu_compat_test.dart` 有反向断言——出现
+   `for X in (gen_snapshot|impellerc|...)` 即判失败）。
+
+**实证**（沙箱 `bug429_sim.sh`，真实引擎目录结构）：
+
+```
+android-*/linux-x64 层：6 个
+顶层 linux-x64 层（新增覆盖）：7 个  ← impellerc 在此
+合计：13 个 x64 宿主工具全部纳入包装
+```
+
+**教训（本 Bug 最有价值的部分）**：Bug 428→429 连续两次翻车，
+说明**"逐一点名"的检查/修复策略在开放集合上必然失效**。
+正确姿势是把不变量写成**全称命题**：
+
+> 对 `linux-x64/` 下**每一个** x86_64 ELF，`linux-arm64/` 里必须
+> 存在同名 `#!` 转发脚本。
+
+这样 Flutter 未来新增任何宿主工具（乃至用户从未用过的功能触发的新
+工具）都会自动纳入，无需预见。**用户那句"万一用户有什么新东西调用
+会不会还报错"正是这个道理**——答案是"会，如果还在点名的话"。
+
+---
+
+### Bug 430：没有可交互终端——PTY 缺失导致诊断只能靠截图猜
+
+**症状**（2026-09-18 用户反馈）：
+
+> 真机容器内，那个app终端好像还没有可交互执行命令的界面
+
+排查确认：原「终端」页是**预设命令跑批**（`hello` / `系统` /
+`发行版` / `apt` / `身份` 五个 ChoiceChip + 运行按钮），只能一次跑一条
+固定命令。**这不是终端**。
+
+**实际代价**：Bug 425→429 的排障过程中，每一次都只能请用户截图，
+再根据屏幕文字猜根因。有 4 次因为无法在设备上直接执行
+`ls`/`readelf`/`strace` 而多绕了弯路（`tools/diag_428.sh` 写好了
+却没地方跑）。
+
+**技术难点**：Android/JVM **没有 pty API**——`ProcessBuilder` 只能给出
+单向管道，拿不到 tty；JNI 也没暴露 `posix_openpt`。于是 `apt` 进度条、
+`vim`/`top` 全屏程序、Ctrl+C 中断、方向键历史、tab 补全全部失效。
+
+**解决**（alpha.40，三层）：
+
+1. **C 中继器 `platform/android/pty/foa_pty.c`**（约 10KB，纯 bionic，
+   只依赖 `libc.so`/`libdl.so`，随 APK 分发）：
+   ```
+   Java(ProcessBuilder) ──pipe──▶ foa_pty ──pty──▶ proot / 宿主 sh
+   ```
+   用 `openpty()` 建真 tty，把本进程 stdin/stdout 与 pty master 双向对接。
+2. **原生会话层 `platform/android/PtySession.kt` + MainActivity 五方法**
+   （`ptyStart`/`ptyWrite`/`ptyPoll`/`ptyStop`/`ptyResize`）；
+3. **UI 换用 `xterm` 包**（完整 VT100 仿真）：`terminal.write()` 灌输出、
+   `onOutput` 接按键、`onResize` 报尺寸。软键盘补齐 Ctrl+C/D/Z、
+   Esc、Tab、四个方向键、`/ - ~` 常用符号。
+
+**做 shim 时踩的四个坑**（全部已固化为测试，因为沙箱是 x86_64 跑不了
+真机 APK，只能靠静态契约防回退）：
+
+| 坑 | 现象 | 正解 |
+|---|---|---|
+| `c_cc[]` 未赋值 | `stty -a` 显示 `intr = <undef>`，屏幕回显 `^C` 但 `sleep` 照睡 | 显式填 `VINTR=0x03`/`VERASE=0x7f`/`VEOF=0x04` 等 |
+| 会话首进程上再 `setpgid(0,0)` | 返回 EPERM 被当致命 → 终端一启动就退出（rc=120） | `setsid()` 后**不要**再 `setpgid` |
+| 父进程 `setpgid(child, child)` | 子进程成进程组组长 → 子进程 `setsid()` 失败 → rc=120 | 父进程不插手子进程的会话/进程组 |
+| 中继进程未忽略 SIGINT | 按一下 Ctrl+C 整个终端崩掉（BrokenPipe） | `signal(SIGINT/SIGQUIT/SIGTSTP, SIG_IGN)` |
+
+**尺寸热更新**：master fd 只在 shim 手里，Java 改不了 winsize；stdin 内联
+控制序列又会污染用户输入。故用**控制文件** `FOA_PTY_SIZE_FILE`
+（内容 `"<rows> <cols>"`）+ 主循环 `poll(..., 200)` 超时检查，
+变化即 `ioctl(TIOCSWINSZ)`。实测 `stty size` 从 `24 80` → `31 120`。
+
+**验证**：`tools/build_pty_shim.sh --verify` 五项目测
+（真 tty / 退出码透传 / exec 失败 127 / 尺寸透传 / `intr=^C`）全过；
+Ctrl+C 中断实测（发 0x03 后 `sleep 30` 立即被打断，shell 存活）；
+`test/pty_terminal_test.dart` 28 项契约测试。
+
+---
+
+### Bug 431：字号缩放"功能有、发现不了"——用户以为要出教程
+
+**症状**（2026-09-18 用户反馈）：
+
+> "代码编辑器"页面只有一个手指不动一个手指动的时候才能"放大/缩小"
+> 我感觉这得单独出个教程告诉用户了（）
+
+**排查结论（与直觉相反）**：功能**早就完整存在**——alpha.32 就做了
+双指捏合缩放、`A−`/`A+` 步进按钮、点中间数字恢复默认，且全部持久化
+（`EditorFontPrefs`）。tooltip 里甚至写了"双指捏合亦可"。
+
+**真正的问题是可发现性**：
+- 按钮图标只有 **14px**、颜色 **`Colors.grey`**（低对比）；
+- 水平内边距仅 **5px**，实际可点区域远小于 44px 的最小触控尺寸；
+- 状态栏总高只有 24px，视觉上完全被 `A− 14 A+` 淹没。
+
+用户那句"一个手指不动一个手指动"其实就是**系统级无障碍缩放手势**，
+说明他压根没看到编辑器自己的入口——**这不是用户不会用，是我们没让人看见**。
+
+**解决**（alpha.40，两处，都不是"写教程"）：
+1. **把入口做显眼**：图标 14→**17px**、颜色 `Colors.grey`→
+   **`Colors.grey.shade300`**、内边距 5→**8px**；新增**到达上下限时
+   变暗**（`shade700`）——避免用户反复点击却无反应；
+2. **首次进入给一次性提示**（新增 `HintPrefs` 一次性标记）：
+   > 字号调节：点底部状态栏的 A− / A+ 即可；双指捏合也能缩放，
+   > 戳中间数字可恢复默认。
+
+   带「知道了」关闭入口，只弹一次，先写标记再弹窗（用户秒退也
+   不重复打扰）。
+
+**为什么选"提示"而不是"教程"**：需要让用户去读的教程，本身就是设计
+失败的补丁。把功能放到用户视线里 + 首用时一句话点明，成本低得多，
+也不会被忽略。
+
+**教训**：**"功能存在"与"功能可用"是两件事**。自查清单——
+入口的**尺寸**（是否 >= 44px 触控区）、**对比度**（是否淹没在背景里）、
+**位置**（是否在用户会看的地方）、**首次可发现性**（用户第一次
+打开能不能自己找到）。回顾性验证：把截图缩小到手机实际尺寸看，
+14px 灰色图标确实找不到。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
