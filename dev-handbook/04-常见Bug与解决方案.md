@@ -2183,6 +2183,362 @@ gs=@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot
 
 ---
 
+### Bug 438：`impellerc failure:` 后面一片空白——进程被信号杀死，stderr 是空字符串
+
+**症状**（2026-09-19 真机，alpha.45）：
+
+```
+REASSERT=0                    ← Bug 433 的修复生效了，转发层完好
+...
+Dart snapshot generator failed with exit code -4
+impellerc failure:            ← 冒号后面什么都没有
+ShaderCompilerException: Shader compilation of ".../ink_sparkle.frag" failed
+```
+
+**关键在「冒号后面什么都没有」。**
+
+看 Flutter 源码 `shader_compiler.dart:274`：
+
+```dart
+_logger.printError('impellerc failure: ${result.stderr}');
+```
+
+`result.stderr` 是**空字符串**。一个程序哪怕参数写错、文件找不到，
+也总会往 stderr 吐点东西。**stderr 完全为空 + `exit code -4`，
+只有一种解释：进程被信号杀死了，没来得及写任何输出。**
+`-4` 是 Dart 对 `ProcessSignal` 的编号，对应 **SIGILL（128+4=132）**。
+
+**为什么这次不能靠"再改一处代码"解决**：
+
+三条排除法把范围压到了墙角：
+
+| 假设 | 反证 |
+| --- | --- |
+| 依赖库缺失（`libatomic1:amd64` 等） | 那会打印 `error while loading shared libraries: ...`，不是空 |
+| 转发层被 pub get 覆盖 | 同轮日志 `REASSERT=0`，7 个转发脚本都在且完好 |
+| impellerc 文件损坏 | 文件校验和正常，且**同时**崩的是两个独立程序 |
+
+最后一条是决定性的：**`gen_snapshot` 和 `impellerc` 是两个完全不同的
+x86_64 程序，却在同一次构建里同时、静默、以同一个信号退出。**
+两个互不相干的可执行文件不会同时出现同一处代码 bug——
+**唯一共享的东西就是 qemu 这条链路本身。**
+
+所以本次的修复目标不是"改某一行"，而是**让构建日志自己开口**。
+在真机上盲改代码的代价是一个小时等构建，而拿到诊断数据只需要 10 秒。
+
+**修复：构建前主动分层诊断（`QemuCompat.buildPreflightScript`）**
+
+在 pub get 之前插入一段预检（越早越好，别浪费后面几分钟），
+逐层输出 `QEMU_CHAIN_*` 前缀的行：
+
+```
+QEMU_CHAIN_NONE=1                              ← 没装 qemu（termux 后端会走到这）
+QEMU_CHAIN_VER=qemu-x86_64 version 7.2.0       ← 层1：qemu 本体在不在、什么版本
+QEMU_CHAIN_LOADER=ok / fail rc=132 / missing   ← 层2：qemu 能不能跑 x64 动态链接器
+QEMU_CHAIN_PROBE=impellerc=ok rc=0             ← 层3：转发脚本能不能真的跑起来
+QEMU_CHAIN_PROBE=impellerc=FAIL:SIGILL out=EMPTY
+QEMU_CHAIN_SRC=impellerc=7f454c46020101...0200 ← 层4：转发目标还是不是 x86_64 ELF
+QEMU_CHAIN_DONE=1
+```
+
+四层分别对应四种修法，一眼定位：
+
+| 输出 | 含义 | 修什么 |
+| --- | --- | --- |
+| `NONE=1` | qemu 没装或路径不对 | 工具链页「一键应用」x64 兼容层 |
+| `LOADER=fail` | qemu 在，但跑不了 x64 glibc | 多架构运行库装歪了（Bug 434 的残留） |
+| `LOADER=ok` + `PROBE=FAIL:SIGILL` | qemu 和链接器都好，转发脚本一跑就崩 | 转发脚本本身有问题 |
+| `SRC=...0200` 结尾 | 目标不是 x86_64（`3e` 结尾才是） | 转发目标被换成了 arm64 原件 |
+| `PROBE=ok` 但构建仍崩 | qemu 链路没问题 | 问题在 qemu 之外，别再查这里 |
+
+**此处踩到的坑：shell 管道会吞掉退出码（这个坑值得单独记）**
+
+第一版我这么写：
+
+```sh
+out=$( "$tool" --help 2>&1 | head -2 )
+rc=$?                                    # ← 这是 head 的退出码，永远是 0
+```
+
+`rc` 拿到的是**管道最后一个命令**（`head`）的退出码。
+于是 SIGILL 被显示成 `rc=0`，诊断信息当场变成误导——
+**这个 bug 恰好会掩盖它本要检测的那个 bug**，是最坏的一类。
+
+正确写法是拿临时文件承接输出，让 `rc` 紧邻真正的命令：
+
+```sh
+tf=/tmp/.foa_probe_out
+: > "$tf"
+"$tool" --help > "$tf" 2>&1
+rc=$?                                    # ← 这才是 impellerc 的退出码
+out=$(head -2 "$tf" 2>/dev/null)
+```
+
+同理，`if cmd; then` 里也取不到被吞掉的 `$?`：
+
+```sh
+@QEMU@ -L / "$ld" --version > /dev/null 2>&1
+lrc=$?
+if [ "$lrc" = 0 ]; then ...              # ← 先捕获，再判断
+```
+
+这条已固化成单测断言，防止以后改回去。
+
+**验证（沙箱能做到的部分）**：
+
+沙箱是 x86_64 **原生**环境，没有也**不需要** qemu，
+所以真机链路无法复现。**改用模拟环境验证「区分能力」**——
+造一个假 qemu（`kill -ILL $$`），看预检脚本能不能把两种情况分开：
+
+```
+=== 模拟 SIGILL ===
+QEMU_CHAIN_LOADER=fail rc=132
+QEMU_CHAIN_PROBE=impellerc=FAIL:SIGILL out=EMPTY     ← 正确识别
+
+=== 模拟正常 ===
+QEMU_CHAIN_LOADER=ok
+QEMU_CHAIN_PROBE=impellerc=ok rc=0                   ← 正确识别
+```
+
+**能区分，就说明这套诊断有信息量**——这正是本次交付的核心价值。
+配套单测 9 项（`test/bug438_qemu_chain_diag_test.dart`）。
+
+> **诚实说明**：本修复**不保证**构建一定能过。它保证的是——
+> **失败时你能知道是哪一层坏了**。真机 SIGILL 的真因仍需真机数据，
+> 请把构建日志里的 `QEMU_CHAIN_*` 各行截图反馈。
+
+**教训**：「现象是空的」不是「没有现象」。
+`impellerc failure:` 后的空白其实是**最精确的一条线索**
+（= 被信号杀死），只是默认没人往那儿读。
+当症状本身不提供信息时，**正确的动作是让下次运行产出信息**，
+而不是继续盲改代码。
+
+---
+
+### Bug 439：转发脚本 `-L /` 让所有 x64 工具静默崩于栈保护——Bug 438 的真身
+
+**这是 Bug 438 的根因。** 438 交付了「诊断能力」，439 交付出「修复」。
+
+**症状**（与 438 完全一致，因为就是同一个故障）：
+
+```
+Dart snapshot generator failed with exit code -4     ← SIGILL
+impellerc failure:                                   ← 冒号后为空
+```
+
+且 `REASSERT=0`——转发层完好无损，但程序照崩。
+
+**根因：转发脚本用的 qemu 调用形式是错的。**
+
+原转发脚本生成的内容是：
+
+```sh
+#!/bin/sh
+exec /usr/bin/qemu-x86_64-static -L / <真x64二进制> "$@"
+```
+
+`-L /` 的含义是「把 `/` 当作 guest 根」，然后**让 qemu 自己去里面找
+ld.so**。正是这个"让 qemu 代劳"的动作触发了 glibc 的栈保护初始化
+（`__stack_chk_fail`）：进程在 `main` **之前**就被信号杀死，
+**stderr 一个字都没有**。对应真机就是"冒号后面空白 + exit code -4"。
+
+**正确形式**：把 guest 的 ld.so 当**程序**交给 qemu，动态链接全由
+guest ld.so 自己完成，qemu 只做指令翻译：
+
+```sh
+exec /usr/bin/qemu-x86_64-static -L / /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 <真x64二进制> "$@"
+```
+
+**ld.so 路径陷阱**：必须用 Debian multiarch 真身
+`/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`。
+**不能**用 `/lib64/ld-linux-x86-64.so.2`——它是一个指向**绝对路径**
+`/lib/x86_64-linux-gnu/...` 的符号链接，跨 root（`qemu -L`）解析时会落到
+**宿主**，反而崩得更彻底。实测：
+
+| 传给 qemu 的 ld.so | 结果 |
+| --- | --- |
+| `/lib64/ld-linux-x86-64.so.2` | ❌ stack smashing |
+| `/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2` | ✅ 正常 |
+
+**四程序 A/B 矩阵**（沙箱 x86_64 + Debian amd64 libc 2.36，qemu-user-static 7.2）：
+
+| 程序 | 旧 `-L / <bin>` | 新 `-L / <ld.so> <bin>` |
+| --- | --- | --- |
+| `dart` | ✗ 崩（core dump） | ✓ `Dart SDK version: 3.13.3 ... on "linux_x64"` |
+| `impellerc` | ✗ 崩 | ✓ `ImpellerC is an offline shader processor...` |
+| `gen_snapshot` | ✗ 崩 | ✓ `Usage: gen_snapshot ...` |
+| `font-subset` | ✗ 崩 | ✓ `Usage: ...` |
+
+**旧形式 4/4 崩，新形式 4/4 正常。**
+
+**真实 shader 编译端到端**（`ink_sparkle.frag` 同级，独立 shader）：
+
+| | 旧形式 | 新形式 |
+| --- | --- | --- |
+| rc | **134**（SIGABRT），无产物 | **0** |
+| 产物 | — | `t.glsl` 134 B + `t.spirv` 1160 B |
+
+更关键的对比：编译那个**不独立的** `ink_sparkle.frag`（它是 include 片段，
+不能单独编译）时——
+
+| | 旧形式 | 新形式 |
+| --- | --- | --- |
+| rc | 134，`*** stack smashing detected ***` | 1，`Compilation error. 1 error(s)... syntax error, unexpected LEFT_BRACE` |
+
+新形式**跑到了真正的编译器里**并报出**真实的 GLSL 语法错误**；
+旧形式连启动都没完成就死了。**「真错误」vs「静默死亡」就是本次修复的全部意义。**
+
+**修复要点**：
+
+1. 新增 `QemuCompat.x64Loader = '/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2'`。
+2. 转发脚本生成片段加显式 ld.so 分支 + **旧形式回退**（保底不回归）：
+   ```sh
+   if [ -x "@LOADER@" ]; then
+     exec @QEMU@ -L / "@LOADER@" "$2" "$@"
+   fi
+   exec @QEMU@ -L / "$2" "$@"
+   ```
+   用**运行时探测**而不是生成期写死，因为 rootfs 是「先解压、后装兼容层」，
+   生成脚本那一刻 `@LOADER@` 可能还不存在。
+3. **`.so` 不能包装**（潜伏 bug）：`.so` 的 ELF magic
+   `7f454c46*3e` 与 PIE 可执行文件**完全一致**（`e_machine` 同为 x86_64、
+   `e_type` 同为 `ET_DYN`），旧判定会把 `libpath_ops.so` /
+   `libtessellator.so` / `libflutter_linux_gtk.so` 一并替换成 shell 脚本。
+   必须按 `*.so|*.so.*` 名字排除。`build apk` 不触发（`flutter_tester` 才
+   dlopen），属潜伏 bug。
+4. **占位符替换收口到 `fill()`**：新增 `@LOADER@` 后，任何一个调用点漏替换，
+   `[ -x "@LOADER@" ]` 恒假 → **静默回退到旧的错误形式**，Bug 439 原样复发
+   且毫无提示。所有调用点统一走 `QemuCompat.fill()`。
+5. 预检（Bug 438 那套诊断）新增 **OLDSTYLE 对照探针**：同时用新旧两种形式
+   跑一次，若「旧崩、新正常」就精确命中 439。另补 `134) s=SIGABRT`。
+
+**heredoc 反引号陷阱（修复过程中实际踩到）**：
+
+生成脚本时用的是 `cat > "$1" <<FOAWRAP`。**分隔符没加引号**，导致 body
+会被 shell 展开——注释里写一个反引号（如在说明里写 `-L /` 形式）就会被当成
+命令替换，**吞掉后面所有行**，报 `Syntax error: end of file unexpected`，
+而报错行号指向**脚本第 1 行**，极难定位。
+
+- 验证：`printf 'cat >/tmp/bt.txt <<EOF\nHello `whoami` world\nEOF\ncat /tmp/bt.txt' | dash`
+  → 输出 `Hello root world`，证实未加引号的 heredoc 会展开。
+- 修复：分隔符改成 **`<<'FOAWRAP'`**（带单引号），body 完全字面量；
+  原先 body 里手写的 `\$` 全部改回裸 `$`（否则会残留字面反斜杠）。
+- 固化：`test/bug439_loader_wrapper_test.dart` 有专门断言
+  「分隔符带单引号」「body 内无裸露反引号」「用裸美元符而非转义形式」，
+  并对五个脚本跑 `dash -n` + `bash -n`。
+
+**验证**（本次全部通过）：
+
+| 项 | 结果 |
+| --- | --- |
+| `flutter analyze` | 7 条 third_party 基线，无新增 |
+| `flutter test` | **196 项全绿**（原 180 + Bug 439 新增 16） |
+| 五个生成脚本 `dash -n` / `bash -n` | 全部通过 |
+| 实际执行 `wrapReassertScript` | `REASSERT=3`，`.so` **未被包装** ✓ |
+| 生成的转发脚本跑 `impellerc --help` | ✓ 正常输出 |
+| 新老形式同条件 A/B | 旧 `*** stack smashing detected ***` / 新 正常 |
+| 真实 shader 编译 | 旧 rc=134 无产物 / 新 rc=0 产出 glsl+spirv |
+
+> **沙箱限制（诚实说明）**：沙箱是 x86_64 原生，无 arm64 硬件。
+> 本次通过**下载真实 Debian arm64/amd64 qemu 包 + amd64 libc 做单层/嵌套
+> 模拟**，实现了真机链路的等效复现，根因已端到端复现并可 A/B 验证，
+> 与真机日志特征一一对应。**最终确认仍需真机**。
+
+**真机确认步骤**：装包 → 工具链页「一键应用」x64 兼容层
+（**必须重新应用**，否则仍是旧转发脚本）→ 看 `impellerc 冒烟` 是否通过
+→ 构建并检查日志里的 `QEMU_CHAIN_*`（尤其 `QEMU_CHAIN_OLDSTYLE=` 一行）。
+
+**教训**：
+- 「转发层在位」不等于「转发层正确」——文件存在、可执行、`REASSERT=0`，
+  都只证明脚本在那里，**不证明它调用 qemu 的方式是对的**。
+  检查中间层时，要检查它的**内容**，而不只是它的**存在**。
+- 一个 **bug 的"现象"和"根因"可以隔着两层**：438 记录了现象（stderr 为空），
+  439 才是让现象消失的那一行代码。诊断能力先落地，根因后到，这是正常节奏，
+  但要记得**回头把根因补上**——否则诊断只会一直报同一个错。
+- 凡是「两个互不相干的程序同时以同一信号静默退出」，答案几乎总在
+  **它们共享的那一层**上，而不是它们各自的代码里。
+
+---
+
+### Bug 440：平台模板领先于生成目录——PTY 终端实现根本没编进 APK
+
+**怎么发现的**：出 alpha.47 时执行第 6 步「平台模板双写门禁」，
+`diff` 生成目录与 `platform/` 模板，发现 **`platform/MainActivity.kt`
+比生成目录多 269 行，而生成目录没有任何一行是模板没有的**
+（`diff | grep -c '^>'` = 269，`'^<'` = 0）。
+
+这是一个**单向领先**的信号：模板里有东西，生成目录里没有。
+追下去发现两处：
+
+| 文件 | 生成目录 | platform 模板 |
+| --- | --- | --- |
+| `MainActivity.kt` | 1401 行，**0 处** PTY 代码 | 1670 行，含完整 PTY 五件套 |
+| `PtySession.kt` | **不存在** | 存在 |
+
+**影响面是致命的，且和用户反馈对上了**：Dart 侧
+`lib/ui/terminal_page.dart` 有 **20 处**调用
+`ptyStart` / `ptyWrite` / `ptyPoll` / `ptyStop` / `ptyResize`，
+而生成目录的 `MainActivity.kt` 里 **0 个 handler**。
+`foa_pty` 二进制**已经打进 APK**（`assets/tools/foa_pty`，11152 B），
+但 Java 侧没有实现 —— 一打开终端就是 **`MissingPluginException`**。
+这正是用户此前反馈的三张截图之一。
+
+**为什么之前没被发现**：`platform/` 模板是"新工程脚手架"的来源，
+但**它不是构建输入**——构建只编译 `android/app/src/main/`。
+于是「模板里写好的功能」和「实际编进包的代码」是两条独立的路径，
+没有门禁强制它们一致。Bug 430 的 PTY 工作**只落在了模板侧**，
+从没进入过构建目录，所以从没被编译、也从没被验证。
+
+**修复过程中的三连编译错误**（模板代码从未编译过，一编译就暴露）：
+
+| 位置 | 错误 | 原因 |
+| --- | --- | --- |
+| `MainActivity.kt:349` | `None of the following candidates is applicable` + `listFiles`/`name`/`delete` 全部 Unresolved | `File(File(filesDir, "tmp"))` —— **单参数**嵌套时 Kotlin 把外层 `File` 解析成**类构造器引用**而非 `java.io.File` 工厂函数。改用 `java.io.File(...)` 显式限定 |
+| `MainActivity.kt:1085` | `Condition type mismatch: inferred type is 'Int' but 'Boolean' was expected` | `Process.waitFor()` 返回**退出码 Int**，不是 Boolean。原写法 `val finished = proc.waitFor()` 再 `if (finished)` 不成立。改为直接取 `code`，用 try/catch 兜 `-500` |
+| `PtySession.kt:64` | `Empty character literal` | `var lastCwdHint: String = ''` —— `''` 是空**字符**字面量，字符串初值必须是 `""` |
+
+> **注意一个容易误判的点**：同一个文件里还有 8 处
+> `File(File(x, y), z)` 的两参数嵌套写法，那些**是能编译的**——
+> 因为外层调用带了第二个参数，Kotlin 能明确解析到构造器。
+> 只有**单参数** `File(File(...))` 才会歧义。
+> 修的时候要按「是否单参数」筛，不能见 `File(File(` 就改。
+
+**修复**：
+
+```bash
+# 单向同步：模板 → 生成目录（模板是权威源）
+cp platform/android/MainActivity.kt android/app/src/main/kotlin/dev/foa/flutter_on_android/MainActivity.kt
+cp platform/android/PtySession.kt   android/app/src/main/kotlin/dev/foa/flutter_on_android/PtySession.kt
+# 然后修上面三个编译错误，再构建
+```
+
+**验证**：
+
+| 项 | alpha.47 首轮（模板未同步） | alpha.47 修复后 |
+| --- | --- | --- |
+| Kotlin 编译 | — | ✅ 通过 |
+| `classes.dex` 里 `ptyStart` | **0** | **3** |
+| `classes.dex` 里 `PtyRegistry` | **0** | **2** |
+| `classes.dex` 里 `ptyResize` | 0 | 1 |
+| 终端功能 | `MissingPluginException` | 可用 |
+
+四件套（badging / 资产 / 签名 / GPL）全过；`analyze` 保持
+7 条 third_party 基线；`flutter test` **196 项全绿**。
+
+**教训**：
+- **第 6 步双写门禁不是形式主义**——它这次直接拦下了一个
+  "功能完全没进包"的致命缺陷。**门禁的价值就在于它会拦下你没想到的事。**
+- 判断双写差异时，**要看方向**：`diff | grep -c '^>'` 与 `'^<'` 的
+  数量对比能立刻告诉你谁是权威源。单向领先 = 有内容漏同步；
+  双向都有 = 两边各自改了，要人工判断。
+- **"模板里有" ≠ "包里会有"**。只要模板不是构建输入，
+  任何只写在模板里的代码都是**未编译、未验证**的。
+  一个功能写完之后**必须过一次构建**才算存在。
+- 提前做全仓同类缺陷扫描（这里扫 `= ''` / `File(File(` / `waitFor()`），
+  比"改一个→构建 8 分钟→再改下一个"省下大量时间。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
