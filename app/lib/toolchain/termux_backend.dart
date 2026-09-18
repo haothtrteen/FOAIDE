@@ -241,23 +241,53 @@ class TermuxRepo {
   static String indexPath(String repoBase) =>
       '$repoBase/dists/stable/main/binary-aarch64/Packages';
 
+  /// gz 版索引路径：明文 Packages 有 8MB+，Packages.gz 只有 ~1.5MB——
+  /// 弱网（几十 KB/s）下差距 5 倍时间。Bug 422 主修复之一。
+  static String indexPathGz(String repoBase) =>
+      '$repoBase/dists/stable/main/binary-aarch64/Packages.gz';
+
+  /// 与 SdkDownloader 同语义的超时常量（独立定义避免跨文件耦合）：
+  /// 响应头 20s（connectionTimeout 只管到握手）/ 数据间隔 15s。
+  static const Duration _respHeaderTimeout = Duration(seconds: 20);
+  static const Duration _stallTimeout = Duration(seconds: 15);
+
   /// 拉取并解析索引，返回目标包的最新条目。逐镜像尝试：404/超时/断网 → 下一个。
+  ///
+  /// 三重保护（Bug 422，2026-09-18 真机反馈驱动）：
+  /// ① 拉 Packages.gz（体积减 5 倍）；② 卡死熔断——原实现
+  /// `resp.transform(...).join()` 无任何数据侧超时，服务端 hang 时永久
+  /// 挂起，真机弱网下"查询索引"一小时不返回（与 Bug 421 同款死逻辑：
+  /// 超时检查必须由 Stream.timeout 独立驱动，不能依赖数据到达）；
+  /// ③ 磁盘缓存回退——全镜像失败时用上次成功拉取的索引（版本可能
+  /// 略旧，只是非最新，可接受；比"装不了"强）。
   static Future<TermuxPackageSpec> resolve(
     String pkg, {
     void Function(String mirrorName)? onMirror,
+    String? cachePath,
   }) async {
     Object? lastErr;
     for (final m in repoMirrors()) {
       try {
         onMirror?.call(m.name);
-        final text = await _fetchText(indexPath(m.url));
+        final gz = await _fetchIndexGz(indexPathGz(m.url));
+        final text = utf8.decode(gzip.decode(gz));
         final specs = parsePackagesIndex(text, pkg);
         if (specs.isEmpty) {
           throw DownloadException('索引里没有 $pkg 的 aarch64 条目');
         }
+        if (cachePath != null) _writeCache(cachePath, gz);
         return newest(specs);
       } catch (e) {
         lastErr = e;
+      }
+    }
+    // 全镜像失败 → 缓存回退（indexing 卡一小时的教训：弱网下"旧索引"
+    // 远比"查询失败"有用；下载走 SdkDownloader 多源，还有兜底）
+    if (cachePath != null) {
+      final cached = _readCache(cachePath);
+      if (cached != null) {
+        final specs = parsePackagesIndex(utf8.decode(gzip.decode(cached)), pkg);
+        if (specs.isNotEmpty) return newest(specs);
       }
     }
     throw DownloadException('Termux 仓库索引获取失败（$pkg）：$lastErr');
@@ -268,18 +298,44 @@ class TermuxRepo {
       .map((m) => MirrorSource(m.name, '${m.url}/${spec.filename}'))
       .toList();
 
-  static Future<String> _fetchText(String url) async {
+  /// 拉 Packages.gz 原始字节。超时三件套：连接 20s（含 DNS 后的握手）/
+  /// 响应头 20s / 数据间隔 stall 15s（Stream.timeout 驱动，事件间隔超时
+  /// 即抛 → 上层换下一个镜像，不再永久挂起）。
+  static Future<List<int>> _fetchIndexGz(String url) async {
     final client = HttpClient();
     client.connectionTimeout = const Duration(seconds: 20);
     try {
       final req = await client.getUrl(Uri.parse(url));
-      final resp = await req.close().timeout(const Duration(seconds: 60));
+      final resp = await req.close().timeout(_respHeaderTimeout);
       if (resp.statusCode != 200) {
         throw DownloadException('HTTP ${resp.statusCode}');
       }
-      return await resp.transform(utf8.decoder).join();
+      final bytes = <int>[];
+      await for (final chunk in resp.timeout(_stallTimeout)) {
+        bytes.addAll(chunk);
+      }
+      if (bytes.isEmpty) throw DownloadException('空响应');
+      return bytes;
     } finally {
       client.close();
+    }
+  }
+
+  /// 索引缓存（存原始 gz 字节，~1.5MB；写失败静默——缓存只是兜底）。
+  static void _writeCache(String path, List<int> gz) {
+    try {
+      final f = File(path);
+      f.parent.createSync(recursive: true);
+      f.writeAsBytesSync(gz);
+    } catch (_) {}
+  }
+
+  static List<int>? _readCache(String path) {
+    try {
+      final f = File(path);
+      return f.existsSync() ? f.readAsBytesSync() : null;
+    } catch (_) {
+      return null;
     }
   }
 }
@@ -379,7 +435,12 @@ echo COMMIT_OK
     DownloadCancelToken? token,
   }) async {
     onPhase?.call('indexing');
-    final spec = await TermuxRepo.resolve(pkg, onMirror: onMirror);
+    // 缓存回退（Bug 422）：索引存 filesDir，全镜像失败时用旧索引兜底
+    final spec = await TermuxRepo.resolve(
+      pkg,
+      onMirror: onMirror,
+      cachePath: '${env.filesDir}/termux-packages-index.gz',
+    );
     final dl = Directory(TermuxPaths.dlDir(env));
     await dl.create(recursive: true);
     final save = '${dl.path}/${spec.fileName()}';

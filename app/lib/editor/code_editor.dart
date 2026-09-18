@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:code_text_field/code_text_field.dart';
 import 'package:dart_style/dart_style.dart';
@@ -23,6 +25,7 @@ import 'package:highlight/languages/yaml.dart' as hl_yaml;
 
 import 'completion.dart';
 import 'dart_syntax_checker.dart';
+import '../env/proot_bridge.dart';
 
 /// 代码编辑器：语法高亮 + 行号 + 等宽字体 + 轻量补全/语法检查。
 ///
@@ -60,6 +63,14 @@ class CodeEditorState extends State<CodeEditor> {
   List<SyntaxIssue> _issues = const [];
   bool _checking = false;
 
+  // ---- 字号缩放（alpha.32）----
+  /// 当前字号；initState 异步恢复上次偏好（捏合/按钮调整后持久化）。
+  double _fontSize = EditorFontPrefs.def;
+
+  /// 捏合起点字号（onScaleStart 快照，onScaleUpdate 按手势 scale 乘算）。
+  double _scaleBase = EditorFontPrefs.def;
+  bool _scaleActive = false;
+
   @override
   void initState() {
     super.initState();
@@ -69,6 +80,9 @@ class CodeEditorState extends State<CodeEditor> {
     );
     _controller.addListener(_onChanged);
     _scheduleCheck(immediate: true);
+    EditorFontPrefs.load().then((v) {
+      if (mounted && v != _fontSize) setState(() => _fontSize = v);
+    });
   }
 
   @override
@@ -311,25 +325,53 @@ class CodeEditorState extends State<CodeEditor> {
                 // Bug 214 修复：1.1.0 起高亮主题由 CodeTheme widget 提供
                 // （CodeController 的 theme 参数已废弃），不包 CodeTheme 则
                 // highlight 产出的 span 无样式 → 语法高亮"不生效"
-                child: CodeTheme(
-                  data: const CodeThemeData(styles: monokaiSublimeTheme),
-                  child: CodeField(
-                    controller: _controller,
-                    focusNode: _focus,
-                    expands: true,
-                    // 显式声明普通多行文本输入（非密码/数字变体），
-                    // 避免厂商 ROM 的安全键盘误判（系统级设置仍需用户关闭）
-                    keyboardType: TextInputType.multiline,
-                    decoration: const BoxDecoration(),
-                    cursorColor: const Color(0xFF3DDC84),
-                    textStyle: const TextStyle(
-                      fontFamily: 'monospace',
-                      fontSize: 14,
-                      height: 1.5,
-                    ),
-                    lineNumberStyle: const LineNumberStyle(
-                      width: 46,
-                      textStyle: TextStyle(fontSize: 12, color: Colors.grey),
+                //
+                // alpha.32：外层 GestureDetector 双指捏合缩放字号——
+                // 单指手势完全放行给 CodeField（光标/滚动/长按选择），
+                // pointerCount>=2 才接管；缩放结果在 onScaleEnd 持久化。
+                child: GestureDetector(
+                  onScaleStart: (d) {
+                    if (d.pointerCount >= 2) {
+                      _scaleBase = _fontSize;
+                      _scaleActive = true;
+                    }
+                  },
+                  onScaleUpdate: (d) {
+                    if (!_scaleActive || d.pointerCount < 2) return;
+                    final v = (_scaleBase * d.scale).clamp(
+                        EditorFontPrefs.min, EditorFontPrefs.max);
+                    // 0.5px 以下不刷，避免高频 setState
+                    if ((v - _fontSize).abs() >= 0.5) {
+                      setState(() => _fontSize = v);
+                    }
+                  },
+                  onScaleEnd: (_) {
+                    if (_scaleActive) {
+                      _scaleActive = false;
+                      EditorFontPrefs.save(_fontSize);
+                    }
+                  },
+                  child: CodeTheme(
+                    data: const CodeThemeData(styles: monokaiSublimeTheme),
+                    child: CodeField(
+                      controller: _controller,
+                      focusNode: _focus,
+                      expands: true,
+                      // 显式声明普通多行文本输入（非密码/数字变体），
+                      // 避免厂商 ROM 的安全键盘误判（系统级设置仍需用户关闭）
+                      keyboardType: TextInputType.multiline,
+                      decoration: const BoxDecoration(),
+                      cursorColor: const Color(0xFF3DDC84),
+                      textStyle: TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: _fontSize,
+                        height: 1.5,
+                      ),
+                      lineNumberStyle: LineNumberStyle(
+                        width: _fontSize < 18 ? 46 : 54,
+                        textStyle: TextStyle(
+                            fontSize: _fontSize - 2, color: Colors.grey),
+                      ),
                     ),
                   ),
                 ),
@@ -466,6 +508,31 @@ class CodeEditorState extends State<CodeEditor> {
                   style: const TextStyle(fontSize: 11, color: Colors.grey),
                 ),
               ),
+              // 字号缩放（alpha.32）：A- / 当前字号 / A+，字号可点回默认；
+              // 与双指捏合等效，给不熟悉手势的用户一个可见入口
+              _fontButton(Icons.text_decrease, '缩小字号（双指捏合亦可）', -1),
+              Tooltip(
+                message: '点击恢复默认字号',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(4),
+                  onTap: () {
+                    if (_fontSize == EditorFontPrefs.def) return;
+                    setState(() => _fontSize = EditorFontPrefs.def);
+                    EditorFontPrefs.save(_fontSize);
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: Text(
+                      _fontSize.toStringAsFixed(_fontSize.truncateToDouble() == _fontSize ? 0 : 1),
+                      style: const TextStyle(
+                          fontSize: 11, color: Colors.grey,
+                          fontFeatures: [FontFeature.tabularFigures()]),
+                    ),
+                  ),
+                ),
+              ),
+              _fontButton(Icons.text_increase, '放大字号（双指捏合亦可）', 1),
+              const SizedBox(width: 4),
               Text(
                 _languageName,
                 style: const TextStyle(fontSize: 11, color: Colors.grey),
@@ -473,6 +540,27 @@ class CodeEditorState extends State<CodeEditor> {
               const SizedBox(width: 8),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  /// 字号步进按钮（±1，夹在 min/max）。
+  Widget _fontButton(IconData icon, String tip, double delta) {
+    return Tooltip(
+      message: tip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(4),
+        onTap: () {
+          final v = (_fontSize + delta)
+              .clamp(EditorFontPrefs.min, EditorFontPrefs.max);
+          if (v == _fontSize) return;
+          setState(() => _fontSize = v);
+          EditorFontPrefs.save(_fontSize);
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+          child: Icon(icon, size: 14, color: Colors.grey),
         ),
       ),
     );
@@ -632,5 +720,39 @@ class _SearchDialogState extends State<_SearchDialog> {
         ),
       ],
     );
+  }
+}
+
+/// 编辑器字号偏好（alpha.32）：存 filesDir/editor-font.json。
+///
+/// CodeEditor 不持有 EnvInfo——经 ProotBridge.envInfo() 异步取一次
+///（与构建页 BackendPrefs 同款路径布局；解析/IO 失败一律回退默认值，
+/// 字号偏好只是体验增强，任何异常都不该拦着打开编辑器）。
+class EditorFontPrefs {
+  static const double def = 14.0;
+  static const double min = 9.0;
+  static const double max = 28.0;
+
+  static Future<double> load() async {
+    try {
+      final env = await ProotBridge().envInfo();
+      final f = File('${env.filesDir}/editor-font.json');
+      if (!await f.exists()) return def;
+      final raw = jsonDecode(await f.readAsString());
+      if (raw is! Map<String, dynamic>) return def;
+      final v = (raw['fontSize'] as num?)?.toDouble() ?? def;
+      return v.clamp(min, max).toDouble();
+    } catch (_) {
+      return def;
+    }
+  }
+
+  static Future<void> save(double v) async {
+    try {
+      final env = await ProotBridge().envInfo();
+      final f = File('${env.filesDir}/editor-font.json');
+      await f.parent.create(recursive: true);
+      await f.writeAsString(jsonEncode({'fontSize': v}));
+    } catch (_) {}
   }
 }

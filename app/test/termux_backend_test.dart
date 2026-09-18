@@ -236,8 +236,8 @@ Size: 999
   // ---------------- TermuxRepo ----------------
   group('TermuxRepo', () {
     test('索引路径拼接', () {
-      expect(TermuxRepo.indexPath('https://example.com/apt/termux-main'),
-          'https://example.com/apt/termux-main/dists/stable/main/binary-aarch64/Packages');
+      expect(TermuxRepo.indexPathGz('https://example.com/apt/termux-main'),
+          'https://example.com/apt/termux-main/dists/stable/main/binary-aarch64/Packages.gz');
     });
 
     test('deb 直链 = 每个镜像 + filename', () {

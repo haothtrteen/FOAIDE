@@ -1748,7 +1748,7 @@ class _TermuxCard extends StatelessWidget {
 
   String get _statusLabel => switch (phase) {
         TermuxPhase.idle => prefixReady ? '已初始化' : '未安装',
-        TermuxPhase.indexing => '查询 Termux 仓库索引…',
+        TermuxPhase.indexing => '查询 Termux 仓库索引（查 JDK / aapt 版本；Flutter 不在主仓，走下方独立下载）…',
         TermuxPhase.downloading => '下载中…',
         TermuxPhase.unpacking => '容器内解包 + 前缀改写…',
         TermuxPhase.importing => '导入 Flutter…',

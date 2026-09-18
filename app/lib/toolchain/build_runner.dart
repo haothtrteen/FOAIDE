@@ -203,18 +203,25 @@ class BuildRunner {
       }
     }
 
-    // pub get 三次重试（Bug 420 第二层）：弱网下 pub 的 TLS 瞬断会让
-    // flutter build 内部的自动 pub get 直接 exit 69。提前独立 pub get
-    // 并重试，成功后 build 内部的自动 pub get 秒过（pubspec 未变）。
+    // pub get 多源轮换重试（Bug 423）：真机弱网（~50KB/s）下到
+    // pub.flutter-io.cn 的 TLS 握手会**持续**失败——同源重试 3 次
+    // （alpha.30）救不了，改为 pub 镜像逐源轮换（io.cn → 清华 → 中科大），
+    // 每源 2 次，成功源 export 后供 build 内部自动 pub get 复用。
+    // storage 镜像不变：engine artifacts 只有 flutter-io.cn 有代理。
     final flutterCmd =
         bare ? "'${TermuxPaths.flutterHome(env)}/bin/flutter'" : 'flutter';
     final envPart = bare ? TermuxPaths.envPrefix(env) : '';
     final cmd = "cd $proj && $envPart"
         'FLUTTER_ALLOW_ROOT=true '
-        'ok=0; for i in 1 2 3; do '
-        'if $flutterCmd pub get; then ok=1; break; fi; '
-        'sleep 3; done; '
+        'ok=0; '
+        'for src in https://pub.flutter-io.cn '
+        'https://mirrors.tuna.tsinghua.edu.cn/dart-pub '
+        'https://mirrors.ustc.edu.cn/dart-pub; do '
+        'for i in 1 2; do '
+        'if PUB_HOSTED_URL=\$src \$flutterCmd pub get; '
+        'then ok=1; break 2; fi; sleep 3; done; done; '
         '[ "\$ok" = 1 ] || exit 69; '
+        'export PUB_HOSTED_URL=\$src; '
         '$flutterCmd build apk --release '
         '--target-platform=android-arm64$aapt2Override';
     final stream = await bridge.execStream(cmd, bare: bare);
@@ -330,8 +337,9 @@ class BuildRunner {
     } else if (l.contains('could not resolve') || l.contains('sslhandshake')) {
       tip = '依赖下载失败：检查镜像源（工具链页 → Gradle 镜像）';
     } else if (l.contains('tls error') || l.contains('failed to update packages')) {
-      tip = 'pub 拉取 TLS 失败（多为弱网瞬断）：构建已自动重试 3 次，'
-          '仍失败请切换网络后重试；若反复出现，检查「Gradle 镜像」页的源配置';
+      tip = 'pub 拉取 TLS 失败：已自动按 pub 镜像轮换重试（官方 io.cn → 清华 → '
+          '中科大）仍全部失败，多为当前网络到镜像站的握手被丢——切换网络'
+          '（WiFi/流量互换）后重试效果最好';
     } else if (l.contains('waiting for another flutter command')) {
       tip = 'Flutter 启动锁被占用：残留进程未清干净——完全杀掉 App 重开再试'
           '（alpha.30 起构建前会自动清理）';
