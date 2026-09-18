@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../editor/editor_page.dart';
+import '../editor/file_tree.dart';
 import '../editor/fs_bridge.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
@@ -57,6 +58,10 @@ extension _SectionLabel on _Section {
 class _ProjectPageState extends State<ProjectPage> {
   final FsBridge _fb = FsBridge();
   _Section _section = _Section.overview;
+
+  /// 内嵌编辑器句柄（alpha.35 融合）：抽屉/左栏文件树经
+  /// openFile 就地打开文件，页面不跳转。
+  final GlobalKey<EditorPageState> _editorPageKey = GlobalKey();
 
   EnvInfo? _env;
   bool _loading = true;
@@ -285,13 +290,66 @@ class _ProjectPageState extends State<ProjectPage> {
           ? const Center(child: CircularProgressIndicator())
           : _loadError.isNotEmpty
               ? _buildError()
-              : switch (_section) {
-                  _Section.overview => _buildOverview(),
-                  _Section.code => _buildCode(),
-                  _Section.manifest => _buildManifest(),
-                  _Section.build => _buildPanel(),
-                },
+              : OrientationBuilder(
+                  builder: (context, orientation) {
+                    final landscape = orientation == Orientation.landscape;
+                    final sections = _buildSections();
+                    if (!landscape) return sections;
+                    // 横屏：左栏常驻文件树（与编辑器页同一布局语言）
+                    return Row(
+                      children: [
+                        SizedBox(width: 280, child: _buildSideTree()),
+                        const VerticalDivider(width: 1),
+                        Expanded(child: sections),
+                      ],
+                    );
+                  },
+                ),
     );
+  }
+
+  /// 四区 IndexedStack（alpha.35 融合）：全部保活——「代码」就地切换
+  /// 不丢编辑状态（未保存修改跨区保留），打包区 timer 由 _section 驱动
+  /// 照常工作。编辑器为 embed 模式（无 Scaffold，自带工具行）。
+  Widget _buildSections() {
+    return IndexedStack(
+      index: _section.index,
+      children: [
+        _buildOverview(),
+        EditorPage(
+          key: _editorPageKey,
+          embed: true,
+          bridge: _fb,
+          initialDir: '/root/projects/${widget.projectName}',
+        ),
+        _buildManifest(),
+        _buildPanel(),
+      ],
+    );
+  }
+
+  /// 文件树面板（抽屉区块 / 横屏左栏共用）：点文件就地打开进内嵌
+  /// 编辑器，不跳页。
+  Widget _buildSideTree() {
+    return FileTree(
+      bridge: _fb,
+      initialDir: '/root/projects/${widget.projectName}',
+      onOpenFile: (path) {
+        // 先收抽屉（横屏左栏无 Scaffold drawer，pop 无副作用由
+        // maybeOf 判空兜住）——openFile 内的收抽屉逻辑只兜编辑器自身
+        final scaffold = Scaffold.maybeOf(context);
+        if (scaffold != null && scaffold.isDrawerOpen) {
+          Navigator.of(context).pop();
+        }
+        _openInEmbed(path);
+      },
+    );
+  }
+
+  /// 在内嵌编辑器中打开文件（文件树/清单入口共用）。
+  void _openInEmbed(String path) {
+    setState(() => _section = _Section.code);
+    _editorPageKey.currentState?.openFile(path);
   }
 
   Widget _buildError() {
@@ -318,73 +376,100 @@ class _ProjectPageState extends State<ProjectPage> {
     return Drawer(
       backgroundColor: const Color(0xFF14181E),
       child: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        // alpha.35：上半导航 + 下半文件树（侧边栏单开一档）——
+        // 抽屉里直接浏览项目文件，点文件就地进内嵌编辑器
+        child: Column(
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+            Expanded(
+              flex: 4,
+              child: ListView(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 children: [
-                  Text(widget.projectName,
-                      style: const TextStyle(
-                          fontSize: 20, fontWeight: FontWeight.bold,
-                          color: Color(0xFFE6E6E6)),
-                      overflow: TextOverflow.ellipsis),
-                  const SizedBox(height: 2),
-                  Text('项目工作台 · ${_pubName.isNotEmpty ? _pubName : "…"}',
-                      style: const TextStyle(
-                          fontSize: 12, color: Color(0xFF8A939E))),
+                  _drawerHeader(),
+                  for (final s in _Section.values) _drawerItem(s),
                 ],
               ),
             ),
-            for (final s in _Section.values)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 4),
-                child: Material(
-                  color: s == _section
-                      ? const Color(0xFF173F35)
-                      : Colors.transparent,
-                  borderRadius: BorderRadius.circular(10),
-                  child: InkWell(
-                    borderRadius: BorderRadius.circular(10),
-                    onTap: () {
-                      Navigator.of(context).pop(); // 收起抽屉
-                      if (s == _Section.code) {
-                        // alpha.34 代码区融合：不进工作台停留区，直达
-                        // 编辑器（文件树在编辑器抽屉/左栏，少一次跳转）
-                        _openEditor();
-                        return;
-                      }
-                      setState(() => _section = s);
-                    },
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 14),
-                      child: Row(
-                        children: [
-                          Icon(s.icon,
-                              size: 20,
-                              color: s == _section
-                                  ? const Color(0xFF3DDC84)
-                                  : const Color(0xFF8A939E)),
-                          const SizedBox(width: 16),
-                          Text(s.label,
-                              style: TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: s == _section
-                                      ? FontWeight.w600
-                                      : FontWeight.w400,
-                                  color: s == _section
-                                      ? const Color(0xFF3DDC84)
-                                      : const Color(0xFFC9CFD6))),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
+            const Divider(height: 1),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(26, 10, 12, 6),
+              child: Row(children: [
+                Icon(Icons.folder_outlined,
+                    size: 14, color: Color(0xFF8A939E)),
+                SizedBox(width: 6),
+                Text('文件',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF8A939E),
+                        letterSpacing: 2)),
+              ]),
+            ),
+            Expanded(flex: 6, child: _buildSideTree()),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _drawerHeader() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(widget.projectName,
+              style: const TextStyle(
+                  fontSize: 20, fontWeight: FontWeight.bold,
+                  color: Color(0xFFE6E6E6)),
+              overflow: TextOverflow.ellipsis),
+          const SizedBox(height: 2),
+          Text('项目工作台 · ${_pubName.isNotEmpty ? _pubName : "…"}',
+              style: const TextStyle(
+                  fontSize: 12, color: Color(0xFF8A939E))),
+        ],
+      ),
+    );
+  }
+
+  Widget _drawerItem(_Section s) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Material(
+        color: s == _section
+            ? const Color(0xFF173F35)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: () {
+            // alpha.35：「代码」与其他区统一——IndexedStack
+            // 就地切换到内嵌编辑器，不再跳页
+            setState(() => _section = s);
+            Navigator.of(context).pop(); // 收起抽屉
+          },
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+            child: Row(
+              children: [
+                Icon(s.icon,
+                    size: 20,
+                    color: s == _section
+                        ? const Color(0xFF3DDC84)
+                        : const Color(0xFF8A939E)),
+                const SizedBox(width: 16),
+                Text(s.label,
+                    style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: s == _section
+                            ? FontWeight.w600
+                            : FontWeight.w400,
+                        color: s == _section
+                            ? const Color(0xFF3DDC84)
+                            : const Color(0xFFC9CFD6))),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -450,7 +535,8 @@ class _ProjectPageState extends State<ProjectPage> {
         Row(
           children: [
             Expanded(
-              child: _quickCard(Icons.code, '写代码', '打开编辑器', _openEditor),
+              child: _quickCard(Icons.code, '写代码', '编辑 main.dart',
+                  () => setState(() => _section = _Section.code)),
             ),
             const SizedBox(width: 10),
             Expanded(
@@ -524,37 +610,9 @@ class _ProjectPageState extends State<ProjectPage> {
   }
 
   // ============================ 代码 ============================
-
-  /// 直达编辑器（抽屉「代码」与概览「写代码」共用）：文件树在编辑器的
-  /// 抽屉/左栏内，自动恢复上次编辑的文件（无记录回退 lib/main.dart）。
-  void _openEditor() {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => EditorPage(
-        initialDir: '/root/projects/${widget.projectName}',
-      ),
-    ));
-  }
-
-  /// 兜底视图（alpha.34 起抽屉「代码」直达编辑器，此分支正常不可达）。
-  Widget _buildCode() {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.code, size: 44, color: Color(0xFF3DDC84)),
-          const SizedBox(height: 12),
-          FilledButton.icon(
-            onPressed: _openEditor,
-            icon: const Icon(Icons.open_in_new, size: 16),
-            label: const Text('打开编辑器'),
-          ),
-          const SizedBox(height: 8),
-          Text('文件树在编辑器左侧抽屉内',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
-        ],
-      ),
-    );
-  }
+  // alpha.35 融合：代码区即 IndexedStack 里的内嵌 EditorPage（embed），
+  // 文件树在抽屉下半区/横屏左栏（_buildSideTree），点文件就地打开；
+  // 本节不再有自己的构建函数。
 
   // ============================ 清单（模仿参考图 2） ============================
 
@@ -680,12 +738,7 @@ class _ProjectPageState extends State<ProjectPage> {
       _toast('读取失败：${probe.error}');
       return;
     }
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => EditorPage(
-        initialDir: '/root/projects/${widget.projectName}',
-        initialPath: path,
-      ),
-    ));
+    _openInEmbed(path); // alpha.35：就地进内嵌编辑器，不跳页
   }
 
   Widget _fieldLabel(String s) {

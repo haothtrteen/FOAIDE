@@ -23,14 +23,22 @@ class EditorPage extends StatefulWidget {
   /// 初始打开的文件（容器内路径）；缺省不打开。
   final String? initialPath;
 
-  EditorPage({super.key, FsBridge? bridge, this.initialDir, this.initialPath})
+  /// 内嵌模式（alpha.35 工作台融合）：不建 Scaffold/AppBar/Drawer，
+  /// 输出「紧凑工具行 + 编辑面板」，供工作台内容区就地切换；
+  /// 文件树由宿主提供（抽屉/横屏左栏），经 [EditorPageState.openFile]
+  /// 联动。独立页模式（主页「编辑器」入口）完全不变。
+  final bool embed;
+
+  EditorPage(
+      {super.key, FsBridge? bridge, this.initialDir, this.initialPath,
+      this.embed = false})
       : bridge = bridge ?? FsBridge();
 
   @override
-  State<EditorPage> createState() => _EditorPageState();
+  State<EditorPage> createState() => EditorPageState();
 }
 
-class _EditorPageState extends State<EditorPage> {
+class EditorPageState extends State<EditorPage> {
   final GlobalKey<FileTreeState> _treeKey = GlobalKey();
   final GlobalKey<CodeEditorState> _editorKey = GlobalKey();
 
@@ -46,7 +54,7 @@ class _EditorPageState extends State<EditorPage> {
     // build 前改状态；失败静默——编辑器照常空态展示）
     final p = widget.initialPath;
     if (p != null && p.isNotEmpty) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _openFile(p));
+      WidgetsBinding.instance.addPostFrameCallback((_) => openFile(p));
     } else if ((widget.initialDir ?? '').isNotEmpty) {
       // alpha.34 代码区融合：工作台「代码」直达编辑器时自动恢复——
       // 优先上次编辑的文件，无记录（或已删除）回退 lib/main.dart
@@ -62,19 +70,19 @@ class _EditorPageState extends State<EditorPage> {
     if (last != null && last.isNotEmpty) {
       final probe = await widget.bridge.read(last);
       if (probe.ok) {
-        if (mounted) await _openFile(last);
+        if (mounted) await openFile(last);
         return;
       }
     }
     // 无记录（或上次文件已删）→ lib/main.dart 兜底；再没有就空态展示
     final fallbackPath = '$dir/lib/main.dart';
     final fallback = await widget.bridge.read(fallbackPath);
-    if (fallback.ok && mounted) await _openFile(fallbackPath);
+    if (fallback.ok && mounted) await openFile(fallbackPath);
   }
 
   // ---------------- 文件操作 ----------------
 
-  Future<void> _openFile(String path) async {
+  Future<void> openFile(String path) async {
     if (path == _currentPath) return;
     final proceed = await _confirmSaveIfDirty();
     if (!proceed) return;
@@ -232,6 +240,12 @@ class _EditorPageState extends State<EditorPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.embed) {
+      // 内嵌模式（alpha.35 工作台融合）：无 Scaffold/AppBar/Drawer，
+      // 输出「紧凑工具行 + 编辑面板」；文件树由宿主（工作台抽屉/
+      // 横屏左栏）提供，openFile 跨组件联动。
+      return _buildEmbedBody();
+    }
     return OrientationBuilder(
       builder: (context, orientation) {
         final landscape = orientation == Orientation.landscape;
@@ -248,65 +262,7 @@ class _EditorPageState extends State<EditorPage> {
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
-            actions: [
-              if (_currentPath != null) ...[
-                IconButton(
-                  tooltip: '撤销更改',
-                  onPressed: _dirty ? _revert : null,
-                  icon: const Icon(Icons.undo),
-                ),
-                IconButton(
-                  tooltip: _dirty ? '应用更改（有未保存修改）' : '应用更改',
-                  onPressed: _save,
-                  icon: Icon(
-                    Icons.save_outlined,
-                    color: _dirty ? const Color(0xFF3DDC84) : null,
-                  ),
-                ),
-                IconButton(
-                  tooltip: '搜索',
-                  onPressed: () => _editorKey.currentState?.openSearch(),
-                  icon: const Icon(Icons.search),
-                ),
-                IconButton(
-                  tooltip: '转到行',
-                  onPressed: _showGoToLine,
-                  icon: const Icon(Icons.my_location),
-                ),
-                // 更多：格式化 / 帮助（Dart 手册、Flutter API）
-                PopupMenuButton<String>(
-                  tooltip: '更多操作',
-                  onSelected: _onMenuSelected,
-                  itemBuilder: (ctx) => const [
-                    PopupMenuItem(
-                      value: 'format',
-                      child: ListTile(
-                        dense: true,
-                        leading: Icon(Icons.auto_fix_high, size: 20),
-                        title: Text('格式化代码'),
-                      ),
-                    ),
-                    PopupMenuDivider(),
-                    PopupMenuItem(
-                      value: 'dart_docs',
-                      child: ListTile(
-                        dense: true,
-                        leading: Icon(Icons.menu_book, size: 20),
-                        title: Text('Dart 官方手册'),
-                      ),
-                    ),
-                    PopupMenuItem(
-                      value: 'flutter_api',
-                      child: ListTile(
-                        dense: true,
-                        leading: Icon(Icons.language, size: 20),
-                        title: Text('Flutter API 浏览器'),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ],
+            actions: _editorActions(),
           ),
           // 竖屏：文件浏览器收纳为侧边栏 Drawer（AppBar 自动显示汉堡键）。
           // 注意：Drawer 是全高浮层（从屏幕顶端开始），内容必须 SafeArea
@@ -328,11 +284,130 @@ class _EditorPageState extends State<EditorPage> {
     );
   }
 
+  /// 编辑器动作组（独立页 AppBar 与内嵌工具行共用）。
+  List<Widget> _editorActions({double iconSize = 24}) {
+    return [
+      if (_currentPath != null) ...[
+        IconButton(
+          iconSize: iconSize,
+          tooltip: '撤销更改',
+          onPressed: _dirty ? _revert : null,
+          icon: const Icon(Icons.undo),
+        ),
+        IconButton(
+          iconSize: iconSize,
+          tooltip: _dirty ? '应用更改（有未保存修改）' : '应用更改',
+          onPressed: _save,
+          icon: Icon(
+            Icons.save_outlined,
+            color: _dirty ? const Color(0xFF3DDC84) : null,
+          ),
+        ),
+        IconButton(
+          iconSize: iconSize,
+          tooltip: '搜索',
+          onPressed: () => _editorKey.currentState?.openSearch(),
+          icon: const Icon(Icons.search),
+        ),
+        IconButton(
+          iconSize: iconSize,
+          tooltip: '转到行',
+          onPressed: _showGoToLine,
+          icon: const Icon(Icons.my_location),
+        ),
+        // 更多：格式化 / 帮助（Dart 手册、Flutter API）
+        PopupMenuButton<String>(
+          tooltip: '更多操作',
+          onSelected: _onMenuSelected,
+          itemBuilder: (ctx) => const [
+            PopupMenuItem(
+              value: 'format',
+              child: ListTile(
+                dense: true,
+                leading: Icon(Icons.auto_fix_high, size: 20),
+                title: Text('格式化代码'),
+              ),
+            ),
+            PopupMenuDivider(),
+            PopupMenuItem(
+              value: 'dart_docs',
+              child: ListTile(
+                dense: true,
+                leading: Icon(Icons.menu_book, size: 20),
+                title: Text('Dart 官方手册'),
+              ),
+            ),
+            PopupMenuItem(
+              value: 'flutter_api',
+              child: ListTile(
+                dense: true,
+                leading: Icon(Icons.language, size: 20),
+                title: Text('Flutter API 浏览器'),
+              ),
+            ),
+          ],
+        ),
+      ],
+    ];
+  }
+
+  /// 内嵌模式主体：紧凑工具行（文件名 + dirty 标记 + 动作组）+ 编辑面板。
+  Widget _buildEmbedBody() {
+    final path = _currentPath;
+    return Column(
+      children: [
+        Container(
+          height: 44,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          color: FoaTheme.consoleBg,
+          child: Row(
+            children: [
+              Expanded(
+                child: path == null
+                    ? Text('未打开文件',
+                        style:
+                            TextStyle(fontSize: 13, color: Colors.grey.shade500))
+                    : Tooltip(
+                        message: path,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(path.split('/').last,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w600)),
+                            ),
+                            if (_dirty) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                width: 7,
+                                height: 7,
+                                decoration: const BoxDecoration(
+                                    color: Color(0xFF3DDC84),
+                                    shape: BoxShape.circle),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+              ),
+              ..._editorActions(iconSize: 20),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(child: _buildEditorPanel()),
+      ],
+    );
+  }
+
   Widget _buildTreePanel() {
     return FileTree(
       key: _treeKey,
       bridge: widget.bridge,
-      onOpenFile: _openFile,
+      onOpenFile: openFile,
       initialDir: widget.initialDir,
     );
   }
@@ -347,10 +422,12 @@ class _EditorPageState extends State<EditorPage> {
             Icon(Icons.code, size: 56, color: Colors.grey.shade700),
             const SizedBox(height: 12),
             Text(
-              '从侧边栏选择文件开始编辑',
+              // 内嵌模式没有自己的 ☰：树在工作台抽屉/横屏左栏
+              widget.embed ? '从工作台侧边文件树选择文件' : '从侧边栏选择文件开始编辑',
               style: TextStyle(color: Colors.grey.shade500),
             ),
-            if (MediaQuery.of(context).orientation == Orientation.portrait)
+            if (!widget.embed &&
+                MediaQuery.of(context).orientation == Orientation.portrait)
               Text(
                 '（点左上角 ☰ 打开文件浏览）',
                 style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
