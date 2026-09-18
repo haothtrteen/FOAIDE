@@ -123,6 +123,36 @@ class MainActivity : FlutterActivity() {
                         }
                         "installApk" -> installApkAsync(result, call.argument<String>("path") ?: "")
                         "installRootfs" -> result.success(installRootfs())
+                        // ---- Bug 430 · 可交互 PTY 终端 ----
+                        // 五件套：起会话 / 写按键 / 轮询输出 / 停止 / 改窗口尺寸。
+                        // 走真正的 pty（foa_pty 中继器），vim/top/apt 进度条、
+                        // Ctrl+C、方向键历史、tab 补全全部可用。
+                        "ptyStart" -> {
+                            val bare = call.argument<Boolean>("bare") == true
+                            val cols = (call.argument<Number>("cols") ?: 80).toInt()
+                            val rows = (call.argument<Number>("rows") ?: 24).toInt()
+                            result.success(ptyStart(bare, cols, rows))
+                        }
+                        "ptyWrite" -> {
+                            val id = (call.argument<Number>("id") ?: -1L).toLong()
+                            val text = call.argument<String>("text") ?: ""
+                            result.success(ptyWrite(id, text))
+                        }
+                        "ptyPoll" -> {
+                            val id = (call.argument<Number>("id") ?: -1L).toLong()
+                            val offset = (call.argument<Number>("offset") ?: 0).toInt()
+                            result.success(ptyPoll(id, offset))
+                        }
+                        "ptyStop" -> {
+                            val id = (call.argument<Number>("id") ?: -1L).toLong()
+                            result.success(ptyStop(id))
+                        }
+                        "ptyResize" -> {
+                            val id = (call.argument<Number>("id") ?: -1L).toLong()
+                            val cols = (call.argument<Number>("cols") ?: 80).toInt()
+                            val rows = (call.argument<Number>("rows") ?: 24).toInt()
+                            result.success(ptyResize(id, cols, rows))
+                        }
                         // ---- Step 3 · 本地安装兜底：系统文件选择器 ----
                         "pickInstallFile" -> {
                             pendingPickResult = result
@@ -305,6 +335,29 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        /*
+         * PTY 会话必须显式收掉：shim + proot + shell 是一串真实子进程，
+         * Activity 销毁（用户按返回键退出）后若放任它们存活，会残留
+         * 僵尸 shell 与占用的 /dev/pts，并在下次进入时表现为「终端打不开」。
+         * 同理清理临时尺寸控制文件。
+         */
+        try {
+            ptyRegistry.stopAll()
+        } catch (_: Exception) {
+        }
+        try {
+            // ⚠️ 这里必须写成 `java.io.File(filesDir, "tmp")` 的函数调用形式。
+            // 写成 `File(File(...))` 时，Kotlin 会把外层 `File` 解析成
+            // **File 类的构造器引用**（不是 java.io.File 的工厂函数），
+            // 于是报 "None of the following candidates is applicable"
+            // 并连带 listFiles/name/delete 全部 Unresolved（Bug 440）。
+            // 显式限定 java.io.File 可消除歧义。
+            val tmpDir = java.io.File(filesDir, "tmp")
+            tmpDir.listFiles()?.forEach { f ->
+                if (f.name.startsWith("pty-size-")) f.delete()
+            }
+        } catch (_: Exception) {
+        }
         executor.shutdownNow()
         super.onDestroy()
     }
@@ -903,6 +956,238 @@ class MainActivity : FlutterActivity() {
             }
             try { sc.process.inputStream.close() } catch (_: Exception) {}
             mapOf<String, Any?>("ok" to true, "killed" to true)
+        } catch (e: Exception) {
+            mapOf<String, Any?>("ok" to false, "error" to e.message)
+        }
+    }
+
+    // ---------------- Bug 430 · 可交互 PTY 终端 ----------------
+
+    private val ptyRegistry = PtyRegistry()
+
+    /**
+     * 启动一个可交互 PTY 会话。
+     *
+     * 组装顺序：foa_pty(中继) → proot 或 /system/bin/sh(真 shell)。
+     * foa_pty 是纯 bionic 的小中继器（只依赖 libc/libdl，随 APK 分发），
+     * 它把 Java 给的管道与真 tty 对接，于是被它 exec 的 proot/shell
+     * 拿到的是货真价实的 pty（isatty=真）。
+     *
+     * bare=true 时跳过 proot，直接在宿主 /system/bin/sh 里跑
+     * （Termux 裸原生后端），与构建链的后端选择保持一致。
+     */
+    private fun ptyStart(bare: Boolean, cols: Int, rows: Int): Map<String, Any> {
+        val shim = PtyCmd.ensureBinary(assets, filesDir)
+            ?: return fail(-404, "PTY 中继器未落位（assets/tools/foa_pty 缺失）。")
+
+        val colsC = if (cols in 20..400) cols else 80
+        val rowsC = if (rows in 5..200) rows else 24
+
+        val argv = mutableListOf<String>()
+        argv.add(shim.absolutePath)
+        argv.add(rowsC.toString())
+        argv.add(colsC.toString())
+
+        if (bare) {
+            argv.add("/system/bin/sh")
+            argv.add("-i")
+        } else {
+            val rootfs = File(filesDir, ROOTFS_REL)
+            if (!File(rootfs, "bin/sh").exists()) {
+                return fail(-403, "rootfs 未安装：请回主页点击「初始化环境」，"
+                    + "或改用 Termux 裸原生后端。")
+            }
+            val built = buildProotCmd("")
+            val base = built.cmd ?: return built.error!!
+            /*
+             * buildProotCmd 的末尾是 `/usr/bin/env -i ... /bin/sh -c "<boot><command>"`，
+             * 交互式终端要的是**不带 -c 的登录 shell**。这里从末尾的
+             * `-c` 往前**连同它的 `/bin/sh` 前缀一起**截掉，再重新收尾。
+             *
+             * ⚠️ Bug 433：此前只截到 `-c` 之前（base.subList(0, tailIdx)），
+             * 于是 head 末尾残留一个孤立的 `/bin/sh`。重新拼接后实际传给
+             * proot 的是：
+             *     ... /bin/sh  /usr/bin/env -i HOME=... /bin/sh -c "boot; exec /bin/sh -i"
+             * 即外层 sh 把 `/usr/bin/env` 当**脚本文件路径**去执行（还要把
+             * 后续参数当作位置参数），必然起不来；PTY 里没有任何输出 →
+             * 界面永久停在「正在启动终端…」（真机 2026-09-19 反馈）。
+             * 正确做法：截掉 `-c` 时把紧邻其前的 `/bin/sh` 也一并去掉。
+             *
+             * 保留 proot 参数与绑定，改成 `-i` 交互 shell；
+             * boot 注入（resolv.conf 修复 + foa-env.sh）本身需要执行，
+             * 因此退一步用 `-c "<boot>exec /bin/sh -i"` —— exec 让
+             * shell 顶替掉外层进程，fd 0/1/2 已绑定 tty，交互体验不受影响。
+             */
+            val tailIdx = base.indexOfLast { it == "-c" }
+            var headEnd = if (tailIdx > 0) tailIdx else base.size
+            // 若 `-c` 前紧邻 `/bin/sh`（或其它 sh 路径），一并截掉
+            if (headEnd - 1 >= 0 &&
+                (base[headEnd - 1] == "/bin/sh" || base[headEnd - 1].endsWith("/sh"))
+            ) {
+                headEnd -= 1
+            }
+            val head = base.subList(0, headEnd)
+            val boot = "if ! grep -qE '^nameserver (223\\.5\\.5\\.5|119\\.29\\.29\\.29|8\\.8\\.8\\.8|114\\.114\\.114\\.114|1\\.1\\.1\\.1)' /etc/resolv.conf 2>/dev/null; then printf 'nameserver 223.5.5.5\\nnameserver 119.29.29.29\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; fi; [ -f /etc/profile.d/foa-env.sh ] && . /etc/profile.d/foa-env.sh; "
+            argv.addAll(head)
+            /*
+             * TERM 用 xterm-256color：buildProotCmd 里写死 TERM=dumb 是为了
+             * 构建日志干净，交互终端则必须给足能力，否则 vim/top 全屏渲染、
+             * 方向键、颜色全部退化。这里改 env 里的 TERM。
+             */
+            argv.add("/usr/bin/env")
+            argv.add("-i")
+            argv.add("HOME=/root")
+            argv.add("TERM=xterm-256color")
+            argv.add("PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin")
+            argv.add("/bin/sh")
+            argv.add("-c")
+            argv.add(boot + "exec /bin/sh -i")
+        }
+
+        return try {
+            val pb = ProcessBuilder(argv)
+            if (!bare) {
+                findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
+                pb.environment()["LD_LIBRARY_PATH"] = libraryPath()
+                val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
+                pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
+            } else {
+                bareEnvironment(pb)
+            }
+            /*
+             * ⚠️ 千万别 redirectErrorStream(true)：pty 已把 stdout/stderr
+             * 合到同一个终端（stderr 本身就是 slave 的 dup2），再合并会把
+             * shim 自身的诊断输出也混进屏幕。分开读反而更干净——shim 的
+             * stderr 只有致命错误（openpty 失败等），单独收集便于上报。
+             */
+            pb.redirectErrorStream(false)
+            val proc = pb.start()
+
+            val id = ptyRegistry.nextId()
+
+            /*
+             * 尺寸控制文件按会话隔离（pty-size-<id>）：多开终端时各自
+             * 独立重排。先写入初始尺寸，shim 启动时即可读到一致值。
+             */
+            val sizeFile = File(File(filesDir, "tmp").apply { mkdirs() }, "pty-size-$id")
+            try {
+                sizeFile.writeText("$rowsC $colsC")
+            } catch (_: Exception) {
+            }
+            pb.environment()["FOA_PTY_SIZE_FILE"] = sizeFile.absolutePath
+            pb.environment()["TERM"] = "xterm-256color"
+
+            val session = PtySession(id, proc, if (bare) "termux" else "proot")
+            ptyRegistry.put(session)
+
+            Thread {
+                PtyRegistry.pump(proc.inputStream, session)
+                // ⚠️ Bug 440：Process.waitFor() 返回的是**退出码 Int**，
+                // 不是 Boolean。原先写 `val finished = proc.waitFor()` 再
+                // `if (finished) ...` 编译不过（Int 不能当条件）。
+                // 这里直接取退出码：waitFor() 正常返回即代表进程已结束，
+                // 抛出 InterruptedException（线程被中断）才走 -500 兜底。
+                val code = try {
+                    proc.waitFor()
+                } catch (_: InterruptedException) {
+                    -500
+                }
+                // waitFor() 返回后仍可能有少量输出在管道里，给读取线程
+                // 一点时间把尾巴抽干，避免最后几行丢失。
+                try {
+                    Thread.sleep(60)
+                } catch (_: InterruptedException) {
+                }
+                session.exitCode = code
+                session.finished = true
+            }.apply { name = "foa-pty-$id" }.start()
+
+            // shim 的 stderr 单独收集（正常情况下为空）
+            Thread {
+                try {
+                    proc.errorStream.bufferedReader(Charsets.UTF_8).use { r ->
+                        val sb = StringBuilder()
+                        var line = r.readLine()
+                        while (line != null) {
+                            sb.append(line).append('\n')
+                            line = r.readLine()
+                        }
+                        if (sb.isNotEmpty()) {
+                            synchronized(session.lock) {
+                                session.buffer.append("\n[pty-relay] ").append(sb)
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }.apply { name = "foa-pty-err-$id" }.start()
+
+            mapOf(
+                "ok" to true,
+                "id" to id,
+                "backend" to session.backend,
+                "cols" to colsC,
+                "rows" to rowsC,
+            )
+        } catch (e: Exception) {
+            fail(-500, "启动 PTY 失败: ${e.message}")
+        }
+    }
+
+    private fun ptyWrite(id: Long, text: String): Map<String, Any?> {
+        val s = ptyRegistry.get(id)
+            ?: return mapOf<String, Any?>("ok" to false, "error" to "未知会话 id=$id")
+        if (s.finished) return mapOf<String, Any?>("ok" to false, "error" to "会话已结束")
+        s.write(text)
+        return mapOf<String, Any?>("ok" to true)
+    }
+
+    /** 轮询增量：返回自 offset 起的新增屏幕文本（含 ANSI 转义，Dart 侧渲染）。 */
+    private fun ptyPoll(id: Long, offset: Int): Map<String, Any?> {
+        val s = ptyRegistry.get(id)
+            ?: return mapOf<String, Any?>("ok" to false, "error" to "未知会话 id=$id")
+        val chunk: String
+        val len: Int
+        synchronized(s.lock) {
+            len = s.buffer.length
+            chunk = if (offset >= len) "" else s.buffer.substring(offset, len)
+        }
+        return mapOf<String, Any?>(
+            "ok" to true,
+            "running" to !s.finished,
+            "chunk" to chunk,
+            "len" to len,
+            "exitCode" to s.exitCode,
+            "backend" to s.backend,
+        )
+    }
+
+    private fun ptyStop(id: Long): Map<String, Any?> {
+        val s = ptyRegistry.get(id)
+            ?: return mapOf<String, Any?>("ok" to true, "killed" to false)
+        val killed = s.stop()
+        return mapOf<String, Any?>("ok" to true, "killed" to killed)
+    }
+
+    /**
+     * 窗口尺寸变化：vim/top 等全屏程序据此重排。
+     *
+     * master fd 在 foa_pty 进程手里，Java 碰不到，所以走「控制文件」：
+     * 把 "<rows> <cols>" 写进 FOA_PTY_SIZE_FILE 指定的文件，shim 主循环
+     * 每 200ms 检查一次，变化即 ioctl(TIOCSWINSZ)。实测生效
+     * （stty size 从 24 80 变 31 120，无需重启会话）。
+     */
+    private fun ptyResize(id: Long, cols: Int, rows: Int): Map<String, Any?> {
+        val s = ptyRegistry.get(id)
+            ?: return mapOf<String, Any?>("ok" to false, "error" to "未知会话 id=$id")
+        val c = if (cols in 20..1000) cols else 80
+        val r = if (rows in 5..500) rows else 24
+        return try {
+            // 文件名与 ptyStart 写入的一致：pty-size-<id>
+            val f = File(File(filesDir, "tmp"), "pty-size-$id")
+            f.parentFile?.mkdirs()
+            f.writeText("$r $c")
+            mapOf<String, Any?>("ok" to true, "cols" to c, "rows" to r)
         } catch (e: Exception) {
             mapOf<String, Any?>("ok" to false, "error" to e.message)
         }
