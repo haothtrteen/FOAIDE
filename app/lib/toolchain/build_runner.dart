@@ -160,6 +160,18 @@ class BuildRunner {
         _ui();
         return;
       }
+
+      // Bug 425 根因修复：容器 CA 证书预检+自愈——minbase rootfs 无
+      // ca-certificates 时 pub 对任何 https 源 100% 握手失败（真机
+      // 三连卡 4% 的元凶），apt/内置 bundle 双路自愈
+      final caErr = await ToolchainEnsure().caCerts(env: env);
+      if (caErr != null) {
+        status = BuildStatus.error;
+        lines.add('✗ $caErr');
+        lines.add('  修复后重新打包即可');
+        _ui();
+        return;
+      }
     }
 
     lines.add('▶ flutter build apk --no-shrink --release'
@@ -227,7 +239,11 @@ class BuildRunner {
     // storage 镜像不变：engine artifacts 只有 flutter-io.cn 有代理。
     final flutterCmd =
         bare ? "'${TermuxPaths.flutterHome(env)}/bin/flutter'" : 'flutter';
-    final envPart = bare ? TermuxPaths.envPrefix(env) : '';
+    // proot：SSL_CERT_FILE 显式指向容器 CA bundle（Bug 425 双保险——
+    // dart 优先读此环境变量，即使默认路径探测有偏差也能找到根证书）
+    final envPart = bare
+        ? TermuxPaths.envPrefix(env)
+        : 'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt ';
     final cmd = buildCommand(
       proj: proj,
       flutterCmd: flutterCmd,
@@ -407,9 +423,11 @@ class BuildRunner {
     } else if (l.contains('could not resolve') || l.contains('sslhandshake')) {
       tip = '依赖下载失败：检查镜像源（工具链页 → Gradle 镜像）';
     } else if (l.contains('tls error') || l.contains('failed to update packages')) {
-      tip = 'pub 拉取 TLS 失败：已自动按 pub 镜像轮换重试（官方 io.cn → 清华 → '
-          '中科大）仍全部失败，多为当前网络到镜像站的握手被丢——切换网络'
-          '（WiFi/流量互换）后重试效果最好';
+      tip = 'pub 拉取 TLS 失败：alpha.36 起构建前会自动确保容器根证书'
+          '（此前 minbase rootfs 缺 CA 导致所有 https 源必失败——Bug 425）。'
+          '若本条仍出现：已自动按 pub 镜像轮换重试（官方 io.cn → 清华 → '
+          '中科大），仍全败多为网络到镜像站丢包——切换网络（WiFi/流量互换）'
+          '后重试效果最好';
     } else if (l.contains('waiting for another flutter command')) {
       tip = 'Flutter 启动锁被占用：残留进程未清干净——完全杀掉 App 重开再试'
           '（alpha.30 起构建前会自动清理）';

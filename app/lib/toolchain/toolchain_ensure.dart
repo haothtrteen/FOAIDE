@@ -1,3 +1,8 @@
+import 'dart:io';
+
+import 'package:flutter/services.dart' show rootBundle;
+
+import '../env/models.dart';
 import '../env/proot_bridge.dart';
 
 /// 工具链前置确保（Step 7 修复：容器内 flutter create/build 依赖 git；
@@ -10,6 +15,61 @@ import '../env/proot_bridge.dart';
 /// 克隆改写为国内镜像（gitclone.com），避免直连 github 超时。
 class ToolchainEnsure {
   final ProotBridge _bridge = ProotBridge();
+
+  /// 容器 CA 根证书确保（Bug 425 根因修复，2026-09-18 真机三连卡 4%）。
+  ///
+  /// debian minbase rootfs **不带 ca-certificates**（实测 tar 内
+  /// /etc/ssl 与 CA 相关条目为 0）：dart 的 TLS 证书校验读系统根证书，
+  /// 一个都没有 → pub 对**任何** https 源（io.cn/清华/中科大）100%
+  /// 握手失败（`Got TLS error`），多源轮换、重试全部无效——真机从
+  /// 首次构建起就没成功过 pub get 的真正原因。gradle 不受影响（JDK
+  /// 自带 cacerts），apt 能装包（debian 源走 http）。
+  ///
+  /// 自愈顺序：① 已就位秒过；② apt 在线装（http 源 + JDK 无关）；
+  /// ③ apt 失败 → 把 App 内置 Mozilla bundle（assets/ca/ca-bundle.crt，
+  /// 147 证书 ~220KB）直接写进容器 /etc/ssl/certs/（rootfs 树宿主可见，
+  /// 与 bare 的 gradle 改写同一 IO 路径）。构建命令另带
+  /// SSL_CERT_FILE 环境变量双保险（dart 显式读它）。
+  ///
+  /// [bare]（termux 后端）暂不处理：bionic dart 的证书路径体系不同，
+  /// 该后端未投产。成功返回 null，失败返回错误文案。
+  Future<String?> caCerts({EnvInfo? env, bool bare = false}) async {
+    if (bare) return null;
+    const path = '/etc/ssl/certs/ca-certificates.crt';
+    final probe = await _bridge.exec(
+      'test -s $path && echo CA_OK || echo CA_MISSING',
+      timeoutSec: 30,
+    );
+    if (probe.stdout.contains('CA_OK')) return null;
+
+    // ① apt 在线装（debian 源走 http，不受缺 CA 影响）
+    final install = await _bridge.exec(
+      'DEBIAN_FRONTEND=noninteractive apt-get update -qq '
+      '&& DEBIAN_FRONTEND=noninteractive apt-get install -y -qq '
+      '--no-install-recommends ca-certificates '
+      '&& update-ca-certificates >/dev/null 2>&1; '
+      'test -s $path && echo CA_FIXED || echo CA_STILL_MISSING',
+      timeoutSec: 600,
+    );
+    if (install.stdout.contains('CA_FIXED')) return null;
+
+    // ② App 内置 bundle 直写容器（不经容器网络）
+    try {
+      final rootfs = env?.rootfsPath ?? (await _bridge.envInfo()).rootfsPath;
+      final data = await rootBundle.load('assets/ca/ca-bundle.crt');
+      final f = File('$rootfs/etc/ssl/certs/ca-certificates.crt');
+      await f.parent.create(recursive: true);
+      await f.writeAsBytes(data.buffer.asUint8List(), flush: true);
+      final verify = await _bridge.exec(
+        'test -s $path && echo CA_OK || echo CA_MISSING',
+        timeoutSec: 30,
+      );
+      if (verify.stdout.contains('CA_OK')) return null;
+      return 'CA bundle 写入后仍不可见（$path）';
+    } catch (e) {
+      return '容器缺 CA 证书且自动修复失败（apt 与内置 bundle 均未就位）：$e';
+    }
+  }
 
   /// 确保容器内 git 可用并完成国内镜像配置；成功返回 null，失败返回错误文案。
   Future<String?> git() async {

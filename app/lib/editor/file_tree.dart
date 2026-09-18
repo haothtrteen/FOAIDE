@@ -21,11 +21,19 @@ class FileTree extends StatefulWidget {
   /// 初始浏览目录（alpha.33 项目工作台传入项目根）；缺省 = projects 根。
   final String? initialDir;
 
+  /// 紧凑模式（alpha.36 工作台抽屉/左栏）：隐藏顶部工具行（↑/面包屑/
+  /// 刷新/新建——抽屉里双头部太挤、面包屑截断），锁定 [initialDir]
+  /// 为根（子目录可进，↑ 到项目根为止不越界）；新建/重命名/删除仍走
+  /// 每行 ⋮ 菜单，刷新与新建由宿主经 [reload]/[promptCreateFile]/
+  /// [promptCreateDir] 提供。
+  final bool minimal;
+
   const FileTree({
     super.key,
     required this.bridge,
     required this.onOpenFile,
     this.initialDir,
+    this.minimal = false,
   });
 
   @override
@@ -49,6 +57,12 @@ class FileTreeState extends State<FileTree> {
   /// 加载当前目录。外部（EditorPage 保存/删除后）可调用刷新。
   Future<void> reload() => _load();
 
+  /// 在当前浏览目录新建文件（minimal 模式宿主按钮入口）。
+  Future<void> promptCreateFile() => _createFile(_dir);
+
+  /// 在当前浏览目录新建文件夹（minimal 模式宿主按钮入口）。
+  Future<void> promptCreateDir() => _createDir(_dir);
+
   Future<void> _load() async {
     setState(() {
       _loading = true;
@@ -69,7 +83,13 @@ class FileTreeState extends State<FileTree> {
     });
   }
 
-  bool get _canGoUp => _dir != kProjectsRoot;
+  /// 浏览根：常规模式 = projects 根；minimal 模式锁定 initialDir
+  ///（项目根）——抽屉里不允许浏览到项目外。
+  String get _root =>
+      widget.minimal && _hasInit ? widget.initialDir! : kProjectsRoot;
+  bool get _hasInit => widget.initialDir != null && widget.initialDir!.isNotEmpty;
+
+  bool get _canGoUp => _dir != _root;
 
   void _goUp() {
     if (!_canGoUp) return;
@@ -316,10 +336,30 @@ class FileTreeState extends State<FileTree> {
 
   @override
   Widget build(BuildContext context) {
+    final root = _root;
+    final here = _dir == root ? '项目根' : _dir.substring(root.length + 1);
     return Column(
       children: [
-        _buildPathBar(),
-        const Divider(height: 1),
+        // minimal 模式（工作台抽屉/左栏）：无工具行，宿主提供刷新/新建；
+        // 顶部一行迷你路径防"进了子目录迷路"（⋮ 菜单里也有完整路径）
+        if (widget.minimal)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(here,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          fontSize: 11, color: Colors.grey.shade600)),
+                ),
+              ],
+            ),
+          ),
+        if (!widget.minimal) ...[
+          _buildPathBar(),
+          const Divider(height: 1),
+        ],
         Expanded(child: _buildList()),
       ],
     );

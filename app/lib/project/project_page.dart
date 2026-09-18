@@ -63,6 +63,9 @@ class _ProjectPageState extends State<ProjectPage> {
   /// openFile 就地打开文件，页面不跳转。
   final GlobalKey<EditorPageState> _editorPageKey = GlobalKey();
 
+  /// 文件树句柄（alpha.36）：抽屉标题行的刷新/新建经它操作列表。
+  final GlobalKey<FileTreeState> _treeKey = GlobalKey();
+
   EnvInfo? _env;
   bool _loading = true;
   String _loadError = '';
@@ -329,11 +332,14 @@ class _ProjectPageState extends State<ProjectPage> {
   }
 
   /// 文件树面板（抽屉区块 / 横屏左栏共用）：点文件就地打开进内嵌
-  /// 编辑器，不跳页。
+  /// 编辑器，不跳页。minimal 模式：无工具行、锁定项目根——
+  /// 刷新/新建由上方标题行提供（经 _treeKey）。
   Widget _buildSideTree() {
     return FileTree(
+      key: _treeKey,
       bridge: _fb,
       initialDir: '/root/projects/${widget.projectName}',
+      minimal: true,
       onOpenFile: (path) {
         // 先收抽屉（横屏左栏无 Scaffold drawer，pop 无副作用由
         // maybeOf 判空兜住）——openFile 内的收抽屉逻辑只兜编辑器自身
@@ -343,6 +349,33 @@ class _ProjectPageState extends State<ProjectPage> {
         }
         _openInEmbed(path);
       },
+    );
+  }
+
+  /// 文件树「新建」菜单（新建文件/文件夹，作用于当前浏览目录）。
+  void _showTreeCreateMenu() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.note_add_outlined),
+            title: const Text('新建文件'),
+            onTap: () {
+              Navigator.pop(ctx);
+              _treeKey.currentState?.promptCreateFile();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.create_new_folder_outlined),
+            title: const Text('新建文件夹'),
+            onTap: () {
+              Navigator.pop(ctx);
+              _treeKey.currentState?.promptCreateDir();
+            },
+          ),
+        ]),
+      ),
     );
   }
 
@@ -392,18 +425,35 @@ class _ProjectPageState extends State<ProjectPage> {
               ),
             ),
             const Divider(height: 1),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(26, 10, 12, 6),
-              child: Row(children: [
-                Icon(Icons.folder_outlined,
-                    size: 14, color: Color(0xFF8A939E)),
-                SizedBox(width: 6),
-                Text('文件',
-                    style: TextStyle(
-                        fontSize: 11,
-                        color: Color(0xFF8A939E),
-                        letterSpacing: 2)),
-              ]),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(26, 4, 8, 0),
+              child: Row(
+                children: [
+                  const Icon(Icons.folder_outlined,
+                      size: 14, color: Color(0xFF8A939E)),
+                  const SizedBox(width: 6),
+                  const Text('文件',
+                      style: TextStyle(
+                          fontSize: 11,
+                          color: Color(0xFF8A939E),
+                          letterSpacing: 2)),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: '新建',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.add, size: 16,
+                        color: Color(0xFF8A939E)),
+                    onPressed: _showTreeCreateMenu,
+                  ),
+                  IconButton(
+                    tooltip: '刷新',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.refresh, size: 16,
+                        color: Color(0xFF8A939E)),
+                    onPressed: () => _treeKey.currentState?.reload(),
+                  ),
+                ],
+              ),
             ),
             Expanded(flex: 6, child: _buildSideTree()),
           ],

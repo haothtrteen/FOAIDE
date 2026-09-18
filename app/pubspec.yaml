@@ -1,7 +1,7 @@
 name: flutter_on_android
 description: A Flutter IDE that runs natively on Android devices, with local Flutter SDK and on-device APK building.
 publish_to: 'none'
-version: 0.1.0-alpha.35+35
+version: 0.1.0-alpha.36+36
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -36,3 +36,4 @@ flutter:
   assets:
     - assets/tools/
     - assets/rootfs/
+    - assets/ca/
