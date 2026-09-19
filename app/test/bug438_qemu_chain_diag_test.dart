@@ -107,11 +107,25 @@ void main() {
         reason: '管道会吞掉真实退出码，必须写临时文件再读',
       );
       expect(s.contains(r': > "$tf"'), isTrue, reason: '用临时文件承接输出');
+      // Bug 445：探针改为在 /tmp 沙盒目录里跑（原来直接在真实转发位目录
+      // 里跑 `--help`，产物会覆盖转发脚本本身——诊断把被测对象弄坏了）。
+      // rc 仍必须紧邻真正的命令捕获。
       expect(
-        RegExp(r'"\$tool" --help > "\$tf" 2>&1\s*\n\s*rc=\$\?').hasMatch(s),
+        RegExp(r'\( cd "\$probe_dir" && "\$pt" --help \) > "\$tf" 2>&1'
+                r'\s*\n\s*rc=\$\?')
+            .hasMatch(s),
         isTrue,
         reason: 'rc 必须紧邻真正的命令捕获',
       );
+      // 反向断言：不许退回"直接在转发位目录里跑"的写法
+      expect(
+        RegExp(r'"\$tool" --help > "\$tf" 2>&1').hasMatch(s),
+        isFalse,
+        reason: 'Bug 445：探针必须在 /tmp 沙盒里跑，'
+            '否则 --help 的产物会覆盖真实转发位',
+      );
+      expect(s.contains('probe_dir'), isTrue,
+          reason: 'Bug 445：必须有临时沙盒目录承接产物');
     });
 
     test('LOADER 的 rc 也要紧邻捕获（同样不能放进 if 条件里）', () {

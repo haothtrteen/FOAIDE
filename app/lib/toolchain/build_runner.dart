@@ -426,6 +426,14 @@ exit 0
         //   （对比 Bug 443：那次是无意中被管道吞掉退出码，性质不同。）
         'echo "---- 预取引擎构件（把 build 内部的下载提前）----"; '
         '$flutterCmd precache --android_gen_snapshot 2>&1 | tail -n 5; '
+        // ---------------- Bug 445：跑完 precache 立刻重建转发层 ----------------
+        // 真机 alpha.50 的日志证明：**下载发生在 build 内部的 AOT 之前**，
+        // 我上一版把 precache 放在 reassert 前面**没有拦住它** ——
+        // build 自己又下了一遍（它有自己的完整度判定，precache 的精简集
+        // 满足不了），照样盖掉 linux-arm64/。所以紧接着 precache 再断言一次，
+        // 确保 build 启动时转发层一定是完好的。
+        // （⚠️ 这只是"多一道保险"，真正的根治是 build 之后的 heal + 重启构建；
+        //   见下面 Bug 445 段。别指望这一步能单独解决问题。）
         'sh -c ${_shq(reassert)} 2>&1 | tail -n 10; '
         '$flutterCmd build apk --no-shrink --release '
         '--target-platform=android-arm64$aapt2Override; '
@@ -436,17 +444,54 @@ exit 0
         // 变体：precache 发生在 build 过程中，而不是 pub get 阶段）。
         // 只在失败时跑，成功时不留噪音。
         //
-        // Bug 444：确证被覆盖时**自愈重试一次**。
-        // 此时构件已下载完（第一次 build 内部下载过了），reassert 重建
-        // 转发层后再跑一次**不会再次覆盖**（缓存已就位）→ 第二次应当成功。
-        // 若指纹不含 RAW_ELF（转发层完好），说明崩溃另有原因，重试没有
-        // 意义 —— 不重试，不让用户白等一整轮。
+        // ---------------- Bug 445：构建后重新取指纹（不是复用旧变量！）----
+        // ⚠️ alpha.50 的一处真 bug：这里原写成
+        //     fp=$(sh -c '<diag>' | grep -E "AOT_FP=")
+        //   但 `fp` 在**上面第一处诊断**已经赋值过了，而这里取的是
+        //   **同样的诊断**，只是没走 tail 截断。真机日志里那对
+        //   `AOT_FP=impellerc=wrapper` + `AOT_FP=impellerc=RAW_ELF`
+        //   不是"两个不同时刻的值"，而是**一次执行的输出被印了两遍**
+        //   （diag 只跑了一次，`tail -n 30` 截掉了前半、完整输出在失败段）。
+        //   两个文件的四次出现、以及 `QEMU_CHAIN_*` 行只出现一次，
+        //   都与此吻合。
+        //   后果：我还是不知道"构建后"到底是不是 RAW_ELF。
+        //   **所以必须真的重取一次，而且要把新指纹打进日志做对比。**
+        //   判定放到 heal+重启之后（见下），因为重启后的构建才是最终事实。
         'brc=\$?; if [ "\$brc" != 0 ]; then '
-        'echo "---- 构建后工具链指纹（对比上面的 AOT_FP）----"; '
-        'fp=\$(sh -c ${_shq(diag)} 2>&1 | grep -E "AOT_FP="); '
-        'echo "\$fp" | tail -n 12; '
-        'if echo "\$fp" | grep -q "RAW_ELF"; then '
-        'echo "FOA_HEAL=转发层在构建中被覆盖，重建后重试一次"; '
+        'echo "---- 构建后工具链指纹（重新采集，对比上面的 AOT_FP）----"; '
+        'fp=\$(sh -c ${_shq(diag)} 2>&1 | grep "AOT_FP="); '
+        'echo "\$fp"; '
+        // ---------------- Bug 445：heal + 重启构建 ----------------
+        // 真机实测（alpha.50 日志）：
+        //   FOA_HEAL=转发层在构建中被覆盖，重建后重试一次
+        //   REASSERT=0
+        //   REASSERT_DART=0
+        // **rebuild（重启构建）两步都返回 0，一个文件都没重建** ——
+        // 因为 AOT 失步**没有停掉整个构建**：`Target android_aot_..._failed`
+        // 被 flutter 记录后，构建继续跑到 shader/资产阶段才整体失败，
+        // 而这个过程中 gen_snapshot 已经**产出**了 app.so（Dart AOT 的
+        // 失败是非致命的），把文件恢复成了正常的 x64 ELF 形态。
+        // 于是 reassert 一看"已是正常形态"就跳过 → 覆盖状态被固化 →
+        // 重启构建仍然崩。
+        // 根因：**"看形态判定"的幂等修复，遇上"被覆盖后形态依然合法"
+        //   的情况会静默失效。**
+        // 修法（两件事缺一不可）：
+        //   ① heal：把 linux-arm64/ 下的转发位**无条件**删除并由其
+        //      linux-x64/ 对应文件重新生成（该目录里的东西**本来就该
+        //      全是转发脚本**，不存在"合法的裸 ELF"，所以无条件删是安全的、
+        //      比看形态更可靠）；
+        //   ② 重启构建：让 AOT 用重建后的转发层重跑一遍。
+        // ⚠️ 为什么是"**重启构建**"而不是"重跑 build"：
+        //   flutter 的增量构建会看到 app.so「已存在且比输入新」，直接跳过
+        //   AOT target，转发层修好了也不会重新编译。必须造一个输入变化
+        //   （删掉 app.dill / app.so）把 AOT 逼出来。
+        // ⚠️ 判据只看 **BAD**，不能再 grep "RAW_ELF"（Bug 445）：
+        //   `linux-x64/` 下的真身**本来就该是** RAW_ELF，
+        //   用 RAW_ELF 当"被覆盖"的判据会**恒为真**、白跑一轮自愈。
+        //   现在诊断给每行标了角色与是否合格，只看 BAD 即可。
+        'if echo "\$fp" | grep -q "BAD("; then '
+        'echo "FOA_HEAL=检测到转发位异常（见上面 BAD 行），重建转发层并重启构建"; '
+        '$flutterCmd clean --no-version-check > /dev/null 2>&1; '
         'sh -c ${_shq(reassert)} 2>&1 | tail -n 10; '
         '$flutterCmd build apk --no-shrink --release '
         '--target-platform=android-arm64$aapt2Override; brc=\$?; '

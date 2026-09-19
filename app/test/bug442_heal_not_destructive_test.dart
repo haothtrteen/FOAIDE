@@ -247,7 +247,19 @@ void main() {
           reason: '真身应被搬到 .foa-real 并生成转发脚本');
     });
 
-    test('reassert 幂等：正常态重复执行不改变任何东西', () {
+    test('reassert 幂等：重复执行后最终状态一致（允许重复重建）', () {
+      // ⚠️ Bug 445 修改了这条测试的语义，理由很重要：
+      //
+      // 旧断言是「第二轮 `REASSERT_DART=0` —— 不该被动任何东西」，
+      // 它固化的正是 **Bug 445 的病灶**：reassert 靠"看形态"判断要不要重建
+      // （`head -c 2 == '#!'` 就跳过）。而真机上 AOT 失步后 gen_snapshot
+      // **仍会产出 app.so**，把转发位恢复成**形态合法的 x64 ELF** →
+      // reassert 认为"已是好文件"→ 跳过 → 覆盖状态被固化 → 重启构建照样崩。
+      //
+      // 关键认识：`dart-sdk/bin` 与 `linux-arm64/` 里的转发位**本来就该全是
+      // 转发脚本**，不存在"合法的裸 ELF"。所以现在**无条件重建**，
+      // 幂等性体现在**最终状态**（dart 永远是转发脚本、.foa-real 不重复
+      // 堆积），而不是"第二轮什么都不做"。
       final root = makeToolchain();
       makeWrappedTools(root, 22);
       final d = '${root.path}/bin/cache/dart-sdk/bin';
@@ -255,13 +267,37 @@ void main() {
       final script = fillFor(root, QemuCompat.wrapReassertScript);
 
       runScript(root, script);
-      expect(head4('$d/dart'), before,
-          reason: 'dart 已是转发脚本，不该被动');
+      expect(head4('$d/dart'), before, reason: '重建后仍是转发脚本');
       expect(countReal(d), 22, reason: '不该产生重复的 .foa-real');
 
       final out2 = runScript(root, script);
-      expect(out2, contains('REASSERT_DART=0'),
-          reason: '第二轮应当无事可做');
+      // 允许非 0（无条件重建），但**最终状态必须稳定**
+      expect(out2, contains('REASSERT_DART='),
+          reason: '必须回报处理数量');
+      expect(head4('$d/dart'), '23212f62',
+          reason: '重复执行后 dart 仍必须是转发脚本');
+      expect(countReal(d), 22,
+          reason: '重复执行不得堆积 .foa-real（第二次不能再 mv 一次）');
+    });
+
+    test('Bug 445：即使转发位是「形态合法的裸 ELF」也必须重建', () {
+      // 这是 Bug 445 的精确复现：把转发位换成**形态完全正常的 x64 ELF**
+      // （模拟 AOT 失步后 gen_snapshot 产出 app.so 把转发位恢复的情形），
+      // 旧判据会跳过它 → REASSERT_DART=0 → 覆盖被固化。
+      final root = makeToolchain();
+      makeWrappedTools(root, 22);
+      final d = '${root.path}/bin/cache/dart-sdk/bin';
+      final dart = File('$d/dart');
+      // 覆盖成"合法 x64 ELF 形态"
+      dart.writeAsBytesSync(x64ElfHeader() + List<int>.filled(128, 0));
+      expect(head4('$d/dart'), '7f454c46',
+          reason: '前置条件：此刻它是裸 x64 ELF');
+
+      runScript(root, fillFor(root, QemuCompat.wrapReassertScript));
+
+      expect(head4('$d/dart'), '23212f62',
+          reason: 'Bug 445：必须以转发脚本覆盖它，'
+              '不能因为"形态合法"就跳过（旧判据在此静默失效）');
     });
 
     test('生成的 dart 转发脚本语法合法（dash 与 bash）', () {

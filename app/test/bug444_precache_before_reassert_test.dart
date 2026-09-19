@@ -110,14 +110,34 @@ void main() {
           reason: '必须先接住 build 的退出码');
       expect(cmd, contains(r'fp=$(sh -c '),
           reason: '必须把构建后的 AOT_FP 抓进变量，供后面判断与打印');
-      expect(cmd, contains('grep -E "AOT_FP="'),
+      // Bug 445：这里**必须真的重新执行一次诊断**。
+      // alpha.50 的教训：原本写成复用上面那次 diag 的输出，结果真机日志里
+      // 出现两对 `AOT_FP=xxx=wrapper` + `AOT_FP=xxx=RAW_ELF`——
+      // 那不是"两个时刻"的值，而是**同一次执行被印了两遍**
+      // （第一次走 tail -n 30 被截断、这里是完整输出），
+      // 导致我根本没拿到"构建后"的真实状态。
+      expect(cmd, contains('grep "AOT_FP="'),
           reason: '二次快照只看 AOT_FP，别把整份诊断刷屏');
+      expect(cmd, contains(r'echo "$fp";'),
+          reason: 'Bug 445：重新采集的指纹必须完整打印，'
+              '否则无法与构建前的 AOT_FP 对比');
     });
 
-    test('重试的判据必须是「指纹出现 RAW_ELF」，不能无条件重试', () {
-      expect(cmd, contains('grep -q "RAW_ELF"'),
-          reason: '只在转发层真的被覆盖成裸 x64 时才重试；'
+    test('重试的判据必须是「指纹出现 BAD」，不能无条件重试', () {
+      // ⚠️ Bug 445 纠正了一个**我自己写错的判据**：
+      //   原判据是 `grep -q "RAW_ELF"`，理由是"转发层被覆盖成裸 x64"。
+      //   但 AOT_FP 循环里同时列了**真身**（`linux-x64/`），
+      //   而真身**本来就该是** RAW_ELF —— 这个判据**恒为真**，
+      //   于是每次失败都白跑一轮"清缓存 + 重建 + 重启构建"。
+      //   现在诊断给每行标了角色（SLOT/REAL）与是否合格（ok/BAD），
+      //   判据只看 BAD。
+      expect(cmd, contains(r'grep -q "BAD("'),
+          reason: '只在转发位真的异常时才重试；'
               '否则用户要多等一整轮却毫无收益');
+      // 回归哨兵：不许退回用 RAW_ELF 当判据
+      expect(RegExp(r'grep -q "RAW_ELF"').hasMatch(cmd), isFalse,
+          reason: 'Bug 445：RAW_ELF 在 linux-x64/ 真身上是正常状态，'
+              '拿它当"被覆盖"的判据会恒为真');
     });
 
     test('重试前必须重新 reassert，且 reassert 在第二次 build 之前', () {

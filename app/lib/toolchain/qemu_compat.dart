@@ -218,9 +218,14 @@ put() {
   case "$1" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) return 0 ;; esac
   m=$(dd if="$1" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$m" in 7f454c46*3e) ;; *) return 0 ;; esac
-  if [ -f "$2" ] && head -c 2 "$2" 2>/dev/null | grep -q '#!'; then
-    return 0
-  fi
+  # ---------------- Bug 445：不信任转发位的"形态"，无条件重建 ----------------
+  # 旧写法是 `[ -f "$2" ] && head -c 2 "$2" | grep -q '#!' → 跳过`（幂等）。
+  # 真机 alpha.50 实测：AOT 失步后 gen_snapshot 仍**产出了 app.so**，
+  # 把转发位恢复成**正常的 x64 ELF 形态** → 判据认为"已是好文件" → 跳过
+  # → `REASSERT=0` / `REASSERT_DART=0`，覆盖状态被固化，重启构建照样崩。
+  # 关键认识：**`linux-arm64/` 这个目录里的东西本来就该全是转发脚本**，
+  # 不存在"合法的裸 ELF"。所以这里可以无条件重建，比看形态更可靠。
+  # `gen` 内部是覆盖写（`cat > "$1"`），不需要先删。
   mkdir -p "$(dirname "$2")"
   gen "$2" "$1"
   n=$((n+1))
@@ -280,6 +285,19 @@ echo "REASSERT_DART=$n"
   ///      让 qemu 代劳（会 `__stack_chk_fail`）
   ///
   /// 输出前缀 `QEMU_CHAIN_` 便于在日志里定位。
+  ///
+  /// ⚠️⚠️ **这个脚本必须无副作用**（Bug 445）。
+  /// 它原来直接 `"$tool" --help` 去跑转发脚本 —— 而转发脚本会把 x64 进程的
+  /// 工作目录切到**转发位所在目录**，`--help` 于是把中间产物（如
+  /// `gen_snapshot` 跑 `--help` 后留下的 x64 形态产物）**落在了转发位自己
+  /// 的路径上**，把转发脚本覆盖掉。
+  /// 真机 alpha.50 的日志正是此证：
+  ///   `QEMU_CHAIN_PROBE=impellerc=ok rc=0` 这行是**空的**（`out=EMPTY`），
+  ///   退出码是 **4** —— impellerc 被 `--help` 调用时返回 4 属正常，但它
+  ///   **在转发位留下了 x64 产物**；紧接着 AOT 段 `impellerc failure:` /
+  ///   `gen_snapshot exit -4` 就来了。
+  /// **诊断把被测对象弄坏了，是这次连崩三版的根本原因之一。**
+  /// 现在改成：**只在临时目录里试探**，绝不碰真实转发位。
   static const String buildPreflightScript = r'''
 [ -x @QEMU@ ] || { echo "QEMU_CHAIN_NONE=1"; exit 0; }
 echo "QEMU_CHAIN_VER=$(  @QEMU@ --version 2>&1 | head -1 )"
@@ -304,12 +322,23 @@ for tool in @ENGINE@/linux-arm64/impellerc @ENGINE@/android-arm64-release/linux-
   # rc 必须在命令紧邻处捕获。注意：`out=$(cmd | head -2)` 之后 $? 是
   # **head** 的退出码，不是 cmd 的——管道会吞掉真实状态。所以先写临时
   # 文件再读，才能拿到被调程序的真实信号退出码。
+  #
+  # ⚠️ Bug 445：**不许在真实转发位所在目录里跑转发脚本**。
+  # 转发脚本内 `dirname "$0"` 拿到的是转发位目录，x64 进程的工作目录
+  # 与它的 argv[0] 都指向那里，`--help` 留下的中间产物会覆盖转发脚本。
+  # 所以在 /tmp 建一个只含**软链**的沙盒目录再跑：脚本被调用时 $0 是
+  # 软链路径，dirname 得到 /tmp 下的临时目录，产物落在 /tmp，真实
+  # 转发位毫发无损。（软链接仍能被 `[ -x ]` 与 `#!/bin/sh` 正常执行。）
+  probe_dir=/tmp/.foa_probe_$$
+  rm -rf "$probe_dir"; mkdir -p "$probe_dir"
+  ln -sf "$tool" "$probe_dir/$(basename "$tool")" 2>/dev/null
+  pt="$probe_dir/$(basename "$tool")"
   tf=/tmp/.foa_probe_out
   : > "$tf"
-  "$tool" --help > "$tf" 2>&1
+  ( cd "$probe_dir" && "$pt" --help ) > "$tf" 2>&1
   rc=$?
   out=$(head -2 "$tf" 2>/dev/null)
-  rm -f "$tf"
+  rm -f "$tf"; rm -rf "$probe_dir"
   if [ -n "$out" ]; then
     echo "QEMU_CHAIN_PROBE=$(basename "$tool")=ok rc=$rc"
   else
@@ -326,12 +355,18 @@ for tool in @ENGINE@/linux-arm64/impellerc @ENGINE@/android-arm64-release/linux-
   fi
   # Bug 439 关键对照：直接用 -L / 让 qemu 自己找 ld.so（旧转发脚本的形式）。
   # 若这一路崩、而上一路正常，就精确命中 Bug 439 —— 转发脚本需要重新生成。
+  #
+  # ⚠️ Bug 445：同样要在临时目录里跑（`$src` 是真实 x64 二进制，
+  # `--help` 也可能在当前目录落产物）。这里 `$src` 是**真身路径**、
+  # 不在转发位目录，但 cd 到临时目录更保险，代价为零。
   if [ -x "$src" ] && [ -x "$ld" ]; then
     : > "$tf"
-    @QEMU@ -L / "$src" --help > "$tf" 2>&1
+    tmpd=/tmp/.foa_old_$$
+    rm -rf "$tmpd"; mkdir -p "$tmpd"
+    ( cd "$tmpd" && @QEMU@ -L / "$src" --help ) > "$tf" 2>&1
     arc=$?
     aout=$(head -2 "$tf" 2>/dev/null)
-    rm -f "$tf"
+    rm -f "$tf"; rm -rf "$tmpd"
     if [ -z "$aout" ]; then
       echo "QEMU_CHAIN_OLDSTYLE=$(basename "$src")=FAIL rc=$arc（旧 -L / 形式崩，需重建转发脚本）"
     else
@@ -353,6 +388,21 @@ done
 #
 # 判据用「文件头」而不是「文件存在」：转发脚本是 `#!`，
 # 真 x64 二进制是 `7f454c46`，被 pub get 覆盖后会变回后者。
+# ⚠️⚠️ Bug 445：这个循环里同时有**转发位**和**真身**，两者的期望值**相反**！
+#   - 转发位（`linux-arm64/`、`android-*/linux-arm64/`、`dart-sdk/bin/dart`）：
+#     期望 `#!`（wrapper）。是 `7f454c46` = **被覆盖了，故障**。
+#   - 真身（`linux-x64/`）：期望 `7f454c46`。是 `#!` 才奇怪。
+# 我上一版把两者写成一个文案
+#   `=RAW_ELF（真 x64 二进制，未经转发 → 必 SIGILL）`
+# 是**错的**：真身本来就该是 RAW_ELF，完全正常。而构建命令里那条
+# `grep -q "RAW_ELF"` 重试判据因此**在正常情况下也恒为真**，
+# 白白触发一次"清缓存 + 重建 + 重启构建"。
+# 真机 alpha.50 日志里那对 `wrapper`/`RAW_ELF` 也不是两个时刻的值 ——
+# 是**同一次执行的 6 行输出被 `tail -n 30` 从中间截成两段**
+# （前半落在"构建前"、后半落在"构建后"，且有 3 行重叠）。
+# 现在改成**带角色标签**输出，一眼能看出哪行异常：
+#   SLOT  = 转发位，期望 wrapper
+#   REAL  = 真身，  期望 raw
 for u in \
   @ENGINE@/linux-arm64/impellerc \
   @ENGINE@/linux-x64/impellerc \
@@ -362,11 +412,21 @@ for u in \
   @FLUTTER@/bin/cache/dart-sdk/bin/dart ; do
   [ -e "$u" ] || { echo "AOT_FP=$(basename "$u")=missing"; continue; }
   h=$(dd if="$u" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
-  case "$h" in
-    2321*)    echo "AOT_FP=$(basename "$u")=wrapper" ;;
-    7f454c46) echo "AOT_FP=$(basename "$u")=RAW_ELF（真 x64 二进制，未经转发 → 必 SIGILL）" ;;
-    *)        echo "AOT_FP=$(basename "$u")=other:$h" ;;
+  # 判定角色：路径含 linux-x64（且不是 dart）→ 真身
+  case "$u" in
+    */linux-x64/*) role=REAL; want=raw ;;
+    *)             role=SLOT; want=wrapper ;;
   esac
+  case "$h" in
+    2321*)    got=wrapper ;;
+    7f454c46) got=raw ;;
+    *)        got="other:$h" ;;
+  esac
+  if [ "$got" = "$want" ]; then
+    echo "AOT_FP=$(basename "$u")=$got ok($role)"
+  else
+    echo "AOT_FP=$(basename "$u")=$got BAD($role,期望 $want → 必 SIGILL)"
+  fi
 done
 echo "QEMU_CHAIN_DONE=1"
 ''';
