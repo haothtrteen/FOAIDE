@@ -428,6 +428,55 @@ for u in \
     echo "AOT_FP=$(basename "$u")=$got BAD($role,期望 $want → 必 SIGILL)"
   fi
 done
+# ---------------- Bug 446：真实 AOT 负载探针 ----------------
+# 为什么必须加（alpha.51 真机日志的结论）：
+#   构建前后 AOT_FP 全部 `ok`、`REASSERT=10` 也确实重建了 —— 转发层
+#   **从头到尾都是完好的**，可 AOT 还是 SIGILL。说明问题**不在转发层**，
+#   前面几版的方向错了。
+#   真正没被覆盖的盲区是：**所有诊断都只测 `--help`**。
+#   `--help` 打印完就退出，而 `--snapshot_kind=app-aot-elf` 要分配大内存、
+#   跑长时间编译、执行向量指令（反汇编实测 gen_snapshot 里有大量
+#   `vpshufb`/`vpxor`/`vpaddd` 等 VEX 指令，正是编译启动阶段的哈希计算）。
+#   **"能启动" ≠ "能编译"** —— 这才是三层诊断一直报绿灯、AOT 照样崩的原因。
+#
+# 做法：在 build 目录里找上一次 KernelSnapshot 产出的 app.dill，
+#   用转发位上的 gen_snapshot 跑一次**真实 AOT**，把真实退出码打进日志。
+#   退出码语义：
+#     0        = AOT 负载完全跑通
+#     128+n    = 被信号杀死（n=4 → SIGILL，就是真机那个 exit -4）
+#     其它非 0 = 程序自身报错（如 dill 缺 TFA），说明**执行环境是好的**
+#   ⚠️ 这里**不能**只看"有没有输出"——真实 AOT 失败时也可能有 stderr。
+#      判定必须用**退出码**，且紧邻捕获（管道会吞掉，见 Bug 443）。
+for bd in @PROJ@/build @PROJ@/build/app /root/projects/*/build /root/build; do
+  [ -d "$bd" ] || continue
+  # app.dill 可能在 build/ 或 build/app/intermediates/... 下
+  dill=$(ls "$bd"/app.dill "$bd"/[a-z]*/app.dill 2>/dev/null | head -1)
+  [ -n "$dill" ] || continue
+  [ -f "$dill" ] || continue
+  gsw=@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot
+  [ -x "$gsw" ] || { echo "AOT_LOAD=skip(gen_snapshot 转发位不在)"; continue; }
+  echo "AOT_LOAD=begin dill=$dill size=$(wc -c < "$dill" 2>/dev/null)"
+  # 在临时目录里跑，产物不污染项目目录（Bug 445 教训：诊断不许有副作用）
+  ld_dir=/tmp/.foa_aotload_$$
+  rm -rf "$ld_dir"; mkdir -p "$ld_dir"
+  ( cd "$ld_dir" && "$gsw" --deterministic --snapshot_kind=app-aot-elf \
+      --elf="$ld_dir/probe.so" "$dill" ) > "$ld_dir/out" 2>&1
+  lrc=$?                              # 紧邻捕获，不许过管道
+  echo "AOT_LOAD=rc=$lrc"
+  case "$lrc" in
+    0)      echo "AOT_LOAD=ok（真实 AOT 负载跑通）" ;;
+    132)    echo "AOT_LOAD=SIGILL（qemu 在编译负载下崩 —— 真机那个 exit -4 就是这个）" ;;
+    139)    echo "AOT_LOAD=SIGSEGV" ;;
+    134)    echo "AOT_LOAD=SIGABRT" ;;
+    *)      echo "AOT_LOAD=rc$lrc（非信号退出=程序自身报错，执行环境是好的）" ;;
+  esac
+  echo "AOT_LOAD_OUT=$(head -3 "$ld_dir/out" 2>/dev/null | tr '\n' '~')"
+  ls -la "$ld_dir/probe.so" 2>/dev/null | awk '{print "AOT_LOAD_SO=size="$5}'
+  rm -rf "$ld_dir"
+  break
+done
+# 若还没进到 build 阶段（首次构建、build 目录为空），说明一下而不是静默跳过
+[ -n "$dill" ] || echo "AOT_LOAD=skip(尚无 app.dill，属首次构建)"
 echo "QEMU_CHAIN_DONE=1"
 ''';
 
@@ -695,13 +744,15 @@ echo UNINSTALL_OK
   ///
   /// ⚠️ `@REAL@` **不在**这里替换：它是 `gen()` 内部按每个文件写入的
   /// 真身路径（由 `gen()` 里的 `sed` 完成），不是全局常量。
-  static String fill(String script, {String sdk = sdkHome}) => script
-      .replaceAll('__FOA_GEN__', _wrapGenFunc.trim())
-      .replaceAll('@QEMU@', qemuBin)
-      .replaceAll('@LOADER@', x64Loader)
-      .replaceAll('@ENGINE@', engineDir)
-      .replaceAll('@FLUTTER@', flutterHome)
-      .replaceAll('@SDK@', sdk);
+  static String fill(String script, {String sdk = sdkHome, String proj = ''}) =>
+      script
+          .replaceAll('__FOA_GEN__', _wrapGenFunc.trim())
+          .replaceAll('@QEMU@', qemuBin)
+          .replaceAll('@LOADER@', x64Loader)
+          .replaceAll('@ENGINE@', engineDir)
+          .replaceAll('@FLUTTER@', flutterHome)
+          .replaceAll('@PROJ@', proj)
+          .replaceAll('@SDK@', sdk);
 
   // ---------------- 验证 ----------------
 

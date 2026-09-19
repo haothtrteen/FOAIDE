@@ -361,7 +361,7 @@ exit 0
     // （flutter 打印 `impellerc failure: ` 后面什么都没有），说明进程被
     // 信号杀死、来不及输出。这种静默崩溃无法从 flutter 的日志反推原因，
     // 必须在构建前**主动**测一遍 qemu 链路并记录结果。
-    final diag = QemuCompat.fill(QemuCompat.buildPreflightScript);
+    final diag = QemuCompat.fill(QemuCompat.buildPreflightScript, proj: proj);
     // Bug 441：自愈——把被误包装的文件（如 flutter_tools.snapshot）还原。
     // 放在 reassert 之前：先修好坏文件，再重建转发层，顺序反了会把
     // 刚还原的文件又包一遍。幂等且低代价（只 mv，不动 apt/不删引擎目录），
