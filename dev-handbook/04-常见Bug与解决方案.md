@@ -2914,6 +2914,219 @@ AOT 阶段的 SIGILL（有 impellerc / snapshot generator 上下文）→ Bug 42
 
 ---
 
+### Bug 443：诊断段全绿、AOT 段照样 SIGILL——`smoke()` 的退出码被管道吞了（死代码）+ 诊断行数上限过紧
+
+**症状**（真机 alpha.49，用户截图）：
+
+构建进度一路走到 **57%**，然后：
+
+```
+AOT 编译 (gen_snapshot)                                       57%
+Dart snapshot generator failed with exit code -4
+impellerc failure:
+impellerc failure:
+Target android_aot_release_android-arm64 failed
+```
+
+但**同一份日志的诊断段里**：
+
+```
+impellerc=ok rc=0
+DART=ok（转发脚本在位）
+SNAPSHOT=ok
+HEALED=0
+```
+
+—— 诊断说"全部正常"，编译却照样 SIGILL（`exit -4` = 128+(-132) = SIGILL）。
+而且用户还反馈：**日志里根本没有 `REASSERT=` 这一行**。
+
+一句话概括这个 Bug 的恶心之处：**探针报了绿灯，路却是断的。**
+
+**原因**：三个问题叠在一起，其中前两个是**纯粹的自我欺骗**，第三个真因**至今未定**。
+
+---
+
+**① `smoke()` 的退出码被管道吞掉了 —— 这段代码从写下那天起就没生效过**
+
+Bug 437 引入的 `smoke()` 长这样：
+
+```sh
+o=$( "$t" --help 2>&1 | head -5 )     # ← 管道
+r=$?                                  # ← 这是 **head** 的退出码，不是工具的！
+...
+if [ "$r" -ge 128 ] 2>/dev/null; then    # ← 恒为假，死代码
+  echo "$n=no"
+  echo "  $n: 信号退出 rc=$r（128+n，n=4 即 SIGILL）"
+  return
+fi
+echo "$n=yes"
+```
+
+在 `sh` 里 **`$(cmd | head -5)` 的 `$?` 是管道最后一个命令（也就是 `head`）的退出码。**
+`head` 永远成功退出，所以 `r` 恒为 **0**，`[ "$r" -ge 128 ]` **永远不成立**。
+
+后果：**一个被 SIGILL 杀死、输出为空的工具，会被 `smoke()` 判成 `yes`。**
+这就是"诊断段 impellerc=ok rc=0，编译段 impellerc 崩"的直接来源 ——
+探针不是没跑，是**跑了但看错了结果**。
+
+沙箱最小复现（`bug443_smoke_exitcode_test.dart`）：
+
+| 取退出码的方式 | 结果 |
+|---|---|
+| 直接 `` `"$t" --help` `` | `direct=132` ✅ 拿到 SIGILL |
+| `` `o=$( "$t" --help 2>&1 \| head -5 )` `` 后取 | `piped_head=0` ❌ 被吞 |
+| 落盘重定向 `"$t" --help > "$st" 2>&1` 后取 | `rc=132` ✅ 拿到 SIGILL |
+
+**这一点在 Bug 438 修 `QEMU_CHAIN_PROBE` 时已经踩过一次（当时改成"先落盘再读"），
+但当时只修了那一个点，没有全仓扫同类写法。** 这次是同一个错误在 `smoke()` 里复发。
+
+---
+
+**② `tail -n` 行数上限过紧 —— 解释了"日志里没有 `REASSERT=`"**
+
+`build_runner.dart` 里三段诊断各自截尾：
+
+| 段 | 原来 | 问题 |
+|---|---|---|
+| diag | `tail -n 12` | 诊断输出远超 12 行 |
+| heal | `tail -n 3` | `HEALED=` 前面还有 `DART=` / `SNAPSHOT=` |
+| reassert | `tail -n 2` | **只留最后 2 行**，混进 stderr 时 `REASSERT=` 直接被挤掉 |
+
+`tail` 截的是**尾部**，而 `REASSERT=` 在 reassert 段里不是最后一行。
+一旦 `gen()` 或 `sh` 自己往 stderr 吐哪怕两行，关键结论就没了。
+用户看到的就是"没有 `REASSERT=` 这行" —— 不是脚本没跑，是**被 tail 吃掉了**。
+
+已放宽到 `30 / 10 / 10`。
+
+---
+
+**③ 真因：诊断时刻 vs 编译时刻，工具链状态可能不一致（未定）**
+
+日志里有一行关键提示：
+
+```
+Flutter assets will be downloaded from https://storage.flutter-io.cn
+```
+
+这说明 **`flutter build` 内部又会下载一次引擎构件**。
+如果下载发生在诊断之后、AOT 之前，就会把转发脚本覆盖成裸 x64 ELF（**Bug 428 的变体**，
+只是覆盖点从 `pub get` 挪到了 `build` 内部）。三种可能目前无法区分：
+
+1. 转发脚本压根没重建（`reassert` 没跑 / 没覆盖到）；
+2. 转发脚本重建了，但被 `build` 内部的下载覆盖回裸 ELF；
+3. 转发脚本在位，但 qemu 跑 `gen_snapshot` 本身就失败（Bug 438 类）。
+
+**在证据不足时我不再猜** —— 猜错就是下一个回归（Bug 441/442 都是这么来的）。
+改成加**可观测性**，让下一份真机日志自己把答案说出来。
+
+**解决**：
+
+1. **`smoke()` 改成落盘重定向 + 紧邻取退出码**（`qemu_compat.dart`）：
+
+```sh
+st=/tmp/.foa_smoke_out
+: > "$st"
+"$t" --help > "$st" 2>&1
+r=$?                                  # 紧邻调用，拿到真实退出码
+o=$(head -5 "$st" 2>/dev/null)
+rm -f "$st"
+```
+
+同时**前置两道硬判据**（不等执行就先筛掉明显的坏状态）：
+
+```sh
+[ -x "$t" ] || { echo "$n=no"; ...; return; }        # 不可执行直接判死
+head -c 2 "$t" | grep -q '#!' || { echo "$n=no";     # 不是转发脚本直接判死
+  echo "  $n: 不是转发脚本（真 x64 二进制，arm64 上必 SIGILL）"; return; }
+```
+
+2. **`tail -n` 放宽**：diag `12→30`、heal `3→10`、reassert `2→10`。
+
+3. **新增 `AOT_FP=` 工具链指纹**（`buildPreflightScript`）——
+   对 6 个 AOT 关键工具**判文件头**而不是判文件存在：
+
+```sh
+for u in \
+  @ENGINE@/linux-arm64/impellerc \
+  @ENGINE@/linux-x64/impellerc \
+  @ENGINE@/android-arm64-release/linux-arm64/gen_snapshot \
+  @ENGINE@/android-arm64-release/linux-x64/gen_snapshot \
+  @ENGINE@/linux-arm64/font-subset \
+  @FLUTTER@/bin/cache/dart-sdk/bin/dart ; do
+  h=$(dd if="$u" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  case "$h" in
+    2321*)    echo "AOT_FP=$(basename "$u")=wrapper" ;;
+    7f454c46) echo "AOT_FP=$(basename "$u")=RAW_ELF（真 x64 二进制，未经转发 → 必 SIGILL）" ;;
+  esac
+done
+```
+
+   **为什么用文件头而不是"-x 存在"**：转发脚本是 `#!`（`2321`），真 x64 二进制是
+   `7f454c46`。文件存在与否在两种状态下都为真，只有**文件头**能区分。
+
+4. **构建失败时二次快照**（`build_runner.dart`）—— 用同一份指纹在**崩完之后**再打一遍：
+
+```sh
+brc=$?; if [ "$brc" != 0 ]; then
+  echo "---- 构建后工具链指纹（对比上面的 AOT_FP）----"
+  sh -c '<diag>' 2>&1 | grep -E "AOT_FP|QEMU_CHAIN_PROBE" | tail -n 12
+fi; exit $brc
+```
+
+   两份指纹一对比，上面三种可能立即区分：
+   - 构建前 `RAW_ELF` → 可能是 ①（reassert 没覆盖到）；
+   - 构建前 `wrapper`、构建后 `RAW_ELF` → 确证 ②（build 内部下载覆盖）；
+   - 前后都 `wrapper` → 是 ③（转发层没问题，问题在 qemu 本身）。
+
+5. **新增 `bug443_smoke_exitcode_test.dart`（8 项）**，其中一条**结构性反证**会全仓扫
+   `$(... | head ...)` 后紧跟取退出码的写法，防止同类再次复发：
+
+```dart
+RegExp(r'\$\([^\n]*\|[^\n]*head[^\n]*\)\s*\n\s*\w=\$\?')
+```
+
+**验证**：
+
+| 验证项 | 结果 |
+|---|---|
+| 管道吞退出码最小复现 | `direct=132` / `piped_head=0` / 落盘后 `rc=132` ✅ |
+| `smoke()` 已改为落盘取码 | 断言脚本文本含 `> "$st" 2>&1` 且 `r=$?` 紧邻 ✅ |
+| 全仓同类写法反证 | 无 `$(...\|head...)` 紧跟取退出码 ✅ |
+| 三段 `tail -n` 下限 | diag ≥ 30 / heal ≥ 10 / reassert ≥ 10 ✅ |
+| `AOT_FP` 覆盖 6 个 AOT 工具 | 含 `linux-x64` 与 `linux-arm64` 双路径 ✅ |
+| `AOT_FP` 用文件头判据 | 区分 `2321*` 与 `7f454c46` ✅ |
+| `flutter analyze lib/` | `No issues found!` ✅ |
+| `flutter test` | **227 项全绿** ✅ |
+
+**出现版本**：v0.1.0-alpha.49（构建时暴露；代码缺陷自 alpha.47 / Bug 437 起就存在）
+**修复版本**：commit `cedb91e`（v0.1.0-alpha.50）
+
+**教训**：
+
+- **`cmd | head` 之后取 `$?` 拿到的不是 `cmd` 的退出码。** 这是 shell 基础，
+  但因为它**静默地**把"失败"变成"成功"，写的时候毫无痛感。
+  **凡是"取退出码"，前面不许有管道。** 想截断就先落盘再读。
+- **修了一个点，要立刻全仓扫同类。** Bug 438 修 `QEMU_CHAIN_PROBE` 时已经踩过这个坑，
+  当时只改了那一处，`smoke()` 里的同一写法原封不动留到了 alpha.49。
+  **"修过了"不等于"没有了"。**
+- **探针报绿灯 ≠ 路是通的。** 一个"永远返回成功"的探针比没有探针更危险 ——
+  它会让你排除掉真正的嫌疑方向。这次它让我在 alpha.49 之后一度怀疑
+  "转发层是不是在 build 内部被覆盖了"，而实际`smoke()` 根本没在测它以为在测的东西。
+- **`tail -n N` 截的是尾部，不是头部。** 把诊断结论放在段首、再用 `tail -n 2`，
+  等于**主动把结论扔掉**。诊断输出的行数上限要按"最坏情况 + stderr"来留，
+  宁可多打十行给用户，也不要少打一行给自己。
+- **证据不足时加可观测性，不要加猜测。** Bug 441/442 都是我在证据不足时推断根因、
+  然后引入新回归。这次面对 AOT 崩溃的三种可能，我选择**不改逻辑**，
+  只加 `AOT_FP` 指纹 + 失败后二次快照，让下一份真机日志自己给出答案。
+  **推断可以大胆，但改动必须建立在已观测的事实上。**
+- **注释里的字样会被 `contains` / `indexOf` 命中。** Bug 443 的注释里写了
+  "pub get"，把 Bug 438 的`'预检必须在 pub get 之前'`测试打挂了
+  （注释在第 3023 字符，真正的命令在第 7500）。
+  **断言"某事发生/不发生"时，必须匹配命令形态（如 `flutter pub get;`），
+  不能匹配裸字样。**
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
