@@ -3127,6 +3127,169 @@ RegExp(r'\$\([^\n]*\|[^\n]*head[^\n]*\)\s*\n\s*\w=\$\?')
 
 ---
 
+### Bug 444：AOT 用的 `gen_snapshot` 是 `linux-arm64/` 下那份（内容是 x86_64）——build 内部补下载会盖掉转发层
+
+**症状**：与 Bug 443 同一张截图（alpha.49，进度 57%）：
+
+```
+AOT 编译 (gen_snapshot)                                       57%
+Dart snapshot generator failed with exit code -4
+impellerc failure:
+impellerc failure:
+Target android_aot_release_android-arm64 failed
+```
+
+诊断段却全绿（`impellerc=ok rc=0` / `DART=ok` / `SNAPSHOT=ok` / `HEALED=0`）。
+**关键背景**：用户**卸载重装**过一次，在此之前同样的包是能构建成功的。
+
+**原因**：真机上 AOT 真正执行的那个文件，和我一直盯着的那两个**不是默认的那一个**。
+
+---
+
+**① 真机 AOT 走的是 `linux-arm64/`，不是 `linux-x64/`**
+
+`flutter_tools` 的 `artifacts.dart` `_getAndroidArtifactPath()`：
+
+```dart
+case Artifact.genSnapshot:
+  HostPlatform hostPlatform = getCurrentHostPlatform();
+  if (hostPlatform == HostPlatform.darwin_arm64) {
+    hostPlatform = HostPlatform.darwin_x64;   // 只有 macOS 做了回退！
+  }
+  final String hostPlatformName = hostPlatform.cliName;
+  return path.join(engineDir, hostPlatformName, artifact.getFileName(_platform));
+```
+
+而 `getCurrentHostPlatform()`（build_info.dart:857）在 Linux 上直接返回
+`globals.os.hostPlatform`，也就是由 **`uname -m`** 决定。
+
+真机 Android 是 arm64 → `uname -m` = `aarch64` → hostPlatformName = **`linux-arm64`**
+→ AOT 执行的路径是：
+
+```
+bin/cache/artifacts/engine/android-arm64-release/linux-arm64/gen_snapshot
+```
+
+**注意那段 TODO**：`// TODO(cbracken): Build Android gen_snapshot as Arm64
+binary to run natively on Apple Silicon`（flutter/flutter#152281）。
+**官方至今没有 arm64 版的 android gen_snapshot** —— 意思是
+`linux-arm64/` 目录下放的那份，**文件内容就是 x86_64 ELF**。
+它能不能跑，完全取决于有没有转发脚本罩着。
+
+**沙箱目录结构双向证实了这一点**（本机实测）：
+
+| 路径 | 大小 | 内容 |
+|---|---|---|
+| `android-arm64-release/linux-x64/gen_snapshot` | 6,154,880 B | `7f454c46 … 3e00` 真 x86_64 ELF（**真身**） |
+| `android-arm64-release/linux-arm64/gen_snapshot` | 330 B | `#!/bin/sh` 转发脚本，`exec qemu-x86_64-static … linux-x64/gen_snapshot "$@"` |
+| `linux-arm64/impellerc` | 305 B | 转发脚本，指向 `linux-x64/impellerc` |
+
+**② 覆盖发生在 build 内部、在 reassert 之后**
+
+`flutter build` 在 AOT 之前会检查引擎构件是否就位、缺失则补下载。
+一下载就把 `linux-arm64/{gen_snapshot,impellerc,font-subset}` 覆写成
+**裸 x86_64 ELF**，直接盖掉 reassert 刚放好的转发脚本 → SIGILL。
+
+触发条件 = **构件缓存缺失**：卸载重装 / 清数据 / 首次构建。
+这正好解释了"之前能构建、卸载重装后必崩"—— 用户是卸载重装后才翻车的。
+
+> ⚠️ **排障时的一个陷阱**：日志里的
+> `Flutter assets will be downloaded from https://storage.flutter-io.cn`
+> 是**常驻提示**，构件已缓存时也会打印（沙箱本次构建打了这行但并未下载）。
+> **不能用它判断下载是否真的发生** —— 我一开始把它当铁证，是不严谨的。
+
+**解决**：三层，前两层是修复，第三层是兜底。
+
+1. **把下载提前到 reassert 之前**（`build_runner.dart`）：
+
+```sh
+echo "---- 预取引擎构件（把 build 内部的下载提前）----";
+flutter precache --android_gen_snapshot 2>&1 | tail -n 5;
+sh -c '<reassert>' 2>&1 | tail -n 10;
+flutter build apk --no-shrink --release --target-platform=android-arm64
+```
+
+   顺序改成 **precache → reassert → build**：先让下载把 `linux-arm64/` 覆盖完，
+   reassert 再重建转发层；此时构件已缓存，build 内部不会再下载 → 不会再覆盖。
+   `--android_gen_snapshot` 精确覆盖 AOT 那两个工具，universal
+   （`impellerc`/`font-subset`）默认 `true` 会一并带上。
+
+   ⚠️ 这里的 `| tail -n 5` 是**故意**吞掉退出码做容错：precache 只是把下载
+   提前，失败不该中断构建（后面还有兜底）。**性质与 Bug 443 那次完全不同**
+   ——那次是无意中被管道吞掉退出码、把失败判成成功。测试里专门有一条
+   断言：precache 后面**不许**紧跟取退出码。
+
+2. **失败后指纹确证才自愈重试**（只在真的被覆盖时才重试）：
+
+```sh
+brc=$?; if [ "$brc" != 0 ]; then
+  echo "---- 构建后工具链指纹（对比上面的 AOT_FP）----";
+  fp=$(sh -c '<diag>' 2>&1 | grep -E "AOT_FP=");
+  echo "$fp" | tail -n 12;
+  if echo "$fp" | grep -q "RAW_ELF"; then
+    echo "FOA_HEAL=转发层在构建中被覆盖，重建后重试一次";
+    sh -c '<reassert>' 2>&1 | tail -n 10;
+    flutter build apk --no-shrink --release --target-platform=android-arm64; brc=$?;
+  fi; fi; exit $brc
+```
+
+   为什么值得重试：第一次 build 已经把构件下载完了，reassert 重建后再跑
+   **不会再次覆盖**（缓存已就位）→ 第二次应当成功。
+   为什么用 `RAW_ELF` 当判据：若指纹不含 `RAW_ELF`（转发层完好），说明崩溃
+   另有原因，重试没有意义 —— **不重试，不让用户白等一整轮**。
+   为什么重试**不跑 pub get**：Bug 433 教训，pub get 会盖掉刚重建的转发层。
+
+3. **AOT_FP 指纹**（Bug 443 加的）现在覆盖到了真机真正执行的路径：
+   `android-arm64-release/linux-arm64/gen_snapshot`（真机）+ `…/linux-x64/…`（真身）
+   + `linux-arm64/impellerc` + `linux-arm64/font-subset` + `dart-sdk/bin/dart`。
+
+**验证**：
+
+| 验证项 | 结果 |
+|---|---|
+| flutter_tools 源码：host 由 `uname -m` 定 | `_getAndroidArtifactPath` + `getCurrentHostPlatform` 确认 ✅ |
+| 沙箱引擎目录结构对照 | 真身 6,154,880 B x64 ELF / 转发位 330 B 脚本 ✅ |
+| `precache --android_gen_snapshot` 存在 | precache.dart 选项表确认 ✅ |
+| 构建命令顺序 precache→reassert→build | 位置断言（去注释后）✅ |
+| precache 容错且不造死代码 | 断言其后不紧跟取退出码 ✅ |
+| 重试判据为 `RAW_ELF`、只重试一次 | `flutter build apk` 出现 2 次 ✅ |
+| 重试段不含可执行 `pub get` | 去注释后断言 ✅ |
+| AOT_FP 含 `android-arm64-release/linux-arm64/gen_snapshot` | ✅ |
+| `flutter analyze lib/ test/` | `No issues found!` ✅ |
+| `flutter test` | **243 项全绿**（新增 16 项）✅ |
+
+**出现版本**：v0.1.0-alpha.49（卸载重装后暴露）
+**修复版本**：v0.1.0-alpha.50
+
+**教训**：
+
+- **别只盯着"看起来对"的那条路径。** 我一直以为 AOT 用的是
+  `android-arm64-release/linux-x64/gen_snapshot`（真身所在），
+  实际真机走的是 `linux-arm64/`（host 由 `uname -m` 决定）。
+  **路径里带 `x64` 不代表它就是被执行的那个，反过来也一样。**
+  这类问题只能靠读上游源码 + 看真实目录结构解决，靠猜会一直错。
+- **`uname -m` 这种"环境事实"要显式确认。** 沙箱是 x86_64、真机是 aarch64，
+  同一份代码在两端的 host platform 解析结果**不一样**。
+  沙箱里跑通的链路，不等于真机上跑的是同一条。
+  （这也是 Bug 428/429/433/443 连续四次"沙箱看不出问题"的同一个根。）
+- **"之前能用、重装后不行"= 缓存/持久化状态相关的强信号。**
+  但凡复现条件里出现"卸载重装""清数据""首次"，先去查**什么东西被重建了**，
+  而不是查代码逻辑。
+- **别把常驻提示当证据。** `Flutter assets will be downloaded from …`
+  每次都打，构件已缓存时也打。我一度拿它当"发生了下载"的铁证，
+  这是把"日志里出现了"误当成"事件发生了"。
+  **引用日志行之前，先确认这行是"事件"还是"状态"。**
+- **`contains` 命中注释——第三次了。** Bug 442（注释里的 "pub get"）、
+  Bug 443（注释里的 "pub get"）、这次又是（diag/heal 脚本注释里
+  "被 pub get 覆盖后会变回后者"、"pub get 调 dart = arm64 上直接执行 x64 ELF"）。
+  **断言"不得执行 X"时，必须先剥掉 `#` 注释行。** 已经栽三次，
+  从现在起这类断言一律走 `stripComments`。
+- **锚点断言要配"回归哨兵"。** 用 `indexOf` 拿位置再做大小比较时，
+  一旦锚点找不到（返回 -1），`greaterThan(-1)` **恒真**，断言会悄悄失效。
+  加一条"锚点必须存在"的显式断言，防止测试自己退化成摆设。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
