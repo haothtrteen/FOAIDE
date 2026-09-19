@@ -24,21 +24,33 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   group('Bug 439 · 转发脚本必须显式加载 ld.so', () {
     test('生成出的转发脚本含「显式 ld.so」分支（正确形式）', () {
-      final s = QemuCompat.fill(QemuCompat.wrapReassertScript);
+      // Bug 441：真身路径由 @REAL@ 承接（gen() 里按文件 sed 写入），
+      // **不能**再用运行时的 $2——那是调用者的业务参数。
+      //
+      // ⚠️ @LOADER@ / @REAL@ 都在 `__FOA_GEN__` 片段里（它由 fill() 展开
+      // 成 gen() 函数）。所以要在**未 fill 的原始模板**上找这个片段——
+      // fill() 之后 @LOADER@ 会被换成真实路径，就找不到了。
+      const raw = QemuCompat.wrapReassertScript;
+      expect(raw.contains('__FOA_GEN__'), isTrue);
+      // 取出 gen() 片段：从模板开头到 "__FOA_GEN__" 标记之后由 fill 注入；
+      // 这里直接断言标记存在 + 片段本身由 fill 展开后可验证（见下）。
+      final f = QemuCompat.fill(raw);
+      // fill() 展开后：@LOADER@ → 真实 ld.so 路径；@REAL@ 保留（gen 内部用）
+      expect(f.contains(QemuCompat.x64Loader), isTrue,
+          reason: 'ld.so 路径必须被展开');
+      expect(f.contains('@REAL@'), isTrue,
+          reason: '@REAL@ 是 gen() 内部占位符，fill() 不应吞掉它');
+      // 关键回归断言：展开后必须有 "ld.so 路径" 紧接 "@REAL@" 的形状，
+      // 且**绝不能**出现运行时的 "$2" 当真身。
       expect(
-        s.contains(r'exec @QEMU@ -L / "@LOADER@" "$2" "$@"'),
-        isFalse,
-        reason: '已替换过的脚本不应再留占位符',
-      );
-      expect(
-        s.contains(r'"$2" "$@"'),
+        f.contains('"${QemuCompat.x64Loader}" "@REAL@" ' r'"$@"'),
         isTrue,
-        reason: '真实二进制路径要排在前面，qemu 才会把后者当程序执行',
+        reason: 'ld.so 必须排在真身之前，两者都用占位符承接',
       );
       expect(
-        s.contains(r'"@LOADER@" "$2"'),
+        RegExp(r'exec\s+\S+\s+-L\s+/\s+"[^"]*"\s+"\$2"').hasMatch(f),
         isFalse,
-        reason: '占位符必须被 fill() 展开，否则 [ -x "@LOADER@" ] 恒假 → 静默回退旧形式',
+        reason: 'Bug 441：不得用运行时的第二参数当真身路径',
       );
     });
 
@@ -89,15 +101,20 @@ void main() {
   });
 
   group('Bug 439 · 共享库不能被包装', () {
-    test('三个包装脚本都排除了 *.so', () {
+    test('三个包装脚本都排除了 *.so（Bug 441 起同时排除 snapshot 等）', () {
       for (final s in [
         QemuCompat.wrapReassertScript,
         QemuCompat.engineWrapScript,
         QemuCompat.sdkWrapScript,
       ]) {
+        // Bug 441 把黑名单扩展为 *.so|*.so.*|*.snapshot|*.dill|...
+        // 断言从"精确匹配旧串"改成"判定这些扩展名都在排除分支里"，
+        // 避免黑名单每扩一项就要改一次测试。
         expect(
-          s.contains(r'case "$1" in *.so|*.so.*) return 0 ;; esac') ||
-              s.contains(r'case "$f" in *.so|*.so.*) continue ;; esac'),
+          s.contains('*.so|*.so.*') &&
+              s.contains('|*.snapshot') &&
+              (s.contains(r'case "$1" in *.so') ||
+                  s.contains(r'case "$f" in *.so')),
           isTrue,
           reason: '.so 的 e_machine 也是 x86_64、e_type 也是 ET_DYN，'
               '与 PIE 可执行文件无法用 magic 区分，必须按名字排除',

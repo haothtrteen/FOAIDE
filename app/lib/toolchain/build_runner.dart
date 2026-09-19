@@ -362,6 +362,11 @@ exit 0
     // 信号杀死、来不及输出。这种静默崩溃无法从 flutter 的日志反推原因，
     // 必须在构建前**主动**测一遍 qemu 链路并记录结果。
     final diag = QemuCompat.fill(QemuCompat.buildPreflightScript);
+    // Bug 441：自愈——把被误包装的文件（如 flutter_tools.snapshot）还原。
+    // 放在 reassert 之前：先修好坏文件，再重建转发层，顺序反了会把
+    // 刚还原的文件又包一遍。幂等且低代价（只 mv，不动 apt/不删引擎目录），
+    // 因此每次构建都跑没有副作用。
+    final heal = QemuCompat.fill(QemuCompat.healScript);
     return "cd $proj && $envPart"
         'FLUTTER_ALLOW_ROOT=true '
         // Bug 436：proot 路径原先没设该变量（只有 pub get 那行内联了
@@ -371,6 +376,8 @@ exit 0
         'sh -c ${_shq(stampFix)} 2>&1 | tail -n 1; '
         // Bug 438：qemu 链路预检（输出 QEMU_CHAIN_* 供真机排障）
         'sh -c ${_shq(diag)} 2>&1 | tail -n 12; '
+        // Bug 441：还原被误包装的文件（输出 HEALED=/SNAPSHOT=）
+        'sh -c ${_shq(heal)} 2>&1 | tail -n 3; '
         'ok=0; '
         'for src in https://pub.flutter-io.cn '
         'https://mirrors.tuna.tsinghua.edu.cn/dart-pub '
@@ -509,7 +516,17 @@ exit 0
   void _feedErrorBreakdown(String line) {
     final l = line.toLowerCase();
     String? tip;
-    if (l.contains('exec format error')) {
+    // Bug 441：优先判这个——它是最具体的信号，且和下面 'shared libraries'
+    // 的通配提示是同一句话的前缀，必须排在前面才不会被吃掉。
+    //
+    // `invalid ELF header` 只可能来自动态加载器（ld.so）：说明某个
+    // **不是 ELF 的东西**被当成了可执行程序。真机最典型的受害者是
+    // `flutter_tools.snapshot`（Dart app-jit 快照，头 dc dc f6 f6）。
+    if (l.contains('invalid elf header')) {
+      tip = '工具链文件被误包装成转发脚本（非 ELF 被送进加载器）：'
+          '构建前会自动还原（HEALED=）；若本条仍出现，到「工具链」页执行'
+          '一次「一键应用」重建转发层后重试（Bug 441）';
+    } else if (l.contains('exec format error')) {
       tip = '架构不匹配：x64 工具未经 qemu 转发（工具链页 → x64 兼容层 → 重新应用）';
     } else if (l.contains(': not found')) {
       tip = '命令缺失（sh: xxx: not found）：容器组件不全——到「工具链」页'

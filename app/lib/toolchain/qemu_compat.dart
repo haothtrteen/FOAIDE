@@ -81,15 +81,30 @@ class QemuCompat {
   /// 生成脚本的时刻 `@LOADER@` 可能还没被 apt 装进来。
   static const String _wrapGenFunc = r'''
 gen() {
-  # 注意分隔符写成 <<'FOAWRAP'（**带单引号**）：这样 heredoc 体是完全字面量，
-  # 反引号、$(...) 都不会被展开。原先是不带引号的 <<FOAWRAP，body 里每个 $
-  # 都得手写 \$ 转义；一旦有人在注释里写了反引号（如 -L / 的说明），
-  # shell 会把它当命令替换，**吞掉后面所有行** → "end of file unexpected"，
-  # 而报错指向脚本第 1 行，极难定位（Bug 439 实际踩到）。
-  # 加引号后 body 里写 $ 不用转义，也不会再出这类问题。
+  # ⚠️ 这里是 Bug 439/441 的关键位置，改之前先读完这段。
+  #
+  # `gen <wrapper路径> <真身路径>`：$1=要写入的转发脚本，$2=被包装的真身。
+  #
+  # 分隔符写成 <<'FOAWRAP'（**带单引号**）是为了让 body 完全字面量：
+  # 反引号、`$(...)` 都不会被展开。原先不带引号时，body 里每个 $ 都得
+  # 手写 \$ 转义，一旦有人在注释里写反引号（如 -L / 的说明），shell 会把
+  # 它当命令替换、**吞掉后面所有行** → "end of file unexpected"，而报错
+  # 指向脚本第 1 行，极难定位。
+  #
+  # ⚠️ 但加引号有个**副作用**：body 里的 $2 不再被展开成真身路径。
+  # 旧代码（无引号）里 `"$2"` 之所以正确，纯粹是因为 heredoc 在生成时
+  # 把它展开了。改成带引号后，$2 会**原样留在生成的脚本里**，而运行时
+  # 的 $2 是**调用者的第一个业务参数**（$1 才是真身）→ 参数整体错位：
+  # `qemu -L / <ld.so> <业务参数> <真身> <业务参数>`——把业务参数当成要
+  # 加载的程序。真机表现为 `error while loading shared libraries:
+  # .../flutter_tools.snapshot: invalid ELF header`（dart 的参数里有
+  # snapshot 路径，被 qemu 当可执行目标送进了 ld.so）。这就是 Bug 441。
+  #
+  # 正确做法：**真身路径由生成期显式写入**，不依赖 heredoc 的展开行为。
+  # 用占位符 @REAL@ 承接，生成完再替换，两种分隔符语义下都正确。
   cat > "$1" <<'FOAWRAP'
 #!/bin/sh
-# FOA x86_64 -> qemu-user wrapper (auto-generated, Bug 439)
+# FOA x86_64 -> qemu-user wrapper (auto-generated, Bug 439/441)
 d=$(dirname "$0")
 if [ -d "$d/lib64" ]; then
   LD_LIBRARY_PATH="$d/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -99,10 +114,13 @@ fi
 # Passing -L / and letting qemu find ld.so breaks glibc stack-protector
 # init (__stack_chk_fail): no stderr, process killed by a signal.
 if [ -x "@LOADER@" ]; then
-  exec @QEMU@ -L / "@LOADER@" "$2" "$@"
+  exec @QEMU@ -L / "@LOADER@" "@REAL@" "$@"
 fi
-exec @QEMU@ -L / "$2" "$@"
+exec @QEMU@ -L / "@REAL@" "$@"
 FOAWRAP
+  # Bug 441：真身路径在这里显式写入（@REAL@ 用 # 作分隔符，避免路径里的
+  # / 与 & 干扰 sed；路径不含 # 时安全）。
+  sed -i "s#@REAL@#$2#g" "$1"
   chmod 755 "$1"
 }
 ''';
@@ -119,7 +137,21 @@ FOAWRAP
   /// `e_type` 在 PIE 与共享库之间没有区别位；`.so`/`.so.N` 命名是
   /// ELF 生态的硬约定，可靠且简单。
   ///
-  /// 各遍历点直接内联 `case "$f" in *.so|*.so.*) continue ;; esac`，
+  /// Bug 441：黑名单同时是**兜底防线**。判定本身已要求 ELF 魔数
+  /// `7f454c46`（第 3 行 `case "$m"`），非 ELF 文件（Dart snapshot 的
+  /// `dcdcf6f6` 头、JSON、jar…）在那一关就被挡了。但两道防线都留着：
+  /// 魔数防"内容不是 ELF"，扩展名防"内容是 ELF 但不该被当程序执行"
+  /// ——后者覆盖 `.so`（可 dlopen 不可 exec）这类边界情况。
+  ///
+  /// ⚠️ 特别说明 `*.snapshot`：`flutter_tools.snapshot` 是 **Dart app-jit
+  /// 快照**，头部是 `dc dc f6 f6`，正文里明文写着 `x64 linux`。
+  /// 它**不是可执行文件**，必须由 `dart` 加载（`shared.sh` 里是
+  /// `exec "$DART" ... "$SNAPSHOT_PATH"`）。一旦被误包装成转发脚本，
+  /// 就会被送进 ld.so → `invalid ELF header`。它本身带 `-rw-r--r--`
+  /// （无 +x），已能被 `[ -x ]` 挡住；写进黑名单是**第二道保险**，
+  /// 防止未来某次 chmod 或权限继承把它变成可执行。
+  ///
+  /// 各遍历点直接内联 `case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac`，
   /// 不做成共享片段——那样会引入一层 `__FOA_SO__` 占位符替换，
   /// 比重复一行更容易出错。
 
@@ -146,7 +178,7 @@ for f in "$F"/*; do
   [ -x "$f" ] || continue
   case "$f" in *.foa-real) continue ;; esac
   # Bug 439：共享库不包装
-  case "$f" in *.so|*.so.*) continue ;; esac
+  case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
   # Bug 428：已是转发脚本（#! 开头）则跳过——重应用时不再误动已包装项
   if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
   m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
@@ -182,7 +214,7 @@ put() {
   [ -f "$1" ] || return 0
   [ -x "$1" ] || return 0
   # Bug 439：共享库不能包装（e_machine/e_type 与 PIE 可执行文件相同）
-  case "$1" in *.so|*.so.*) return 0 ;; esac
+  case "$1" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) return 0 ;; esac
   m=$(dd if="$1" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$m" in 7f454c46*3e) ;; *) return 0 ;; esac
   if [ -f "$2" ] && head -c 2 "$2" 2>/dev/null | grep -q '#!'; then
@@ -315,7 +347,7 @@ for d in "$E"/android-*/linux-x64; do
   for f in "$d"/*; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
-    case "$f" in *.so|*.so.*) continue ;; esac
+    case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     w="$a/${f##*/}"
@@ -346,7 +378,7 @@ for hd in "$E"/linux-*/; do
   for f in "$hd"/*; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
-    case "$f" in *.so|*.so.*) continue ;; esac
+    case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     w="$ha/${f##*/}"
@@ -374,7 +406,7 @@ for d in "$S"/build-tools/* "$S"/platform-tools; do
     [ -x "$f" ] || continue
     case "$f" in *.foa-real) continue ;; esac
     # Bug 439：共享库不包装
-    case "$f" in *.so|*.so.*) continue ;; esac
+    case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
     # Bug 428：已是转发脚本则跳过（同 flutter/engine 层修复）
     if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
     m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
@@ -539,6 +571,9 @@ echo UNINSTALL_OK
   ///
   /// 预防的是"我在某处修过 ≠ 所有执行路径都被修复"这个老陷阱：
   /// **占位符替换必须收口在一个函数**。
+  ///
+  /// ⚠️ `@REAL@` **不在**这里替换：它是 `gen()` 内部按每个文件写入的
+  /// 真身路径（由 `gen()` 里的 `sed` 完成），不是全局常量。
   static String fill(String script, {String sdk = sdkHome}) => script
       .replaceAll('__FOA_GEN__', _wrapGenFunc.trim())
       .replaceAll('@QEMU@', qemuBin)
@@ -718,6 +753,88 @@ echo UNINSTALL_OK
         .where((l) => !l.trim().startsWith('android.aapt2FromMavenOverride'))
         .toList();
     await f.writeAsString('${lines.join('\n')}\n');
+  }
+
+  // ---------------- 自愈：还原被误包装的文件 ----------------
+
+  /// Bug 441：把**被误包装**的文件还原回真身。
+  ///
+  /// 场景：`flutter_tools.snapshot`（Dart app-jit 快照，头部 `dc dc f6 f6`）
+  /// 这类**不是可执行文件**的东西，被旧版转发逻辑套上了 `#!/bin/sh`。
+  /// 之后再被当程序执行 → 送进 ld.so → `invalid ELF header`。
+  ///
+  /// 黑名单只防未来，救不了已经坏掉的文件。这里的策略是**通用自愈**：
+  /// 不看扩展名，只看 `X.foa-real` 是否存在——存在即说明 `X` 是被包装过的，
+  /// 直接把 `X.foa-real` 改回 `X`。幂等，重复跑无副作用。
+  ///
+  /// 与 [uninstall] 的区别：uninstall 会 `rm -rf linux-arm64/` 并 purge
+  /// qemu；heal **只做还原**，不删引擎转发层、不动 apt，代价极小，
+  /// 因此可以在**每次构建前**安全地跑一遍（见 build_runner 的预检）。
+  static const String _healScript = r'''
+F=@FLUTTER@
+E=@ENGINE@
+S=@SDK@
+n=0
+# 1) dart-sdk/bin：dart / dartaotruntime 等（Bug 433 时代就有的包装点）
+if [ -d "$F/bin/cache/dart-sdk/bin" ]; then
+  for f in "$F/bin/cache/dart-sdk/bin"/*.foa-real; do
+    [ -f "$f" ] || continue
+    b="${f%.foa-real}"
+    rm -f "$b"
+    mv "$f" "$b"
+    n=$((n+1))
+  done
+fi
+# 2) flutter 根：bug 441 的受害面——snapshot 等非可执行文件若被包过，还原
+if [ -d "$F/bin/cache" ]; then
+  for f in "$F/bin/cache"/*.foa-real; do
+    [ -f "$f" ] || continue
+    b="${f%.foa-real}"
+    rm -f "$b"
+    mv "$f" "$b"
+    n=$((n+1))
+  done
+fi
+# 3) SDK build-tools / platform-tools
+for d in "$S"/build-tools/* "$S"/platform-tools; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*.foa-real; do
+    [ -f "$f" ] || continue
+    b="${f%.foa-real}"
+    rm -f "$b"
+    mv "$f" "$b"
+    n=$((n+1))
+  done
+done
+echo "HEALED=$n"
+# 顺带断言：snapshot 必须以 Dart 快照魔数开头（不是 ELF、更不是 #!）
+if [ -f "$F/bin/cache/flutter_tools.snapshot" ]; then
+  h=$(od -An -tx1 -N 4 "$F/bin/cache/flutter_tools.snapshot" 2>/dev/null | tr -d ' \n')
+  case "$h" in
+    dcdcf6f6) echo "SNAPSHOT=ok" ;;
+    2321*)    echo "SNAPSHOT=SCRIPT_BROKEN（仍是转发脚本，还原未生效）" ;;
+    *)        echo "SNAPSHOT=unexpected:$h" ;;
+  esac
+fi
+''';
+
+  /// 执行自愈（幂等、低代价）。返回一行可读摘要，异常不外抛，
+  /// 因为它是"尽力而为"的修复动作，不该阻断构建流程。
+  /// 自愈脚本正文（公开供单测导出，做 shell 语法与内容断言）。
+  static const String healScript = _healScript;
+
+  static Future<String> heal(ProotBridge bridge) async {
+    try {
+      final r = await bridge.exec(fill(_healScript), timeoutSec: 180);
+      if (!r.ok) return 'HEAL_FAILED';
+      return r.stdout
+          .split('\n')
+          .where((l) => l.startsWith('HEALED=') || l.startsWith('SNAPSHOT='))
+          .join(' ');
+    } catch (e) {
+      stderr.writeln('[QemuCompat] heal 异常（忽略）：$e');
+      return 'HEAL_ERROR';
+    }
   }
 
   // ---------------- 卸载 ----------------
