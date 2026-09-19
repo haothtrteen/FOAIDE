@@ -116,8 +116,12 @@ void main() {
       // 那不是"两个时刻"的值，而是**同一次执行被印了两遍**
       // （第一次走 tail -n 30 被截断、这里是完整输出），
       // 导致我根本没拿到"构建后"的真实状态。
-      expect(cmd, contains('grep "AOT_FP="'),
-          reason: '二次快照只看 AOT_FP，别把整份诊断刷屏');
+      // Bug 448：二次快照必须带上 AOT_FP **和** AOT_LOAD 裁决行——
+      // alpha.53 只 grep "AOT_FP=" 把真机最需要的 AOT_LOAD/AOT_LOAD_DEF
+      // 退出码滤掉了，等于白采。
+      expect(cmd, contains(r'grep -E "AOT_FP=|AOT_LOAD"'),
+          reason: '二次快照带全裁决行（AOT_FP + AOT_LOAD*），'
+              '别再让过滤层吞掉关键证据');
       expect(cmd, contains(r'echo "$fp";'),
           reason: 'Bug 445：重新采集的指纹必须完整打印，'
               '否则无法与构建前的 AOT_FP 对比');

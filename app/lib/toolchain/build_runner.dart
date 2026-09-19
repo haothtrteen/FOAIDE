@@ -459,7 +459,10 @@ exit 0
         //   判定放到 heal+重启之后（见下），因为重启后的构建才是最终事实。
         'brc=\$?; if [ "\$brc" != 0 ]; then '
         'echo "---- 构建后工具链指纹（重新采集，对比上面的 AOT_FP）----"; '
-        'fp=\$(sh -c ${_shq(diag)} 2>&1 | grep "AOT_FP="); '
+        // Bug 448：这里原来只 grep "AOT_FP="，把 AOT_LOAD / AOT_LOAD_DEF
+        // 裁决行全滤掉了 —— alpha.53 真机失败后本该出现的两个退出码
+        // 恰恰是最需要的证据，却被这一层过滤吞了。裁决行必须全量透传。
+        'fp=\$(sh -c ${_shq(diag)} 2>&1 | grep -E "AOT_FP=|AOT_LOAD"); '
         'echo "\$fp"; '
         // ---------------- Bug 445：heal + 重启构建 ----------------
         // 真机实测（alpha.50 日志）：
