@@ -2742,6 +2742,178 @@ sh heal_run.sh     # → HEALED=1 / SNAPSHOT=ok
 
 ---
 
+### Bug 442：修 Bug 441 的自愈把正常包装也还原了——整条工具链瘫痪，`exit 69`
+
+**又是我引入的回归，而且是 Bug 441 的"修复"直接造成的。**
+连续两个 Bug（441、442）都是"修 A 引入 B"，值得单独反思。
+
+**症状**（真机 alpha.48 首次构建，3% 冻结，耗时 24 秒就死）：
+
+```
+QEMU_CHAIN_VER=qemu-x86_64 version 7.2.22   ← qemu 正常
+QEMU_CHAIN_LOADER=ok（ld.so 显式加载方式可用） ← 加载器正常
+QEMU_CHAIN_PROBE=impellerc=ok rc=0           ← 真 x64 程序能跑
+QEMU_CHAIN_OLDSTYLE=impellerc=ok rc=0        ← 两种加载方式都好
+QEMU_CHAIN_SRC=impellerc=7f454c4602...03003e ← 引擎 ELF 头正常
+QEMU_CHAIN_DONE=1
+HEALED=22        ← ⚠️ 自愈还原了 22 个文件
+SNAPSHOT=ok      ← ⚠️ snapshot 是好的
+Illegal instruction   ×5
+✗ 构建失败 (exit 69)
+```
+
+**先看诊断段**：全绿。qemu 本体、ld.so、impellerc（新旧两种加载方式）、
+引擎 ELF 头，**每一项都正常**。说明**引擎层完全没问题**。
+
+**再看两个数字**：`HEALED=22` 和 `SNAPSHOT=ok`。
+- `SNAPSHOT=ok` → Bug 441 的修复**生效了**，snapshot 头是正常的 `dcdcf6f6`
+- `HEALED=22` → **但自愈一口气还原了 22 个文件**
+
+**`exit 69` 只在 build_runner 里出现一次**：`pub get` 三源六次重试全挂的兜底。
+而报错是 `Illegal instruction`（SIGILL）= **arm64 上直接执行了 x64 代码**。
+
+把这两个事实拼起来：**`pub get` 调 `dart` 时撞上了 x64 二进制。**
+
+**根因：我的自愈判据从根上就错**
+
+Bug 441 我加的自愈逻辑是这么想的：
+
+> "`X.foa-real` 存在 = X 是个被误包装的坏文件 → 还原它"
+
+**这个假设对 `dart-sdk/bin` 是错的。** 那里的 `.foa-real` 是**正常且必需**的
+包装产物：
+
+| | 文件 | 角色 |
+| --- | --- | --- |
+| 真身 | `dart.foa-real` | x64 的 dart 二进制 |
+| 转发 | `dart` | `#!/bin/sh` 脚本，exec qemu 去跑上面那个 |
+
+**两个文件都必须在**，这才是转发层的正常形态。
+我的自愈把它当成"坏文件"，**把好好的转发脚本删掉、把 x64 真身搬了回来**。
+
+于是链就断了：
+
+```
+heal 还原 22 个工具 → dart 变成裸 x64 ELF
+    ↓
+reassert 本该重建 —— 但它**只覆盖引擎目录**（$E/android-*/linux-x64、$E/linux-*），
+**根本不碰 dart-sdk/bin** → 没有任何东西把它包回去
+    ↓
+pub get 调 flutter → dart = arm64 上执行 x64 → SIGILL ×5
+    ↓
+三源六次重试全挂 → exit 69
+```
+
+**顺带纠正一个更深的误解**：Bug 441 里我以为 `flutter_tools.snapshot`
+"被误包装过"，所以特意加了还原它的逻辑。**这是错的。**
+
+包装器的判据是 `[ -x "$f" ]` **且** ELF 魔数 `7f454c46*3e`。而
+`flutter_tools.snapshot` 是 `dcdcf6f6` 且权限 `-rw-r--r--`（**无 +x**）——
+**三道关卡全都过不去，它根本不可能被包装**。
+
+Bug 441 里它**只是受害者**：是被错位的转发脚本把它的路径喂进了 ld.so。
+我为它写的"还原"逻辑，**从头到尾都在解决一个不存在的问题**，
+却顺手制造了一个真实的问题。
+
+**修复（三件事）**
+
+**① 换判据：区分"正常包装"与"孤儿"**
+
+`X.foa-real` 只有在**它的兄弟 X 不是有效 FOA 转发脚本**时才需要处理：
+
+```sh
+heal_one() {
+  f="$1"; b="${f%.foa-real}"
+  # 兄弟是有效 FOA 脚本 → 正常包装，保持原样
+  if [ -e "$b" ] && head -c 2 "$b" 2>/dev/null | grep -q '#!' &&
+     grep -q 'FOA x86_64 -> qemu-user wrapper' "$b" 2>/dev/null; then
+    return 0
+  fi
+  # 兄弟缺失 / 不是 FOA 脚本 → 还原真身
+  rm -f "$b"; mv "$f" "$b"; n=$((n+1))
+}
+```
+
+> **取舍方向不是随意的，是代价不对称决定的**：
+> - 误判"合法"而跳过 → 保持现状，**reassert 会无条件重建**（它不看这个判据）
+> - 误判"孤儿"而还原 → **把好好的转发层毁掉**，正是 Bug 442
+>
+> 代价不对称时，判据要往**保守**那一侧收。
+
+**② `reassert` 补上 `dart-sdk/bin`（这是缺失的兜底）**
+
+`reassert` 之前只有 `E=@ENGINE@`，现在加了 `F=@FLUTTER@`，
+并原地重建 `dart-sdk/bin` 的转发层，输出 `REASSERT_DART=` 可观测。
+
+> 为什么必须补：`dart-sdk/bin` 是**所有 flutter 命令的入口**
+> （`flutter` bash 脚本第一件事就是 exec dart）。
+> 入口一旦坏掉，**一条命令都跑不了**——这就是为什么 Bug 442 是"整条链瘫痪"
+> 而不是"某个功能不可用"。**兜底必须覆盖入口。**
+
+**③ 加探针 `DART=ok` / `DART=ELF_BROKEN`**
+
+heal 顺带检查 `dart-sdk/bin/dart` 的头 4 字节：
+`2321` = 转发脚本在位；`7f454c46` = 裸 x64 二进制，转发层丢了。
+
+> 这样问题在**构建早期**就报出来，而不是等 `pub get` 报一句
+> 让人摸不着头脑的 `Illegal instruction`。
+
+**④ 构建日志分诊新增 `Illegal instruction` 分支**
+
+```
+pub get 阶段的 SIGILL（无编译上下文）→ dart-sdk 转发层丢失（Bug 442）
+AOT 阶段的 SIGILL（有 impellerc / snapshot generator 上下文）→ Bug 428
+```
+
+> **这两件事必须分开**。旧分诊表里 SIGILL 只指向"AOT/shader 编译崩溃 +
+> 重新应用兼容层"——对 Bug 442 是完全无关的建议。
+> 新分支**排在那组之前**，但**判据不能太宽**：带 `impellerc` 上下文的
+> 必须仍然落到 Bug 428（有测试专门守这条边界）。
+
+**验证（红-绿对照）**
+
+在**同一 fixture** 上跑旧逻辑与新逻辑：
+
+| 场景 | 旧 heal | 新 heal | 新 reassert |
+| --- | --- | --- | --- |
+| **正常包装态**（22 个工具） | `HEALED=22` ❌ 全毁 | `HEALED=0` ✅ 不动 | — |
+| **已损坏态** | — | 不误伤，报 `DART=ELF_BROKEN` | `REASSERT_DART=23` ✅ 重建 |
+
+真机数字复现：旧逻辑输出 `HEALED=22`，**与用户日志完全一致**。
+
+门禁：`analyze lib/` → `No issues found!`；`flutter test` → **219 项全绿**。
+新增 `bug442_heal_not_destructive_test.dart`（13 项），
+并**验证其在旧实现上正确失败**（3 项变红）。
+
+**教训**
+
+- **"修 A 引入 B"连续发生了两次（441、442），根因是同一个：**
+  **我加修复逻辑时，没有问'这个假设在别的调用点上成立吗'。**
+  Bug 441 的自愈对 `bin/cache/` 也许无害，但我把它**同时**套到了
+  `dart-sdk/bin` 上——而那里的文件形态完全不同。
+  **一条修复逻辑用到 N 个目录时，必须逐个确认前提成立。**
+- **别修不存在的问题。** 我为 `snapshot` 写的还原逻辑基于一个错误推断
+  （"它被包装过"），实际它连包装的资格都没有（无 +x、非 ELF）。
+  **加防御代码前先确认威胁真实存在**，否则防御本身就成了威胁。
+- **兜底必须覆盖"入口"。** reassert 只管引擎目录，漏掉了
+  所有命令的入口 `dart-sdk/bin`，导致"局部能修、全局瘫痪"。
+  **问自己：这条链上，用户最先碰到的那个文件是哪个？**
+- **探针要报"人能看懂的状态"，不要等底层抛出晦涩报错。**
+  `DART=ELF_BROKEN` 比 `Illegal instruction` 有用得多。
+- **测试夹具写错会伪装成代码错。** 我第一版 fixture 用 `+ b'\x00'*10`
+  凑 ELF 长度，把 `e_machine` 挤到 offset 18 之后，19 字节读到 `...0003`，
+  包装器**正确地**跳过了它 —— 我一度以为"修复没生效"。
+  **夹具也要符合真实数据结构。**
+- **对脚本文本做 `contains` 断言很脆。** Bug 442 加的注释里出现了
+  "pub get" 字样，导致 Bug 433 的一条测试误报失败。
+  **断言的意图是"不得执行"，就该只看可执行行，不看注释。**
+- **测试脚本含 `rm -f`/`mv` 时必须有安全闸。** 我调试时占位符替换写错，
+  脚本作用到了**真实的 `/opt/flutter`**，把沙箱的 `dart` 换成了指向不存在
+  qemu 的转发脚本，`flutter test` 整个跑不起来。
+  修法：断言"替换后无残留占位符" + "非注释行不含真实环境路径"。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
