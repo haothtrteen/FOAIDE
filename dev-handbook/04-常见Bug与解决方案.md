@@ -2539,6 +2539,209 @@ cp platform/android/PtySession.kt   android/app/src/main/kotlin/dev/foa/flutter_
 
 ---
 
+### Bug 441：修 Bug 439 的引号把 `$2` 锁死了——转发脚本真身路径丢失，`invalid ELF header`
+
+**这是我自己引入的回归**，而且**被我亲手写的 16 个测试全部放行**。
+记录下来，因为它的教训比 Bug 本身值钱。
+
+**症状**：用户卸载重装后，构建日志出现
+
+```
+error while loading shared libraries: /opt/flutter/bin/cache/flutter_tools.snapshot: invalid ELF header
+```
+
+**第一件事：这行报文的来源是唯一的**
+
+`error while loading shared libraries: X: reason` 这个格式**只有动态加载器
+（ld.so）会打印**。看到它就等于确认：**有个非 ELF 的文件被当成程序送进了 ld.so**。
+（沙箱里用 `/lib64/ld-linux-x86-64.so.2 /etc/hostname` 精确复现了同款报文。）
+
+**第二步：确认 `flutter_tools.snapshot` 是不是 ELF**
+
+不是。它是 Dart 的 **app-jit 快照**：
+
+| 检查项 | 结果 | 说明 |
+| --- | --- | --- |
+| `head -c 4 \| od -An -tx1` | `dc dc f6 f6` | **不是** ELF 的 `7f454c46` |
+| `ls -la` | `-rw-r--r--` | **无 +x 权限** |
+| 正文明文 | 含 `x64 linux` | 可读的元数据字符串 |
+| 由谁加载 | `shared.sh:273` `exec "$DART" ... "$SNAPSHOT_PATH" "$@"` | **不是**直接执行 |
+
+**这儿我上一轮推断错过一次**：我曾怀疑它是被文本匹配
+`grep 'x64'` 误包装了。事实是**包装判定从头到尾都是 ELF 魔数**
+（`[ -x "$f" ]` + `case "$m" in 7f454c46*3e)`），
+`dcdcf6f6` 头**不可能**通过这一关。
+所以它**不是被包装脚本伤的**——是**被当成程序送进加载器**伤的。
+**先验证再下结论。**
+
+**真因：Bug 439 的修复改错了 heredoc 分隔符**
+
+Bug 439 为了修反引号陷阱，把生成脚本的分隔符从
+`<<FOAWRAP`（无引号）改成了 `<<'FOAWRAP'`（带引号）。
+修反引号是对的，但**我漏了它的副作用**：
+
+> **无引号的 heredoc 会展开 body 内的变量**。旧代码正是靠这个副作用，
+> 把 `$2`（真身路径）**烘入**了生成的转发脚本。
+
+改成带引号后，`$2` 不再被展开，**原样留在了脚本里**。而脚本运行时，
+`$2` 是**调用者的第一个业务参数**（`$1` 才是真身），于是命令错位成：
+
+```sh
+qemu -L / <ld.so> <业务参数> <真身> <业务参数>
+#                 ^^^^^^^^^^ 这个被当成程序送进 ld.so → invalid ELF header
+```
+
+**两张对照证明**（沙箱实测）：
+
+```sh
+# 未加引号 heredoc（Bug 439 之前的旧代码）
+exec /usr/bin/qemu -L / "/path/to/REAL_BINARY" "$@"    ✅ 正确
+
+# 加了引号 heredoc（Bug 439 引入的回归）
+exec /usr/bin/qemu -L / "$2" "$@"                      ❌ 错位
+```
+
+**为什么 16 个测试都没抓到**
+
+因为 Bug 439 的 `bug439_loader_wrapper_test.dart` **全是静态文本断言**——
+拿字符串 `contains` 一下，检查脚本"长什么样"。
+**没有一个是"生成脚本之后真的执行它"**。
+文本里含有 `-L /` 和 ld.so 路径，断言就过了，
+**参数到底指向谁，测试根本没看**。
+
+**修复：`@REAL@` 占位符 + `sed` 显式写入**
+
+不再依赖 heredoc 的展开副作用（副作用是隐式的、且和引号耦合，
+下次谁再动引号又会踩）：
+
+```dart
+gen() {
+  cat > "$1" <<'FOAWRAP'
+...
+if [ -x "@LOADER@" ]; then
+  exec @QEMU@ -L / "@LOADER@" "@REAL@" "$@"
+fi
+exec @QEMU@ -L / "@REAL@" "$@"
+FOAWRAP
+  # Bug 441：真身路径在这里显式写入，不依赖 heredoc 展开
+  sed -i "s#@REAL@#$2#g" "$1"
+  chmod 755 "$1"
+}
+```
+
+> `@REAL@` **不走** `fill()` —— 它是 **per-file** 的，
+> 每个被包装文件写自己的真身路径；`fill()` 是全局模板替换。
+
+**新增 `bug441_gen_real_path_test.dart`（10 项）——这次真的执行**
+
+与 Bug 439 的做法相反：**真实跑 `gen()`，检查生成出来的脚本**。
+
+```dart
+Process.runSync('/bin/sh', ['-c', r'. "$1"; gen "$2" "$3"', wrapper, real, ...]);
+```
+
+覆盖五组：真身路径被写进脚本 / **不得残留 `"$2"`** /
+两条 exec 都正确 / 带空格的路径 / dash+bash 双 shell 语法。
+
+**并且验证测试本身能失败**：把旧实现喂进去，
+两条断言**正确失败**（残留 `$2`、缺真身路径）。
+—— 一个从没红过的测试，不能算测试。
+
+**同时落地的两道防线（用户指定方案）**
+
+**① 黑名单扩到 6 类扩展名**（5 个遍历点 + 1 个 put 点）：
+
+```sh
+case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
+```
+
+> **为什么用黑名单不用白名单** —— 用户原话：
+> 「白名单一旦漏了新工具，用户卡死无解；**黑名单漏了最坏只是误包一个文件**。」
+> 失败模式不对称，就该选代价小的那一边。
+
+两道防线分工要讲清楚：
+
+| 防线 | 拦什么 | 例 |
+| --- | --- | --- |
+| ELF 魔数 `7f454c46*3e` | 拦"**内容不是 ELF**" | `.json` / 文本脚本 |
+| 扩展名黑名单 | 拦"**是 ELF 但不该被当程序执行**" | `.so` 是 ELF，但它是库不是程序；`.snapshot` 是第二道保险 |
+
+**② 构建前自愈 `heal()`**
+
+通用还原逻辑——**不看扩展名，只看 `X.foa-real` 是否存在**：
+
+```sh
+[ -f "$f" ] || continue
+b="${f%.foa-real}"; rm -f "$b"; mv "$f" "$b"; n=$((n+1))
+```
+
+幂等、低代价（只 `mv`，不碰 apt、不删引擎目录），所以**每次构建前都跑**。
+覆盖三处：`dart-sdk/bin`、`flutter/bin/cache`（Bug 441 的受害面）、
+SDK build-tools/platform-tools。
+
+还带一个头部体检：读 `flutter_tools.snapshot` 前 4 字节，
+`dcdcf6f6` → `SNAPSHOT=ok`。
+
+**注入顺序有个坑**：`heal` 必须放在 `reassert` **之前**——
+反了会把刚还原的文件**又包一遍**。
+
+**③ 错误驱动兜底提示**
+
+在 `_feedErrorBreakdown` 里优先匹配 `invalid elf header`：
+
+```dart
+if (l.contains('invalid elf header')) {
+  tip = '工具链文件被误包装成转发脚本（非 ELF 被送进加载器）：'
+      '构建前会自动还原（HEALED=）；若本条仍出现，到「工具链」页执行'
+      '一次「一键应用」重建转发层后重试（Bug 441）';
+}
+```
+
+> **分诊表的分支有顺序**：`invalid elf header` 必须排在
+> `shared libraries` **之前**——否则会被后者的前缀判断先吃掉。
+
+**验证**
+
+| 验证项 | 结果 |
+| --- | --- |
+| 生成的转发脚本 exec 行 | `exec qemu -L / "<ld.so>" "<真身>" "$@"` ✅ |
+| 实际执行 `impellerc --help` | rc=0，1795 B 正常输出 ✅ |
+| 旧实现对照 | 残留 `"$2"`、缺真身路径（测试正确失败）✅ |
+| 自愈演练 | `HEALED=1` `SNAPSHOT=ok`，头变回 `dc dc f6 f6` ✅ |
+| dash / bash 语法 | 全通过 ✅ |
+| `flutter analyze lib/` | `No issues found!` |
+| `flutter test` | **206 项全绿** |
+
+自愈演练细节（沙箱）：
+
+```bash
+mkdir -p /tmp/e2e441/healtest/bin/cache
+cp /opt/flutter/bin/cache/flutter_tools.snapshot  .../flutter_tools.snapshot.foa-real
+printf '#!/bin/sh\nexec qemu ...\n' > .../flutter_tools.snapshot && chmod 755 ...
+# 修复前：头 = 23 21 2f 62（"#!/b"），存在 .foa-real
+sh heal_run.sh     # → HEALED=1 / SNAPSHOT=ok
+# 修复后：头 = dc dc f6 f6，.foa-real 已消失，大小 47675168
+```
+
+**教训**
+
+- **修一个 Bug 时引入的下一个 Bug，往往藏在"修复手段的副作用"里。**
+  改 heredoc 引号是为了修反引号，`$2` 展开是**顺带**丢的。
+  改任何"约定/语法糖"时，要问：**它现在替我做了什么隐式的事？**
+  隐式行为一旦消失，最好**改成显式的**（`@REAL@` + `sed`），
+  而不是换个方式继续依赖它。
+- **只做文本断言的测试，挡不住回归。** 16 个测试全绿，
+  真机上照样崩。**测试要碰运行结果，不是碰源码字符串。**
+  这次的对策是"真实执行 `gen()`"，方向要对。
+- **写完测试要验证它会在旧实现上失败**（红-绿验证）。
+  从没红过的测试给的是**虚假的安全感**。
+- 报错信息格式本身就是线索：`error while loading shared libraries:`
+  → 一定是 ld.so 打的 → 一定是"非 ELF 被当成程序"。
+  顺着报文的**生产者**反推，比顺着现象猜快得多。
+- **失败模式不对称时，选代价小的那一边**（黑名单 vs 白名单）。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
