@@ -39,7 +39,10 @@ void main() {
       // Bug 439：转发脚本正文在 gen() 片段里，一律用 fill() 后的文本断言。
       final f = QemuCompat.fill(s);
       // fill() 会把 @QEMU@ 也展开，所以这里断言的是已替换后的真实命令行。
-      expect(f.contains('exec ${QemuCompat.qemuBin} -L /'), isTrue);
+      expect(f.contains('exec ${QemuCompat.qemuBin} -cpu max -L /'), isTrue);
+      // Bug 447：exec 行必须是 -cpu max 形态（比旧的裸 `-L /` 更严格）。
+      expect(f.contains('exec ${QemuCompat.qemuBin} -cpu max -L /'), isTrue,
+          reason: 'Bug 447：TCG 按 CPU 模型门控 SIMD，必须显式 -cpu max');
       expect(f.contains('ld-linux-x86-64'), isTrue,
           reason: 'Bug 439：必须显式加载 guest ld.so，否则所有 x64 工具静默崩溃');
     });

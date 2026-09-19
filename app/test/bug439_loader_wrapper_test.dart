@@ -244,9 +244,16 @@ void main() {
       //   新形式 → "ImpellerC is an offline shader processor..."
       // 这里只做静态契约断言，真实执行需真机/完整 qemu 环境。
       final s = QemuCompat.fill(QemuCompat.wrapReassertScript);
-      final i = s.indexOf('exec ${QemuCompat.qemuBin} -L / "${QemuCompat.x64Loader}"');
+      // Bug 447：exec 行带上了 -cpu max（TCG 按 CPU 模型门控 SIMD，
+      // arm64 host 默认模型不含 AVX 位 → gen_snapshot 一碰 VEX 即 SIGILL）。
+      final i = s.indexOf(
+          'exec ${QemuCompat.qemuBin} -cpu max -L / "${QemuCompat.x64Loader}"');
       expect(i, greaterThan(0),
-          reason: '应生成「qemu -L / <ld.so> <real> args」这一行');
+          reason: '应生成「qemu -cpu max -L / <ld.so> <real> args」这一行');
+      // 回归哨兵：防 indexOf 恒 -1 时上面断言悄悄失效（Bug 443 教训）。
+      expect(s.contains('exec ${QemuCompat.qemuBin} -cpu max'),
+          isTrue,
+          reason: 'Bug 447：转发 exec 行必须显式 -cpu max');
     });
   });
 }

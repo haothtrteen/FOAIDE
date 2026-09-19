@@ -113,10 +113,23 @@ fi
 # Bug 439: let the guest ld.so do the dynamic linking itself.
 # Passing -L / and letting qemu find ld.so breaks glibc stack-protector
 # init (__stack_chk_fail): no stderr, process killed by a signal.
+#
+# ⚠️⚠️ Bug 447（alpha.53）：`-cpu max` 必须带上。
+# qemu TCG 对 SIMD 指令是**按 CPU 模型特性位门控**的：CPU 模型里没有
+# AVX 特性位时，翻译器一碰到 VEX 指令（vpxor/vpshufb/vmovdqa…）就直接
+# 给 guest 发 SIGILL（gen_illegal_opcode）——这正是真机 AOT `exit -4`
+# 的来源（沙箱用真机逐位同版的 qemu 7.2 复现：默认参数通过、
+# `-cpu qemu64` 打出 rc=132 与真机逐位一致）。
+# x86_64 host 上 qemu-user 的默认模型含 AVX（实测 CPUID AVX=1），而
+# **arm64 host 构建包的默认模型行为不同**——真机一进 gen_snapshot 编译
+# 主循环就撞门。`-cpu max` = 暴露 TCG 支持的特性全集，把门全打开；
+# 对 x86 host 也无害（沙箱端到端验证过：真实 AOT 在 max 下跑到业务
+# 报错 rc=134，AVX 裸指令程序 rc=42 正常）。max 只暴露 TCG **支持**的
+# 特性，不会暴露翻译不了的指令，不引入新风险。
 if [ -x "@LOADER@" ]; then
-  exec @QEMU@ -L / "@LOADER@" "@REAL@" "$@"
+  exec @QEMU@ -cpu max -L / "@LOADER@" "@REAL@" "$@"
 fi
-exec @QEMU@ -L / "@REAL@" "$@"
+exec @QEMU@ -cpu max -L / "@REAL@" "$@"
 FOAWRAP
   # Bug 441：真身路径在这里显式写入（@REAL@ 用 # 作分隔符，避免路径里的
   # / 与 & 干扰 sed；路径不含 # 时安全）。
@@ -449,8 +462,13 @@ done
 #      判定必须用**退出码**，且紧邻捕获（管道会吞掉，见 Bug 443）。
 for bd in @PROJ@/build @PROJ@/build/app /root/projects/*/build /root/build; do
   [ -d "$bd" ] || continue
-  # app.dill 可能在 build/ 或 build/app/intermediates/... 下
-  dill=$(ls "$bd"/app.dill "$bd"/[a-z]*/app.dill 2>/dev/null | head -1)
+  # Bug 447（alpha.53）：app.dill 实际在
+  #   build/app/intermediates/flutter/release/app.dill
+  # —— 四层深。旧写法 `ls "$bd"/app.dill "$bd"/[a-z]*/app.dill` 只探两层，
+  # 真机上 kernel_snapshot 明明已经产出 dill（构建都走到 AOT 57% 了），
+  # 探针却报 `AOT_LOAD=skip(尚无 app.dill)`，白白浪费了一版最关键的裁决
+  # 证据。改用 find 深探（限深 6 层，避免扫穿整个 gradle 产物树）。
+  dill=$(find "$bd" -maxdepth 6 -name app.dill -type f 2>/dev/null | head -1)
   [ -n "$dill" ] || continue
   [ -f "$dill" ] || continue
   gsw=@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot
@@ -472,6 +490,26 @@ for bd in @PROJ@/build @PROJ@/build/app /root/projects/*/build /root/build; do
   esac
   echo "AOT_LOAD_OUT=$(head -3 "$ld_dir/out" 2>/dev/null | tr '\n' '~')"
   ls -la "$ld_dir/probe.so" 2>/dev/null | awk '{print "AOT_LOAD_SO=size="$5}'
+  # ---------------- Bug 447：默认 CPU 模型对照（裁决探针） ----------------
+  # 上面的 AOT_LOAD 走转发位（wrapper 已带 -cpu max）。这里**绕过 wrapper**
+  # 直接用裸 qemu（不带 -cpu）跑同一真身同一 dill，把两个退出码并排打出：
+  #   DEF=132 且 max=0/134 → 默认模型门控 SIMD 实锤，-cpu max 修复有效
+  #   两者都 132           → -cpu max 也救不了 → arm64 TCG 后端问题，
+  #                          下一步换 Debian trixie 静态 qemu 9.x
+  #   DEF=0/134            → 默认模型也没门，SIGILL 另有源头
+  dgs=@ENGINE@/android-arm64-release/linux-x64/gen_snapshot
+  if [ -x "$dgs" ]; then
+    ( cd "$ld_dir" && @QEMU@ -L / @LOADER@ "$dgs" --deterministic \
+        --snapshot_kind=app-aot-elf --elf="$ld_dir/def.so" "$dill" ) \
+        > "$ld_dir/defout" 2>&1
+    drc=$?
+    echo "AOT_LOAD_DEF=rc=$drc"
+    case "$drc" in
+      132) echo "AOT_LOAD_DEF=SIGILL(默认模型门控SIMD——-cpu max 修复的就是它)" ;;
+      0)   echo "AOT_LOAD_DEF=ok(默认模型也没门)" ;;
+      *)   echo "AOT_LOAD_DEF=rc$drc(非信号=环境好)" ;;
+    esac
+  fi
   rm -rf "$ld_dir"
   break
 done

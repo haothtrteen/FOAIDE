@@ -108,7 +108,11 @@ void main() {
       // 所以断言必须落在 fill() 之后的文本上（@QEMU@ 也会被一并替换）。
       final f = QemuCompat.fill(s);
       expect(f.contains('#!/bin/sh'), isTrue);
-      expect(f.contains('exec ${QemuCompat.qemuBin} -L /'), isTrue);
+      expect(f.contains('exec ${QemuCompat.qemuBin} -cpu max -L /'), isTrue);
+      // Bug 447：qemu 调用必须带 -cpu max（TCG 按 CPU 模型门控 SIMD 指令，
+      // arm64 host 上默认模型不含 AVX 位 → gen_snapshot 一碰 VEX 就 SIGILL）。
+      expect(f.contains('-cpu max -L /'), isTrue,
+          reason: 'Bug 447：转发 exec 行必须显式 -cpu max，绕开 CPU 模型门控');
       expect(f.contains('ld-linux-x86-64'), isTrue,
           reason: 'Bug 439：必须显式把 ld.so 交给 qemu，否则静默崩溃');
     });
