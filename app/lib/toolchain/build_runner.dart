@@ -400,6 +400,32 @@ exit 0
         // Bug 443：reassert 输出 REASSERT= + REASSERT_DART= 两行，
         // 且 `gen` 生成失败时会有 stderr。tail -n 2 太紧（会被 stderr
         // 顶掉正常行），放到 10 确保两行都在。
+        // ---------------- Bug 444：把 build 内部的构件下载提前 ----------------
+        // 真机链路（已由 flutter_tools 源码 + 沙箱目录结构双向证实）：
+        //   AOT 用的 gen_snapshot 路径 = `android-arm64-release/<host>/gen_snapshot`
+        //   （artifacts.dart `_getAndroidArtifactPath`：join(engineDir,
+        //    hostPlatformName, name)），hostPlatformName 由 `uname -m` 决定，
+        //   真机 Android 上 = `linux-arm64`。
+        //   而官方**没有** arm64 版的 android gen_snapshot
+        //   （artifacts.dart 的 TODO：flutter/flutter#152281），
+        //   `linux-arm64/` 目录下放的就是 x86_64 二进制 —— 必须靠转发脚本。
+        // 问题：flutter build 在 AOT 之前会检查构件是否就位、缺失则补下载。
+        //   （⚠️ 日志里的 `Flutter assets will be downloaded from ...` 是
+        //   **常驻提示**，构件已缓存时也会打印 —— 沙箱本次构建就打了这行
+        //   而并未真的下载。不能用它判断下载是否发生，别再拿它当证据。）
+        //   一旦真的下载，就会把 `linux-arm64/{gen_snapshot,impellerc,...}`
+        //   覆写成**裸 x86_64 ELF**，盖掉 reassert 刚放好的转发脚本 → SIGILL。
+        //   触发条件 = 构件缓存缺失（卸载重装 / 清数据 / 首次构建），
+        //   这也是"之前能构建、卸载重装后必崩"的原因。
+        // 修法：先跑 precache 让**下载发生在 reassert 之前**，reassert 再
+        //   重建转发层；此时构件已缓存，build 内部不会再下载 → 不会再覆盖。
+        //   `--android_gen_snapshot` 精确覆盖 AOT 那两个工具，universal
+        //   （impellerc/font-subset）默认 true 会一并带上。
+        // ⚠️ 这里的 `| tail -n 5` 是**故意**吞掉退出码做容错：precache
+        //   失败（网络/镜像抖动）不该中断构建，后面还有兜底重试。
+        //   （对比 Bug 443：那次是无意中被管道吞掉退出码，性质不同。）
+        'echo "---- 预取引擎构件（把 build 内部的下载提前）----"; '
+        '$flutterCmd precache --android_gen_snapshot 2>&1 | tail -n 5; '
         'sh -c ${_shq(reassert)} 2>&1 | tail -n 10; '
         '$flutterCmd build apk --no-shrink --release '
         '--target-platform=android-arm64$aapt2Override; '
@@ -409,10 +435,22 @@ exit 0
         // flutter build 内部下载引擎构件把转发层覆盖了（Bug 428 的
         // 变体：precache 发生在 build 过程中，而不是 pub get 阶段）。
         // 只在失败时跑，成功时不留噪音。
+        //
+        // Bug 444：确证被覆盖时**自愈重试一次**。
+        // 此时构件已下载完（第一次 build 内部下载过了），reassert 重建
+        // 转发层后再跑一次**不会再次覆盖**（缓存已就位）→ 第二次应当成功。
+        // 若指纹不含 RAW_ELF（转发层完好），说明崩溃另有原因，重试没有
+        // 意义 —— 不重试，不让用户白等一整轮。
         'brc=\$?; if [ "\$brc" != 0 ]; then '
         'echo "---- 构建后工具链指纹（对比上面的 AOT_FP）----"; '
-        'sh -c ${_shq(diag)} 2>&1 | grep -E "AOT_FP|QEMU_CHAIN_PROBE" '
-        '| tail -n 12; fi; exit \$brc';
+        'fp=\$(sh -c ${_shq(diag)} 2>&1 | grep -E "AOT_FP="); '
+        'echo "\$fp" | tail -n 12; '
+        'if echo "\$fp" | grep -q "RAW_ELF"; then '
+        'echo "FOA_HEAL=转发层在构建中被覆盖，重建后重试一次"; '
+        'sh -c ${_shq(reassert)} 2>&1 | tail -n 10; '
+        '$flutterCmd build apk --no-shrink --release '
+        '--target-platform=android-arm64$aapt2Override; brc=\$?; '
+        'fi; fi; exit \$brc';
   }
 
   /// 单引号包裹一段 shell 片段（内部单引号用 '\'' 转义）。
