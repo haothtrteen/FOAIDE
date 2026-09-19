@@ -3585,6 +3585,86 @@ AOT_LOAD_OUT=...dispatch_table_generator.cc: 432: error: Missing table selector 
 
 ---
 
+### Bug 447：真机 SIGILL 真因锁定——qemu TCG 按 CPU 模型门控 SIMD 指令；`-cpu max` 一行修复
+
+**日期**：2026-09-19（alpha.53）
+**症状**：真机 alpha.52 构建在 AOT 57% 崩：`gen_snapshot exit -4`（SIGILL）、
+`impellerc failure:` ×2（同样 -4）。转发层全程完好（`AOT_FP` 前后全 ok）、
+内存 8GB+、诊断探针全绿。`AOT_LOAD=skip(尚无 app.dill)`（这行本身是 Bug 447 的第二病灶，见下）。
+
+**真因（沙箱用真机逐位同版 qemu 复现锁定）**：
+
+1. **qemu TCG 对 SIMD 指令按 CPU 模型特性位门控**。CPU 模型没有 AVX 特性位时，
+   翻译器一碰到 VEX 指令就直接给 guest 发 SIGILL（`gen_illegal_opcode`），
+   **程序自己根本没机会看到这条指令**。
+2. gen_snapshot（objdump 全量清点）含 **10 种裸 AVX 指令**（vpxor/vpshufb/
+   vmovdqa/vmovdqu/vpaddd/vpalignr/vpshufd/vpslld/vpsrld/vpsrlq/vzeroupper，
+   无 AVX2/AVX-512），AOT 编译主循环必经。
+3. x86_64 host 上 qemu-user 的**默认 CPU 模型含 AVX**（实测 CPUID AVX=1/AVX2=1），
+   所以沙箱从来没复现过；**arm64 host 构建包的默认模型行为不同**——真机一进
+   编译主循环就撞门。
+
+**沙箱复现实验链**（Debian bookworm `qemu-user_7.2+dfsg-7+deb12u18+b3`，
+与真机 `QEMU_CHAIN_VER` 显示的版本**逐位一致**）：
+
+| 实验 | 结果 | 结论 |
+|---|---|---|
+| 裸 AVX 程序（vpxor/vpshufb，无 CPUID 保护），默认参数 | rc=42 通过 | x86 host 默认模型含 AVX |
+| 同一程序，`-cpu qemu64` | **rc=132 = SIGILL** | **与真机 exit -4 逐位一致，门控实锤** |
+| 同一程序，`-cpu max` | rc=42 通过 | max = TCG 支持全集，门全开 |
+| CPUID 探针（默认模型） | AVX=1 AVX2=1 XCR0 含 AVX 位 | 默认 = max 行为 |
+| 真机同链路（`-L /` + ld.so 显式加载）真实 AOT | rc=134 业务报错 | 链路形式无关 |
+| bookworm glibc 2.36 全链路（ld.so+libc 全 2.36） | rc=134 / avxtest rc=42 | **rootfs glibc 无关** |
+
+顺带证伪：`-cpu qemu64` 下连 `xgetbv` 都 SIGILL（XSAVE 特性位同样被门控）——
+门控机制覆盖所有特性相关指令，不止 AVX。
+
+**修复（alpha.53）**：
+
+1. **转发 exec 行显式 `-cpu max`**（`_wrapGenFunc` 两处）：
+   `exec @QEMU@ -cpu max -L / "@LOADER@" "@REAL@" "$@"`。
+   max 只暴露 TCG **支持**的特性，不会暴露翻译不了的指令；x86 host 上无害
+   （沙箱端到端验证过）。**一行级修复，不需要重写、不需要 qiling。**
+2. **修探针盲区**：`AOT_LOAD` 找 app.dill 的 glob `ls "$bd"/app.dill
+   "$bd"/[a-z]*/app.dill` 只探两层，而 dill 实际在
+   `build/app/intermediates/flutter/release/`（四层深）——alpha.52 真机日志
+   `AOT_LOAD=skip(尚无 app.dill)` 是**探针瞎，不是 dill 不存在**（kernel_snapshot
+   明明已经跑完才走到 AOT）。改 `find "$bd" -maxdepth 6 -name app.dill -type f`。
+3. **新增裁决探针 `AOT_LOAD_DEF=`**：绕过 wrapper，用裸 qemu（不带 -cpu）直接跑
+   同一真身同一 dill。真机日志上两个 rc 并排：
+   - `DEF=132` 且 `AOT_LOAD=0/134` → 门控实锤 + `-cpu max` 修复有效；
+   - 两者都 132 → max 也救不了 → arm64 TCG 后端问题，下一步换 Debian trixie
+     静态 qemu 9.x（静态二进制可直接放进 rootfs，无依赖）；
+   - `DEF=0/134` → 默认模型也没门，SIGILL 另有源头。
+
+**真机裁决树（alpha.53 日志怎么看）**：
+
+```
+AOT_LOAD=rc=0        → 真实 AOT 跑通，构建应成功 → 结案
+AOT_LOAD=rc=134/其它 → 环境好，程序自身报错（dill 元数据等）→ 看业务错
+AOT_LOAD=rc=132      → wrapper(-cpu max) 还 SIGILL → 看 AOT_LOAD_DEF
+  DEF=132            → max 也门死 → arm64 TCG bug，换 qemu 9.x 静态版
+  DEF=0/134          → 矛盾（不该发生）→ 回来找我
+```
+
+**教训**：
+
+- **"版本相同"不等于"行为相同"——host 架构是独立变量。** 同一份 qemu 源码包，
+  x86 build 与 arm64 build 的默认 CPU 模型行为不同。复现实验要连 host 一起对齐，
+  对不齐就要留一条"真机专属变量"的裁决探针。
+- **诊断探针的查找范围必须覆盖真实产物的真实深度。** 两层 glob 在沙箱里看着
+  正常（沙箱手工造的目录浅），真机的真实目录树深四层。**探针找不到东西时
+  首先怀疑探针瞎，其次才是"东西不存在"。**
+- **修复要带"裁决探针"一起发。** `-cpu max` 是基于强证据的修复，但 arm64 默认
+  模型这个最后一环只能真机验证——把 DEF 对照探针塞进同一版，若修复无效，
+  下一轮诊断信息已经就位，不用再发一版。
+- **用户问"要不要换方案"时，先把机制查透。** 本轮用户问"是不是要换 qiling /
+  proot 当翻译层"——查完发现 proot 根本不做指令翻译（它管环境，qemu 管翻译，
+  两层正交），qiling 与 qemu 同源（Unicorn 是 qemu 的库化 fork）踩同样的门控。
+  **概念澄清本身就是方案省。**
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
