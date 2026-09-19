@@ -3450,6 +3450,141 @@ target —— 转发层修好了也不会重新编译。所以自愈分支里先
 
 ---
 
+### Bug 446：三层诊断全绿、转发层全程完好，AOT 照样 SIGILL —— "能启动 ≠ 能编译"
+
+**症状**（真机 alpha.51）：
+
+```
+QEMU_CHAIN_PROBE=impellerc=ok rc=0          ← 探针正常（上一版这里是空的）
+AOT_FP=impellerc=wrapper ok(SLOT)           ← 构建前：全部 ok
+AOT_FP=impellerc=raw ok(REAL)
+AOT_FP=gen_snapshot=wrapper ok(SLOT)
+AOT_FP=gen_snapshot=raw ok(REAL)
+AOT_FP=font-subset=wrapper ok(SLOT)
+AOT_FP=dart=wrapper ok(SLOT)
+HEALED=0 / DART=ok / SNAPSHOT=ok
+REASSERT=10                                 ← 重建确实执行了
+REASSERT_DART=10
+...
+Dart snapshot generator failed with exit code -4
+impellerc failure:
+...
+---- 构建后工具链指纹（重新采集）----
+AOT_FP=impellerc=wrapper ok(SLOT)           ← 崩完之后：**仍然全 ok**
+AOT_FP=gen_snapshot=wrapper ok(SLOT)
+...
+```
+
+**这份日志的价值在于它证伪了前面几版的假设**：转发层**构建前后都是完好的**，
+`REASSERT=10` 也确实重建了 10 个文件 —— 可 AOT 还是 SIGILL。
+**所以问题跟转发层无关，Bug 444/445 一直在治一个不存在的病。**
+
+**原因**：一个从未被覆盖的**诊断盲区** —— **所有探针都只测 `--help`**。
+
+| 探针 | 调用形态 | 实际覆盖到的代码路径 |
+|---|---|---|
+| `QEMU_CHAIN_PROBE` | `impellerc --help` | 打印帮助 → 退出 |
+| `smoke()` | `gen_snapshot --help` | 打印帮助 → 退出 |
+| **真机 AOT** | `--snapshot_kind=app-aot-elf` | **分配大内存 + 长时间编译 + 向量指令** |
+
+反汇编实测（`objdump`）真机那份 `gen_snapshot` 含大量 VEX 编码的 AVX 指令：
+
+```
+32 vpxor    24 vpaddd    20 vpsrld    16 vpsrlq
+12 vpshufb  11 vmovdqa    8 vpslld     8 vpshufd
+```
+
+`vpshufb`/`vpxor` 这类正是**编译启动阶段算哈希**用的。而 `--help` 打印完就退出，
+**根本走不到这些代码路径**。
+
+> **"能启动" ≠ "能编译"。** 三层诊断一直报绿灯，是因为它们测的是一件
+> 跟失败无关的事。
+
+**排查过程中被排除的假设**（都靠沙箱实验证伪，避免继续瞎猜）：
+
+| 假设 | 实验 | 结论 |
+|---|---|---|
+| 转发层被覆盖 | 构建前后 `AOT_FP` 对照 | ❌ 全程 ok |
+| 内存不足被 OOM 杀 | 用户确认设备内存 | ❌ 8GB+ |
+| 缺 amd64 运行库 | 解析 ELF `NEEDED` | ❌ 只依赖 libc/libm/libdl/libpthread，全已装 |
+| qemu 不支持 AVX | 沙箱装 qemu-user 跑 AVX 程序 + CPUID 对照 | ❌ AVX/AVX2/XSAVE 均正常暴露 |
+| gen_snapshot 二进制本身坏 | 沙箱原生跑真实 AOT | ❌ 能完整走完编译流程 |
+
+最后一条尤其关键：在沙箱（原生 x86_64）直接跑真机那份 `gen_snapshot` 做真实 AOT，
+得到 **`rc=134`（SIGABRT）+ 业务报错**（dill 缺 TFA）——
+**它自己主动 abort，不是被信号杀死的**。这证明**二进制没问题**，
+且"真实 AOT 负载"在原生环境下能跑。
+
+**解决**：加**真实 AOT 负载探针**（`AOT_LOAD=`），测负载而不是测启动。
+
+```sh
+gsw=@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot
+ld_dir=/tmp/.foa_aotload_$$
+( cd "$ld_dir" && "$gsw" --deterministic --snapshot_kind=app-aot-elf \
+    --elf="$ld_dir/probe.so" "$dill" ) > "$ld_dir/out" 2>&1
+lrc=$?                              # 紧邻捕获，不许过管道（Bug 443）
+case "$lrc" in
+  0)   echo "AOT_LOAD=ok（真实 AOT 负载跑通）" ;;
+  132) echo "AOT_LOAD=SIGILL（qemu 在编译负载下崩 —— 真机那个 exit -4 就是这个）" ;;
+  139) echo "AOT_LOAD=SIGSEGV" ;;
+  134) echo "AOT_LOAD=SIGABRT" ;;
+  *)   echo "AOT_LOAD=rc$lrc（非信号退出=程序自身报错，执行环境是好的）" ;;
+esac
+```
+
+设计要点（每一条都是前面踩过的坑的直接产物）：
+- **输入用真实的 `app.dill`**（上一次 `KernelSnapshot` 的产物），不是玩具样本；
+- **判据用退出码**，且**区分信号退出（128+n）与程序自身报错** ——
+  这是本探针的核心价值：`132` = 环境承载不了，`134`/其它 = **环境是好的**；
+- **在 `/tmp` 临时目录里跑**（Bug 445 教训：诊断不许有副作用）；
+- **rc 紧邻捕获**，不过管道（Bug 443 教训）；
+- **失败不阻断构建**（它只是观测）。
+
+沙箱实测探针输出（用真实 dill）：
+
+```
+AOT_LOAD=begin dill=...app.dill size=8620880
+AOT_LOAD=rc=134
+AOT_LOAD=SIGABRT
+AOT_LOAD_OUT=...dispatch_table_generator.cc: 432: error: Missing table selector metadata!~
+```
+
+**验证**：
+
+| 验证项 | 结果 |
+|---|---|
+| 探针用真实 AOT 参数（非 `--help`） | `--snapshot_kind=app-aot-elf` ✅ |
+| 输入为真实 app.dill | 接受 `@PROJ@/build/app.dill` ✅ |
+| 判据用退出码且区分 132/134 | ✅ |
+| rc 捕获不过管道 | 正则反证 ✅ |
+| 探针无副作用（临时目录 + 清理） | ✅ |
+| 端到端真实执行 | 沙箱跑出 `rc=134` + 业务报错 ✅ |
+| `flutter analyze lib/ test/` | `No issues found!` ✅ |
+| `flutter test` | **251 项全绿**（新增 7 项）✅ |
+
+**出现版本**：v0.1.0-alpha.51（问题自始存在，只是此前被其他故障掩盖）
+**修复版本**：v0.1.0-alpha.52（**注意：本版是诊断增强，不是修复**——
+根因尚未确定，见下）
+
+**教训**：
+
+- **⚠️ 探针必须覆盖"真实负载"，不能只覆盖"能否启动"。**
+  我连加三层诊断都在测 `--help`，而失败发生在 `--help` 走不到的代码路径上。
+  **加探针前先问：我测的这件事，跟失败的那件事是同一件吗？**
+- **用户的否定性回答能砍掉整片搜索空间。** 我问了两个问题：
+  「以前成功过吗」→ **从来没成功过**（推翻"回归"假设，不用去找哪个版本改坏）；
+  「内存多少」→ **8GB+**（推翻 OOM 假设）。
+  两条信息各自砍掉一半方向，比我自己猜十轮都管用。
+  **不确定时先问，别硬猜。**
+- **"构建前后状态相同"是极强的证伪信号。** 日志里构建前后 `AOT_FP` 都是 ok ——
+  这说明**被测对象根本没变化**，那么"它被破坏"这个假设一定错。
+  **看到这种日志要立刻换方向，而不是加更多同方向的诊断。**
+- **假设要用实验证伪，不要用推理排除。** 我列的五个假设（转发层/内存/库/
+  AVX/二进制）全部做了实验，其中"qemu 不支持 AVX"这条我一度很确信，
+  实验做完发现是错的。**确信度不能替代验证。**
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
