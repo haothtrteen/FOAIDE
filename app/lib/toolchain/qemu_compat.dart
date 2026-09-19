@@ -344,6 +344,30 @@ for tool in @ENGINE@/linux-arm64/impellerc @ENGINE@/android-arm64-release/linux-
   fi
   break
 done
+# ---------------- Bug 443：AOT 工具链指纹 ----------------
+# 症状：诊断段全绿（impellerc --help 正常），但 AOT 跑到 50%+ 崩 exit -4。
+# 说明**诊断时刻**与**编译时刻**的工具链状态不同。
+# 中间最可疑的动作是 flutter 自己下载引擎构件（日志会打
+# "Flutter assets will be downloaded"）。所以这里把所有 AOT 相关工具的
+# **转发层是否在位**统一快照一遍，供与崩溃后状态对比。
+#
+# 判据用「文件头」而不是「文件存在」：转发脚本是 `#!`，
+# 真 x64 二进制是 `7f454c46`，被 pub get 覆盖后会变回后者。
+for u in \
+  @ENGINE@/linux-arm64/impellerc \
+  @ENGINE@/linux-x64/impellerc \
+  @ENGINE@/android-arm64-release/linux-arm64/gen_snapshot \
+  @ENGINE@/android-arm64-release/linux-x64/gen_snapshot \
+  @ENGINE@/linux-arm64/font-subset \
+  @FLUTTER@/bin/cache/dart-sdk/bin/dart ; do
+  [ -e "$u" ] || { echo "AOT_FP=$(basename "$u")=missing"; continue; }
+  h=$(dd if="$u" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  case "$h" in
+    2321*)    echo "AOT_FP=$(basename "$u")=wrapper" ;;
+    7f454c46) echo "AOT_FP=$(basename "$u")=RAW_ELF（真 x64 二进制，未经转发 → 必 SIGILL）" ;;
+    *)        echo "AOT_FP=$(basename "$u")=other:$h" ;;
+  esac
+done
 echo "QEMU_CHAIN_DONE=1"
 ''';
 
@@ -463,6 +487,15 @@ smoke() {
   # Bug 437：失败时必须输出**具体原因**。原先只输出 yes/no，
   # 真机上无法区分「脚本缺失」「目标 x64 二进制被覆盖」「依赖库找不到」
   # 「SIGILL」——而这四种的修法完全不同。诊断信息才是这条命令的价值。
+  #
+  # Bug 443：⚠️ 这里之前有个**致命缺陷**：
+  #     o=$( "$t" --help 2>&1 | head -5 )
+  #     r=$?          # ← 这是 **head** 的退出码，恒为 0！
+  #   管道会把 `$?` 变成管道**最后一段**的退出码。于是：
+  #     - `[ "$r" -ge 128 ]`（信号退出）这一分支**是死代码**，从没生效过
+  #     - 真机 SIGILL 崩掉时，我们只看到 "无输出（rc=0）"，定位不到信号
+  #   修法与 Bug 438 的 QEMU_CHAIN_PROBE 一致：**先落盘再读**，
+  #   这样 `$?` 紧邻被调程序，拿到的是它的真实信号退出码。
   t="$1"; n="$2"
   if [ ! -x "$t" ]; then echo "$n=no"; echo "  $n: 文件不存在或不可执行"; return; fi
   if ! head -c 2 "$t" 2>/dev/null | grep -q '#!'; then
@@ -470,8 +503,12 @@ smoke() {
     echo "  $n: 不是转发脚本（真 x64 二进制，arm64 上必 SIGILL）"
     return
   fi
-  o=$( "$t" --help 2>&1 | head -5 )
-  r=$?
+  st=/tmp/.foa_smoke_out
+  : > "$st"
+  "$t" --help > "$st" 2>&1
+  r=$?                                  # 紧邻调用，拿到真实退出码
+  o=$(head -5 "$st" 2>/dev/null)
+  rm -f "$st"
   case "$o" in
     *'cannot execute'*|*'Exec format'*)
       echo "$n=no"; echo "  $n: Exec format error（qemu 未生效或未安装）"; return ;;

@@ -375,9 +375,18 @@ exit 0
         'FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn '
         'sh -c ${_shq(stampFix)} 2>&1 | tail -n 1; '
         // Bug 438：qemu 链路预检（输出 QEMU_CHAIN_* 供真机排障）
-        'sh -c ${_shq(diag)} 2>&1 | tail -n 12; '
-        // Bug 441：还原被误包装的文件（输出 HEALED=/SNAPSHOT=）
-        'sh -c ${_shq(heal)} 2>&1 | tail -n 3; '
+        //
+        // Bug 443：行数上限必须**留足余量**。之前是 tail -n 12，
+        // 但预检失败时每行诊断会多带一行原因（Bug 437 加的），
+        // 再加 flutter 自身的 stderr 混入，12 行会把**开头几行挤掉**——
+        // 而 qemu 版本/加载器状态恰恰在最前面。真机上表现为
+        // "日志里没有 REASSERT="，让人以为兜底没跑。
+        // 宁可多打几行，也不要丢诊断信息。
+        'sh -c ${_shq(diag)} 2>&1 | tail -n 30; '
+        // Bug 441：还原被误包装的文件（输出 HEALED=/DART=/SNAPSHOT=）
+        // Bug 443：heal 现在会输出 HEALED + DART + SNAPSHOT 三行，
+        // 再叠上可能的 stderr，tail -n 3 会截掉前面。放到 10。
+        'sh -c ${_shq(heal)} 2>&1 | tail -n 10; '
         'ok=0; '
         'for src in https://pub.flutter-io.cn '
         'https://mirrors.tuna.tsinghua.edu.cn/dart-pub '
@@ -388,9 +397,22 @@ exit 0
         '[ "\$ok" = 1 ] || exit 69; '
         'export PUB_HOSTED_URL=\$src; '
         // Bug 433 转发层再断言（pub get 后、build 前，同一 shell）
-        'sh -c ${_shq(reassert)} 2>&1 | tail -n 2; '
+        // Bug 443：reassert 输出 REASSERT= + REASSERT_DART= 两行，
+        // 且 `gen` 生成失败时会有 stderr。tail -n 2 太紧（会被 stderr
+        // 顶掉正常行），放到 10 确保两行都在。
+        'sh -c ${_shq(reassert)} 2>&1 | tail -n 10; '
         '$flutterCmd build apk --no-shrink --release '
-        '--target-platform=android-arm64$aapt2Override';
+        '--target-platform=android-arm64$aapt2Override; '
+        // Bug 443：构建失败时**再快照一次** AOT 工具链指纹。
+        // 目的是把「构建前 vs 构建后」的转发层状态摆在一起对比：
+        // 若构建前是 wrapper、构建后变 RAW_ELF，就能确证是
+        // flutter build 内部下载引擎构件把转发层覆盖了（Bug 428 的
+        // 变体：precache 发生在 build 过程中，而不是 pub get 阶段）。
+        // 只在失败时跑，成功时不留噪音。
+        'brc=\$?; if [ "\$brc" != 0 ]; then '
+        'echo "---- 构建后工具链指纹（对比上面的 AOT_FP）----"; '
+        'sh -c ${_shq(diag)} 2>&1 | grep -E "AOT_FP|QEMU_CHAIN_PROBE" '
+        '| tail -n 12; fi; exit \$brc';
   }
 
   /// 单引号包裹一段 shell 片段（内部单引号用 '\'' 转义）。

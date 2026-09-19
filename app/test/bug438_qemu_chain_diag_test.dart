@@ -53,7 +53,20 @@ void main() {
         envPart: '',
         aapt2Override: '',
       );
-      expect(cmd.indexOf('QEMU_CHAIN_DONE') < cmd.indexOf('pub get'), isTrue);
+      // 判据要落在**实际执行 pub get 的那条语句**上，不能用裸的
+      // `indexOf('pub get')` —— 代码注释里也会出现 "pub get" 字样
+      // （Bug 423/433/443 的说明都提到它），一旦注释排在预检前面，
+      // indexOf 就会命中注释，断言误报失败。
+      // 真机上这条测试保护的是"预检早于 pub get 执行"，
+      // 所以找真正的命令形态 `flutter pub get;`
+      // （`$flutterCmd` 在 Dart 层已插值为 `flutter`）。
+      final preflight = cmd.indexOf('QEMU_CHAIN_DONE');
+      final pubGetCmd = cmd.indexOf('flutter pub get;');
+      expect(preflight, greaterThanOrEqualTo(0));
+      expect(pubGetCmd, greaterThanOrEqualTo(0),
+          reason: '构建命令里必须有真正的 pub get 调用');
+      expect(preflight < pubGetCmd, isTrue,
+          reason: '预检必须排在 pub get 命令之前（注释里提及不算）');
     });
 
     test('分层覆盖：qemu 本体 / 动态链接器 / 真实 x64 二进制 / 目标架构', () {
