@@ -54,11 +54,21 @@ void main() {
       // 直接检查再断言脚本本体——比在拼好的命令里按 "sh -c '" 切片稳，
       // 因为 Bug 436 之后命令里还有其它 sh -c 片段（版本检查 stamp），
       // 按位置切片会切错对象。
+      //
+      // ⚠️ 判据要落在「**可执行行**」上，不能对整个脚本做 contains。
+      // Bug 442 加了一段注释解释「dart-sdk/bin 是 pub get / flutter build
+      // 的入口」，注释里出现了 "pub get" 这个词，于是这条测试误报失败。
+      // 测试的**意图**是"脚本不得执行 pub get"，不是"脚本文本里不得出现
+      // 这几个字"——注释是文档，不产生行为。所以这里过滤掉注释行。
       const s = QemuCompat.wrapReassertScript;
-      expect(s.contains('pub get'), isFalse,
-          reason: '再断言脚本内不得再跑 pub get');
-      expect(s.contains('precache'), isFalse,
-          reason: '前置检查已确保构件存在，再断言不该 precache');
+      final codeLines = s
+          .split('\n')
+          .where((l) => !l.trimLeft().startsWith('#'))
+          .join('\n');
+      expect(codeLines.contains('pub get'), isFalse,
+          reason: '再断言脚本内不得再跑 pub get（注释里提及不算）');
+      expect(codeLines.contains('precache'), isFalse,
+          reason: '前置检查已确保构件存在，再断言不该 precache（注释里提及不算）');
     });
 
     test('命令里注入的再断言脚本确实是 wrapReassertScript', () {

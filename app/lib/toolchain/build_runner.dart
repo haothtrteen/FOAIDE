@@ -526,6 +526,17 @@ exit 0
       tip = '工具链文件被误包装成转发脚本（非 ELF 被送进加载器）：'
           '构建前会自动还原（HEALED=）；若本条仍出现，到「工具链」页执行'
           '一次「一键应用」重建转发层后重试（Bug 441）';
+    } else if (l.contains('illegal instruction')) {
+      // Bug 442：**这条必须排在 'exit code -4' 那组之前**。
+      // pub get 阶段的 SIGILL 与 AOT 阶段的 SIGILL 是完全不同的两件事：
+      //   - AOT/shader 阶段（有 'impellerc' / 'snapshot generator' 上下文）
+      //     → 引擎转发层被 precache 覆写，是 Bug 428/437
+      //   - 但 `Illegal instruction` 出现在 **pub get 前后、无编译上下文**
+      //     → dart-sdk/bin 的转发层丢了，arm64 直接跑 x64 的 dart，是 Bug 442
+      // 若不加这个分支，用户看到的是"重新应用兼容层"这种无关建议。
+      tip = '工具链入口（dart-sdk/bin）的转发层丢失：arm64 直接执行了 x64 的 '
+          'dart。构建前会自动重建（看日志 REASSERT_DART=）——若 REASSERT_DART '
+          '为 0 而本条仍出现，到「工具链」页「重新应用」x64 兼容层后重试（Bug 442）';
     } else if (l.contains('exec format error')) {
       tip = '架构不匹配：x64 工具未经 qemu 转发（工具链页 → x64 兼容层 → 重新应用）';
     } else if (l.contains(': not found')) {

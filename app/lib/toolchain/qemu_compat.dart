@@ -208,6 +208,7 @@ echo "FLUTTER_WRAPPED=$n"
   /// 所以不需要 precache 分支，脚本很小、秒级完成。
   static const String wrapReassertScript = r'''
 E=@ENGINE@
+F=@FLUTTER@
 [ -d "$E" ] || exit 0
 __FOA_GEN__
 put() {
@@ -237,6 +238,29 @@ for hd in "$E"/linux-*/; do
   for f in "$hd"/*; do put "$f" "$ha/${f##*/}"; done
 done
 echo "REASSERT=$n"
+# ---------------- Bug 442：dart-sdk/bin 转发层再断言 ----------------
+# 这里**原地**包装（真身就在同目录），不是 put 到别处，所以单独一段。
+# 为什么必须有：dart-sdk/bin 是 pub get / flutter build 的**入口**
+# （flutter bash 脚本第一件事就是exec dart）。之前 reassert 只管引擎
+# 目录，一旦 dart-sdk/bin 的转发层被破坏（如 alpha.48 的自愈误还原），
+# **没有任何东西会把它修回来** → 一条命令都跑不了，exit 69。
+# 判据与引擎层一致：只看 ELF 魔数 + 是否已是转发脚本，幂等。
+if [ -d "$F/bin/cache/dart-sdk/bin" ]; then
+  for f in "$F/bin/cache/dart-sdk/bin"/*; do
+    [ -f "$f" ] || continue
+    [ -x "$f" ] || continue
+    case "$f" in *.foa-real) continue ;; esac
+    case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
+    # 已是转发脚本 → 幂等跳过（Bug 428 判据：看头 2 字节而不是看文件存在）
+    if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
+    m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    case "$m" in 7f454c46*3e) ;; *) continue ;; esac
+    mv "$f" "$f.foa-real"
+    gen "$f" "$f.foa-real"
+    n=$((n+1))
+  done
+fi
+echo "REASSERT_DART=$n"
 ''';
 
   /// Bug 438：构建前的 qemu 链路预检。
@@ -775,24 +799,74 @@ F=@FLUTTER@
 E=@ENGINE@
 S=@SDK@
 n=0
-# 1) dart-sdk/bin：dart / dartaotruntime 等（Bug 433 时代就有的包装点）
+# ⚠️⚠️ 改这个脚本之前必须读完整段注释 ⚠️⚠️
+#
+# Bug 442（我引入的回归）：alpha.48 的自愈**把正常包装也还原了**。
+#
+# 旧判据是「X.foa-real 存在 → 还原」，这个判据是**错的**。
+# `.foa-real` 有两种来源，旧判据无法区分：
+#
+#   (A) 正常包装产物 —— dart-sdk/bin/dart 这类。`dart` 是转发脚本，
+#       `dart.foa-real` 是它的 x64 真身。**两个文件都必须在**，
+#       这是转发层的正常形态，绝不能还原。
+#   (B) 真正的损坏 —— 转发脚本本身内容坏了（如 Bug 441 的 $2 残留），
+#       此时正确修复是**重建转发脚本**，而**不是**把真身搬回来
+#       （搬回来只会得到一个 arm64 上跑不了的 x64 二进制）。
+#
+# 真机后果（alpha.48）：HEALED=22 → dart-sdk/bin 下 22 个工具全部
+# 被还原成 x64 ELF、转发脚本全没了 → pub get 调 dart = arm64 上直接
+# 执行 x64 ELF → Illegal instruction ×5 → 三个源六次重试全挂 → exit 69。
+#
+# 而 reassert **只覆盖引擎目录**（$E/android-*/linux-x64、$E/linux-*），
+# 根本不管 dart-sdk/bin → 还原之后没有任何东西把它包回去。
+#
+# ---------------- 修正后的判据 ----------------
+# 一个 .foa-real 只有在「它的兄弟文件不是一个有效的 FOA 转发脚本」时
+# 才算孤儿，才需要处理。判据：
+#
+#   X.foa-real 存在 且 X 是有效 FOA 脚本 且 X 指向的 qemu 存在
+#                     → 正常包装，**跳过**
+#   否则（X 不存在 / X 不是 FOA 脚本 / qemu 缺失）
+#                     → 异常，还原（至少让文件恢复成可辨识的形态）
+#
+# ⚠️ **宁可跳过、不可误还原**：这个方向的取舍不是随意的。
+#    - 误判为"合法"而跳过的代价：保持现状。**reassert 会无条件按
+#      ELF 魔数重建它**，所以照样能恢复（reassert 不看这个判据）。
+#    - 误判为"孤儿"而还原的代价：把好好的转发层毁掉 —— 这正是 Bug 442。
+#    代价不对称，所以判据往"保守"一侧收。
+#
+# 另外：**snapshot 从来不是被包装者**。包装要求 `[ -x ]` + ELF 魔数
+# `7f454c46*3e`，而 flutter_tools.snapshot 是 `dcdcf6f6` 且无 +x，
+# 三道包装关卡全都过不去。Bug 441 里它只是**受害者**——是被错位的
+# 转发脚本把它的路径喂进了 ld.so。所以这里**不需要、也不应该**
+# 为 snapshot 做任何"还原"。
+heal_one() {
+  f="$1"                 # 形如 .../X.foa-real
+  b="${f%.foa-real}"     # 对应的 X
+  # 兄弟是有效 FOA 转发脚本（且其 qemu 真的存在）→ 正常包装，保持原样
+  if [ -e "$b" ] && head -c 2 "$b" 2>/dev/null | grep -q '#!' &&
+     grep -q 'FOA x86_64 -> qemu-user wrapper' "$b" 2>/dev/null; then
+    return 0
+  fi
+  # 兄弟缺失 or 不是 FOA 脚本 → 还原真身（至少让文件恢复可用形态）
+  rm -f "$b"
+  mv "$f" "$b"
+  n=$((n+1))
+  return 0
+}
+# 1) dart-sdk/bin：dart / dartaotruntime 等（正常包装的主战场）
 if [ -d "$F/bin/cache/dart-sdk/bin" ]; then
   for f in "$F/bin/cache/dart-sdk/bin"/*.foa-real; do
     [ -f "$f" ] || continue
-    b="${f%.foa-real}"
-    rm -f "$b"
-    mv "$f" "$b"
-    n=$((n+1))
+    heal_one "$f"
   done
 fi
-# 2) flutter 根：bug 441 的受害面——snapshot 等非可执行文件若被包过，还原
+# 2) flutter 根（bin/cache 顶层）。这里正常不该有 .foa-real；
+#    若有，同样的判据处理（不要按扩展名一刀切还原）。
 if [ -d "$F/bin/cache" ]; then
   for f in "$F/bin/cache"/*.foa-real; do
     [ -f "$f" ] || continue
-    b="${f%.foa-real}"
-    rm -f "$b"
-    mv "$f" "$b"
-    n=$((n+1))
+    heal_one "$f"
   done
 fi
 # 3) SDK build-tools / platform-tools
@@ -800,19 +874,30 @@ for d in "$S"/build-tools/* "$S"/platform-tools; do
   [ -d "$d" ] || continue
   for f in "$d"/*.foa-real; do
     [ -f "$f" ] || continue
-    b="${f%.foa-real}"
-    rm -f "$b"
-    mv "$f" "$b"
-    n=$((n+1))
+    heal_one "$f"
   done
 done
 echo "HEALED=$n"
-# 顺带断言：snapshot 必须以 Dart 快照魔数开头（不是 ELF、更不是 #!）
+# ---------------- 转发层完整性断言（Bug 442 新增） ----------------
+# 关键不变量：dart-sdk/bin/dart 必须是**转发脚本**，不能是 x64 ELF。
+# 这条断言就是 Bug 442 的直接探针——如果 HEALED 又把 dart 还原了，
+# 这里会立刻报 DART=ELF_BROKEN，而不是等 pub get 报 Illegal instruction。
+if [ -e "$F/bin/cache/dart-sdk/bin/dart" ]; then
+  dh=$(od -An -tx1 -N 4 "$F/bin/cache/dart-sdk/bin/dart" 2>/dev/null | tr -d ' \n')
+  case "$dh" in
+    2321*)    echo "DART=ok（转发脚本在位）" ;;
+    7f454c46) echo "DART=ELF_BROKEN（dart 是裸 x64 二进制，转发层丢失 → 一定会 SIGILL）" ;;
+    *)        echo "DART=unexpected:$dh" ;;
+  esac
+else
+  echo "DART=missing"
+fi
+# snapshot 体检：确认它没被任何东西破坏（应当永远是 dart 快照魔数）
 if [ -f "$F/bin/cache/flutter_tools.snapshot" ]; then
   h=$(od -An -tx1 -N 4 "$F/bin/cache/flutter_tools.snapshot" 2>/dev/null | tr -d ' \n')
   case "$h" in
     dcdcf6f6) echo "SNAPSHOT=ok" ;;
-    2321*)    echo "SNAPSHOT=SCRIPT_BROKEN（仍是转发脚本，还原未生效）" ;;
+    2321*)    echo "SNAPSHOT=SCRIPT_BROKEN（被当成可执行文件包装过）" ;;
     *)        echo "SNAPSHOT=unexpected:$h" ;;
   esac
 fi
