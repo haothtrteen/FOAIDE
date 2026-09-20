@@ -4218,6 +4218,143 @@ if (SDK_INT < 35 && style.statusBarColor != null) window.setStatusBarColor(color
 
 ---
 
+### Bug 460：Kotlin 编译期才发现的 `Map<String, Any?>` 类型错——以及它掩盖的"错误文案静默消失"（2026-09-19，alpha.62 修复）
+
+**症状**：
+
+`flutter analyze` 7 条基线全绿、`flutter test` 589 项全过，
+但 `./gradlew :app:compileDebugKotlin` 直接编译失败：
+
+```
+e: MainActivity.kt:1016:16 Return type mismatch:
+   expected 'Map<String, Any>', actual 'Map<String, Any?>'.
+e: MainActivity.kt:1058:16 Return type mismatch:
+   expected 'Map<String, Any>', actual 'Map<String, Comparable<*>? & Serializable?>'.
+```
+
+**原因**：两层，第二层比第一层严重得多。
+
+**第一层（类型）**：`prorootInstall()` / `prorootProbe()` 声明返回
+`Map<String, Any>`，但内部 `mapOf(...)` 里 `"error" to <可空表达式>` ——
+成功时是 `null`、失败时是 `String`。Kotlin 把整个 map 推成
+`Map<String, Any?>`，而 `Map` 的值在 `out` 位置是**协变**的：
+`Map<String, Any?>` 允许空值，赋给承诺"值非空"的 `Map<String, Any>`
+就是打破承诺，Kotlin 直接拒绝。
+
+**第二层（语义，真问题）**：`prorootProbe()` 里有一行
+
+```kotlin
+if (built.cmd == null) return built.error!!
+```
+
+`built` 是 `ProotCmd`，它的 `error` 字段装的是 **`fail()` 的形状**
+（键 `exitCode`/`stdout`/`stderr`），而 Dart 侧
+`ProrootProbeResult.fromMap` 读的是 **`m['error']`**。也就是说：
+proroot 命令构造失败时，返回的 map 里**根本没有 `error` 键**，
+Dart 拿到的是一个只有 `exitCode`/`stdout`/`stderr` 的 map →
+`error` 恒为 `null` → UI 只能显示兜底文案。
+
+这个缺陷**编译不报错、analyze 不报错、单测不跑就发现不了**，
+只在真机上表现为"点了没反应，也没说为什么"。
+
+> 值得记一笔的是：这个类型错误**帮我们逮到了一个语义错误**。
+> 如果当初写的是 `Map<String, Any?>`，它会安安静静地编译通过，
+> 然后把错误文案吞掉——直到用户来报"proroot 装不上，但没告诉我为什么"。
+
+**解决**：
+
+> 这次修了**两轮**才过，过程本身有信息量，一并记下。
+
+**第一轮**（修掉最初的 2 个 e:）：
+
+1. 新增 `prorootFail(code, message)`：**proroot 专用**的失败构造器，
+   产出 `mapOf("ok" to false, "error" to message, "exitCode" to code)`。
+2. `prorootStatus` / `prorootInstall` / `prorootRemove` / `prorootProbe`
+   四处签名改 `Map<String, Any?>`，`mapOf` 显式写 `mapOf<String, Any?>(...)`。
+3. `buildProrootCmd()` 里两处 `fail(...)` 改 `prorootFail(...)`。
+4. `prorootProbe()` 里 `return built.error!!` 改了。
+
+**第二轮**（第一轮的改动**连锁**出 3 个新 e:）——这是本题最有价值的部分：
+
+```
+e: MainActivity.kt:1085:38 Argument type mismatch:
+   actual type is 'Any', but 'String' was expected.
+e: MainActivity.kt:1167:17 Argument type mismatch:
+   actual type is 'Map<String, Any?>', but 'Map<String, Any>?' was expected.
+e: MainActivity.kt:1180:35 同上
+```
+
+原因是我只改了 `prorootFail` 的**返回类型**，没改
+`ProotCmd.error` 的**字段类型**——它还是 `Map<String, Any>?`。
+于是 `prorootFail(...)` 的返回值塞不进 `ProotCmd`。
+Kotlin 顺着这条线把**所有**依赖 `ProotCmd.error` 的地方都报了出来：
+
+| 位置 | 报错 | 说明 |
+| --- | --- | --- |
+| 1085 | `Any` 不是 `String` | `built.error` 从 `Map<String,Any>?` 松成 `Map<String,Any?>?` 后，`?: "兜底"` 的**推导类型变成 `Any`** |
+| 1167 / 1180 | `Map<String,Any?>` 塞不进 `Map<String,Any>?` | `prorootFail` 的返回值 vs `ProotCmd.error` 的旧类型 |
+
+对应修法：
+
+- `ProotCmd` 加 `?`：`val error: Map<String, Any?>?`
+- 1085 处改成**显式取值**而不是整块 map 当字符串用：
+  `built.error?.get("error") as? String ?: "proroot 命令构造失败"`
+- 剩下三处 `return built.error!!`（`exec` / `execStream` / `ptyStart`）
+  → `return built.error ?: fail(-500, "命令构造失败（无错误详情）")`
+
+> **为什么保留 `built.error!!` 的"透传"语义**：这三个方法走的是
+> **proot 路径**（`buildProotCmd`），它给的是 `fail()` 形状，
+> 而这三个方法的 Dart 消费者（`ProotResult`）正好读 `stderr`——
+> 形状是对上的，透传没问题。真正的问题只在于 `!!` 会在
+> "cmd 为 null 但 error 也为 null"（不该发生）时抛 NPE。
+
+**一句话总结这次的连锁反应**：改一个**跨类型共用的构造器**，
+它会沿着"字段类型 → 所有消费者"这条链把隐藏的不一致全炸出来。
+这不是坏事——**第二个 e: 报的 1167/1180 就是"两种形状共用一个字段"的账单**。
+5. `ProotCmd` 的文档注释写清 **`error` 字段装两种形状的 map** 这件事：
+   `buildProotCmd()` 走 `fail`（`stderr`），`buildProrootCmd()` 走
+   `prorootFail`（`error`），Dart 侧消费者各自知道该读哪个键。
+
+**验证**：
+
+- `./gradlew :app:compileDebugKotlin` 通过（BUILD 无 error 输出）。
+- `platform/android/MainActivity.kt` 同步（diff 为空，2207 行）。
+- `test/proroot_integration_test.dart` 新增 4 项「桥接键名契约」断言：
+  ①`prorootFail` 存在且 map 含 `"error" to message`；
+  ②`ProrootProbeResult.fromMap` 读的 5 个键在 `prorootProbe` 里都有产出；
+  ③`ProrootInstallResult.fromMap` 读的 5 个键在 `prorootInstall` 里都有产出；
+  ④四处含可空值的签名必须显式 `Any?`。共 **27/27 通过**。
+
+**教训**：
+
+- **`flutter analyze` 通过 ≠ Kotlin 能编译**。analyze 只看 Dart，
+  Kotlin 的编译期类型检查只有 gradle 会做。改过 `MainActivity.kt` /
+  `PtySession.kt` 就必须跑 `:app:compileDebugKotlin`——这条已进 SKILL 第 2 步。
+- **跨语言的 map 键名契约是最脆的一类接口**。Kotlin 返回 map、
+  Dart 用 `fromMap` 读，两侧都是**字符串**，编译器帮不上任何忙。
+  这类接口必须配静态断言测试（本项目已有先例：Dart↔Kotlin 协议一致）。
+- **改共用构造器要预期"连锁报错"，那是资产不是麻烦**。`prorootFail`
+  的返回类型一变，`ProotCmd.error` 的类型、`exec`/`execStream`/`ptyStart`
+  的透传全被 K2 编译器重新审了一遍。**每一处 e: 都在指出一个真实的不一致**，
+  别急着用 `!!` 或强制转换压回去。
+- **`a ?: b` 的类型推导会被左值"拖宽"**。`built.error` 从
+  `Map<String,Any>?` 变成 `Map<String,Any?>?` 后，`built.error ?: "字符串"`
+  的推导类型成了 `Any` 而不是 `String`——因为 Kotlin 要同时容纳
+  map 和 string 两种可能。**当 `?:` 右边是另一种类型时，往往说明
+  你其实想从左边"取一个字段"**，而不是整个值当字符串用。
+- **类型错误未必是坏事，要追它暴露了什么**。最初的 `Map<String, Any>`
+  报错本身五分钟能修，但顺着它查下去才发现"错误文案在桥上消失"——
+  那才是真正会让用户困惑的问题。**别只把编译错误消掉就完事**。
+- **两套形状共用一个字段是设计债**。`ProotCmd.error` 现在装两种 map，
+  已经用文档注释标注了风险；将来若要彻底了结，应拆成
+  `ProotCmd` / `ProrootCmd` 两个类型，让编译期就能区分。
+  **这次三个 e: 就是这笔债的利息**。
+
+**出现版本**：alpha.62（proroot 可用化那一批）
+**修复版本**：alpha.62
+
+---
+
 
 ```
 ### Bug XXX · <一句话描述症状>
