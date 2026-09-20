@@ -7,6 +7,8 @@
 /local.properties
 GeneratedPluginRegistrant.java
 .cxx/
+# Kotlin 2.x 的 daemon 会话缓存（构建期生成，勿入库；见 Bug 469）
+/.kotlin/
 
 # Remember to never publicly share your keystore.
 # See https://flutter.dev/to/reference-keystore
