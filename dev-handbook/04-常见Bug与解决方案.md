@@ -488,6 +488,33 @@ Dart 系工具 `--version` 会自报编译目标（`simarm64` = 生成 arm64 代
 **解决**：daemon `1.5G 堆 + 512m 元空间`，`kotlin.daemon.jvmargs=-Xmx1024m`；改完必须 `pkill -f org.gradle.launcher.daemon` 让新参数生效（daemon 复用旧 opts）。手机端按设备 RAM 动态下调（见 02 号 init.gradle 注入）。
 **验证**：`free -h` 峰值占用 < 总量；构建不再消失。诊断手段：`dmesg | grep -i 'killed process'` 看 cgroup OOM 记录。
 
+> **⚠️ 2026-09-19 补充（alpha.62 出包时踩到，与上面是**两个不同**的成因）**
+>
+> 同样的报错文案，但这次**不是 cgroup OOM**：
+>
+> - `free -m` 显示 **123GB available**、32 核，`dmesg` 里**没有任何** killed process 记录；
+> - 失败点在 `assembleRelease` 的 **2474s**（≈41 分钟），而且日志里已经出现
+>   `Font asset "MaterialIcons-Regular.otf" was tree-shaken` —— 说明构建已经跑到
+>   **后期打包阶段**，不是早期依赖解析。
+>
+> 真因是 **JVM 自身堆耗尽**。1.5G 这组值是当年按 5.8GB 小机器定的，
+> 而 **release 构建**（AOT + R8 混淆 + 全量 dex）的内存曲线比 debug 陡得多。
+>
+> **判据（一句话区分两者）**：
+>
+> | 现象 | 成因 | 对策 |
+> | --- | --- | --- |
+> | `free` 显示内存紧张 / `dmesg` 有 OOM 记录 | cgroup OOM killer 杀进程 | **下调** jvmargs，给系统留空间 |
+> | `free` 显示大量 available / `dmesg` 干净 | JVM 堆不够 | **上调** jvmargs |
+>
+> 本构建机（123GB / 32 核）实测改为
+> `org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=2g` +
+> `kotlin.daemon.jvmargs=-Xmx3g` 后 release 构建通过。
+> **手机端不要照抄这组值**——仍按设备 RAM 用 init.gradle 动态下调。
+>
+> **方法论**：同一个报错文案可以有相反的修法。
+> **改之前先看 `free` 和 `dmesg`**，不要见到 "daemon disappeared" 就条件反射去降堆。
+
 ### Bug 203 · Flutter 3.47 模板生成 build.gradle.kts 而非 build.gradle
 
 **症状**：`setup_android.sh` 报"未找到 build.gradle，跳过"，targetSdk 补丁没生效。
@@ -4308,9 +4335,34 @@ Kotlin 顺着这条线把**所有**依赖 `ProotCmd.error` 的地方都报了出
 > 形状是对上的，透传没问题。真正的问题只在于 `!!` 会在
 > "cmd 为 null 但 error 也为 null"（不该发生）时抛 NPE。
 
+**第三轮**（第二轮的改动**再连锁**出 3 个新 e:）——债开始收利息了：
+
+```
+e: MainActivity.kt:1226:39 Return type mismatch: expected 'Map<String, Any>', actual 'Map<String, Any?>'.   (exec)
+e: MainActivity.kt:1410:39 同上                                                                              (execStream)
+e: MainActivity.kt:1525:44 同上                                                                              (ptyStart)
+```
+
+`ProotCmd.error` 松成 `Map<String,Any?>?` 后，`exec` / `execStream` /
+`ptyStart` 里的 `return built.error ?: fail(...)` 返回的就成了
+`Map<String,Any?>`，而这**三个方法自己的返回类型还是 `Map<String, Any>`**。
+于是同样的事情发生第二次——类型放宽沿着调用链继续向上传染。
+
+修法：把这三个方法的返回类型也放宽为 `Map<String, Any?>`（其中
+`ptyStart` 是**单行签名**，`exec`/`execStream` 是**多行签名**，
+批量替换时注意形状不一样）。
+
+> **这里踩了个小坑**：批量改签名时我按"多行签名形状"统一匹配，
+> 结果 `ptyStart` 的单行签名匹配不上，脚本在第一处就 assert 失败。
+> 好在脚本是**先校验、后写入**，异常直接中断，**文件没被改坏**——
+> 所以第二处 `if (built.cmd == null) return built.error!!` 也还原成了
+> 带 `!!` 的原样（那三处 `?: fail(...)` 兜底本就是多余的，
+> 因为 cmd 为 null 时 error 必然非 null）。
+
 **一句话总结这次的连锁反应**：改一个**跨类型共用的构造器**，
 它会沿着"字段类型 → 所有消费者"这条链把隐藏的不一致全炸出来。
-这不是坏事——**第二个 e: 报的 1167/1180 就是"两种形状共用一个字段"的账单**。
+这不是坏事——**每一轮 e: 都在指出一个真实的不一致**，
+一共炸出三轮、8 个 e:，本质上都是"两种形状共用一个字段"这笔债。
 5. `ProotCmd` 的文档注释写清 **`error` 字段装两种形状的 map** 这件事：
    `buildProotCmd()` 走 `fail`（`stderr`），`buildProrootCmd()` 走
    `prorootFail`（`error`），Dart 侧消费者各自知道该读哪个键。
@@ -4318,12 +4370,13 @@ Kotlin 顺着这条线把**所有**依赖 `ProotCmd.error` 的地方都报了出
 **验证**：
 
 - `./gradlew :app:compileDebugKotlin` 通过（BUILD 无 error 输出）。
-- `platform/android/MainActivity.kt` 同步（diff 为空，2207 行）。
+- `platform/android/MainActivity.kt` 同步（diff 为空）。
 - `test/proroot_integration_test.dart` 新增 4 项「桥接键名契约」断言：
   ①`prorootFail` 存在且 map 含 `"error" to message`；
   ②`ProrootProbeResult.fromMap` 读的 5 个键在 `prorootProbe` 里都有产出；
   ③`ProrootInstallResult.fromMap` 读的 5 个键在 `prorootInstall` 里都有产出；
   ④四处含可空值的签名必须显式 `Any?`。共 **27/27 通过**。
+- `flutter test` 全量 **593 项全绿**（改类型没有牵连 Dart 侧）。
 
 **教训**：
 
@@ -4335,8 +4388,12 @@ Kotlin 顺着这条线把**所有**依赖 `ProotCmd.error` 的地方都报了出
   这类接口必须配静态断言测试（本项目已有先例：Dart↔Kotlin 协议一致）。
 - **改共用构造器要预期"连锁报错"，那是资产不是麻烦**。`prorootFail`
   的返回类型一变，`ProotCmd.error` 的类型、`exec`/`execStream`/`ptyStart`
-  的透传全被 K2 编译器重新审了一遍。**每一处 e: 都在指出一个真实的不一致**，
-  别急着用 `!!` 或强制转换压回去。
+  的返回类型全被 K2 编译器重新审了一遍，一共炸出**三轮、8 个 e:**。
+  **每一处 e: 都在指出一个真实的不一致**，别急着用 `!!` 或强制转换压回去。
+- **批量改签名要区分单行 / 多行形状**。`ptyStart` 是一行写完的，
+  `exec`/`execStream` 是参数换行的——按一种形状写正则必然漏。
+  **脚本要"先校验、后写入"**：这次 assert 失败时文件完好无损，
+  靠的就是先全量检查再统一落盘，而不是边匹配边改。
 - **`a ?: b` 的类型推导会被左值"拖宽"**。`built.error` 从
   `Map<String,Any>?` 变成 `Map<String,Any?>?` 后，`built.error ?: "字符串"`
   的推导类型成了 `Any` 而不是 `String`——因为 Kotlin 要同时容纳
@@ -4351,6 +4408,104 @@ Kotlin 顺着这条线把**所有**依赖 `ProotCmd.error` 的地方都报了出
   **这次三个 e: 就是这笔债的利息**。
 
 **出现版本**：alpha.62（proroot 可用化那一批）
+**修复版本**：alpha.62
+
+---
+
+### Bug 461：`Gradle build daemon disappeared unexpectedly`——"机器有 123GB 内存"不等于"我能用 123GB"（2026-09-19，alpha.62 出包修复）
+
+**症状**：
+
+`flutter build apk --release --target-platform=android-arm64` 跑到
+**2474.7s（约 41 分钟）**后失败：
+
+```
+----- Last 20 lines from daemon log file - daemon-362581.out.log -----
+... Font asset "MaterialIcons-Regular.otf" was tree-shaken,
+    reducing it from 1645184 to 20192 bytes (98.8% reduction).
+----- End of the daemon log -----
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Gradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)
+
+Running Gradle task 'assembleRelease'...    2474.7s
+Gradle task assembleRelease failed with exit code 1
+```
+
+日志到"字体 tree-shake"就断了——也就是 **AOT 编译已完成、R8/dex 阶段刚开始**
+的位置。
+
+**原因**：
+
+`android/gradle.properties` 里的堆配置是**按 123GB 物理内存的大机器**定的：
+
+```properties
+org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=2g
+kotlin.daemon.jvmargs=-Xmx3g
+```
+
+但本沙箱是**容器**，cgroup 上限只有 8 GiB：
+
+```
+$ cat /sys/fs/cgroup/memory.max
+8589934592          # 8 GiB
+$ free -m
+               total  used   free  ...
+Mem:          126277 30008  9543          # ← 这个数字会误导人
+```
+
+`free -m` 报的 `total` 是**宿主机**的 126GB，而进程实际被限制在 8 GiB。
+6g + 3g + 元空间/线程栈/原生缓冲早已超顶 → R8 阶段内存冲高时被
+cgroup OOM killer 击杀。
+
+> **这个症状有两个成因，处置完全相反**：
+> | 成因 | 判据 | 处置 |
+> | --- | --- | --- |
+> | JVM 自身堆耗尽 | `free -m` 有**大量 available** 却仍消失 | **加**堆 |
+> | cgroup OOM 击杀 | `cat /sys/fs/cgroup/memory.max` 已触顶 | **减**堆 |
+>
+> 前一轮（2026-09-19 早些时候）正是前者——当时按 1.5g 的旧值在大机器上
+> 跑 release，属"堆不够"，于是被改成 6g/3g；**结果这次改成"配置超过了
+> 容器上限"**。两次症状字符串一模一样，修法却相反。
+
+**解决**：
+
+按公式重定：`gradle 堆 + kotlin 堆 + 1.5g(元空间/线程/原生) < cgroup 上限`
+
+```properties
+# 本沙箱 cgroup 8GiB → 4g + 2g + 1.5g ≈ 7.5g，留 0.5g 余量
+org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError
+kotlin.daemon.jvmargs=-Xmx2g
+```
+
+重试前先释放内存（关键：**不要清 `build/`**）：
+
+```bash
+cd android && ./gradlew --stop && pkill -f KotlinCompileDaemon
+cat /sys/fs/cgroup/memory.current   # 确认降下来（实测 6.0GiB → 2.24GiB）
+```
+
+**验证**：
+
+- 重试构建通过，产出 `dist/FOA-v0.1.0-alpha.62-arm64.apk`。
+- `platform/android/gradle.properties` 同步（diff 为空）。
+
+**教训**：
+
+- **容器里永远以 cgroup 为准，别看 `free -m`**。`free` 读的是宿主机视图，
+  与进程实际可用内存可以差一个数量级。
+- **同一个报错文案可能是相反的修法**。"daemon disappeared" 既可能是堆太小、
+  也可能是堆配置超过容器上限——**先查上限，再决定加还是减**，
+  靠症状关键词条件反射改数字会来回横跳（本轮就横跳了一次）。
+- **失败位置能定位成因**。卡在 R8/dex（AOT 之后）= 打包期内存峰值；
+  卡在配置期 = 依赖解析/网络。**AOT 已过就排除 Dart 侧**。
+- **重试前先想"哪些产物不用重做"**。`build/` 里 AOT 的 `app.so`、
+  Kotlin 的 class 都还在，所以"停下来调堆再重试"只要几分钟（R8 阶段），
+  而清 `build/` 重来要再花 41 分钟。**失败时保留现场比"重来干净"更值钱。**
+
+**出现版本**：alpha.62（出包阶段）
 **修复版本**：alpha.62
 
 ---
