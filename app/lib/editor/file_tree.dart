@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'fs_bridge.dart';
+import '../core/theme.dart';
 
 /// 文件浏览器：目录浏览模式（Bug 212 升级）。
 ///
@@ -351,7 +352,7 @@ class FileTreeState extends State<FileTree> {
                   child: Text(here,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                          fontSize: 11, color: Colors.grey.shade600)),
+                          fontSize: 11, color: FoaColors.of(context).muted)),
                 ),
               ],
             ),
@@ -468,7 +469,7 @@ class FileTreeState extends State<FileTree> {
             const SizedBox(height: 8),
             Text(
               '（空文件夹）',
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+              style: TextStyle(color: FoaColors.of(context).muted, fontSize: 13),
             ),
           ],
         ),

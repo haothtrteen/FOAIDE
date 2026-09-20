@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import 'fs_browser_bridge.dart';
+import '../core/theme.dart';
 
 /// Step 4 · 文件浏览器：浏览当前 app 的完整数据。
 ///
@@ -689,7 +690,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
           child: Text(
             '虚拟上级目录：从这里可跳转到 app 的不同数据区域',
-            style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+            style: TextStyle(color: FoaColors.of(context).muted, fontSize: 12),
           ),
         ),
         _VirtualEntryTile(
@@ -745,7 +746,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
             child: Text(
               '项目工作区同步（W^X 限制：构建必须在容器内执行）',
-              style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
+              style: TextStyle(color: FoaColors.of(context).muted, fontSize: 12),
             ),
           ),
           Padding(
@@ -781,7 +782,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
             child: Text(
               '在外部工作区（文件管理器/USB 可见）编辑代码后，点「外部 → 容器」同步进容器再构建；'
               '已有项目点「容器 → 外部」迁移到用户可见区。',
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
+              style: TextStyle(color: FoaColors.of(context).muted, fontSize: 11),
             ),
           ),
         ],
@@ -930,7 +931,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
             const SizedBox(height: 8),
             Text(
               '（空目录）',
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+              style: TextStyle(color: FoaColors.of(context).muted, fontSize: 13),
             ),
           ],
         ),
@@ -1034,7 +1035,7 @@ class _VirtualEntryTile extends StatelessWidget {
       title: Text(title, style: const TextStyle(fontSize: 14)),
       subtitle: Text(
         subtitle,
-        style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+        style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted),
       ),
       trailing: onTap == null
           ? Icon(Icons.lock_outline, size: 14, color: Colors.grey.shade700)

@@ -366,7 +366,7 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
                 if (s.busy || st == WebPreviewStatus.error)
                   Text('已运行 ${WebPreviewService.fmtDur(s.elapsedSec)}',
                       style: TextStyle(
-                          fontSize: 12, color: Colors.grey.shade500)),
+                          fontSize: 12, color: FoaColors.of(context).muted)),
               ],
             ),
             // 进度条真实化（Bug 454）：准备中 30% / 已监听待编译 70% / 就绪 100%
@@ -382,7 +382,7 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
             Text(
               '项目：${s.projName ?? widget.projectRoot.split('/').last}'
               ' · ${WebPreviewService.url}',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+              style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
             ),
             if (s.error != null) ...[
               const SizedBox(height: 4),
@@ -455,7 +455,7 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
         const SizedBox(width: 8),
         Text(
           s.portOpen ? '就绪后自动进入内嵌预览' : '服务器起来后即可打开',
-          style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+          style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
         ),
       ] else ...[
         FilledButton.icon(
@@ -500,7 +500,7 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
                     '以 web 形式在后台运行项目，\n'
                     '改代码 → 热重载，省去反复出包',
                     textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.grey.shade500),
+                    style: TextStyle(color: FoaColors.of(context).muted),
                   ),
                 ],
               ),

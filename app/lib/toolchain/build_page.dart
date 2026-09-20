@@ -6,6 +6,7 @@ import '../filemanager/fs_browser_bridge.dart';
 import 'build_notify.dart';
 import 'build_runner.dart';
 import 'termux_backend.dart';
+import '../core/theme.dart';
 
 /// Step 6 构建页：项目列表 → 流式构建日志 → 取消 → 安装 APK。
 ///
@@ -248,7 +249,7 @@ class _BuildPageState extends State<BuildPage> {
                   '1. 项目位于容器 /root/projects（需已装 JDK / Android SDK / Flutter SDK / 构建镜像，见「工具链」页）\n'
                   '2. 点击项目 → flutter build apk --no-shrink --release（arm64，日志流式输出，可随时取消）\n'
                   '3. 构建成功 → 一键拉起系统安装器安装 APK',
-                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                  style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
                 ),
                 const SizedBox(height: 12),
                 Row(
@@ -305,7 +306,7 @@ class _BuildPageState extends State<BuildPage> {
               child: Column(
                 children: [
                   Icon(Icons.folder_off_outlined,
-                      size: 40, color: Colors.grey.shade600),
+                      size: 40, color: FoaColors.of(context).muted),
                   const SizedBox(height: 8),
                   const Text('暂无项目'),
                   const SizedBox(height: 4),
@@ -313,7 +314,7 @@ class _BuildPageState extends State<BuildPage> {
                     '在「文件浏览器」/「编辑器」创建项目，或把文件放入外部工作区\n'
                     '（/sdcard/Android/data/<包名>/projects）后点「外部工作区 → 容器」。',
                     textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                    style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
                   ),
                 ],
               ),
@@ -413,7 +414,7 @@ class _BuildPageState extends State<BuildPage> {
                 done ? '构建成功，可安装或返回列表' : '构建未成功：可返回列表重试',
                 style: TextStyle(
                     fontSize: 12,
-                    color: done ? const Color(0xFF3DDC84) : Colors.grey.shade500),
+                    color: done ? const Color(0xFF3DDC84) : FoaColors.of(context).muted),
               ),
             ),
           ),
@@ -550,13 +551,13 @@ class _BuildPageState extends State<BuildPage> {
           const SizedBox(height: 8),
           Row(
             children: [
-              Icon(Icons.schedule, size: 13, color: Colors.grey.shade500),
+              Icon(Icons.schedule, size: 13, color: FoaColors.of(context).muted),
               const SizedBox(width: 4),
               Text(
                 building
                     ? '已用 ${BuildRunner.fmtDur(r.elapsedSec)}'
                     : '耗时 ${BuildRunner.fmtDur(r.elapsedSec)}',
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+                style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted),
               ),
               if (building) ...[
                 const SizedBox(width: 10),
@@ -565,7 +566,7 @@ class _BuildPageState extends State<BuildPage> {
                       '通知栏可见进度',
                   style: TextStyle(
                       fontSize: 11,
-                      color: Colors.grey.shade600,
+                      color: FoaColors.of(context).muted,
                       fontStyle: FontStyle.italic),
                 ),
               ],

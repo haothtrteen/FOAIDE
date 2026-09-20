@@ -9,6 +9,7 @@ import '../toolchain/diag_page.dart';
 import '../mcp/remote_takeover_page.dart';
 import '../filemanager/fs_browser_bridge.dart';
 import 'project_stats.dart';
+import '../core/theme.dart';
 
 /// 项目工作台 ·「预览」区（alpha.61 重做）。
 ///
@@ -145,7 +146,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                                fontSize: 12, color: Colors.grey.shade500)),
+                                fontSize: 12, color: FoaColors.of(context).muted)),
                     ],
                   ),
                 ),
@@ -182,7 +183,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
           SizedBox(
             width: 76,
             child: Text(k,
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+                style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
           ),
           Expanded(
             child: SelectableText(v,
@@ -265,7 +266,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                      fontSize: 10.5, color: Colors.grey.shade500)),
+                      fontSize: 10.5, color: FoaColors.of(context).muted)),
             ],
           ),
         ),
@@ -348,7 +349,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                         : '本项目依赖尚未拉取——打包前会自动执行 pub get',
                     style: TextStyle(
                         fontSize: 11.5,
-                        color: Colors.grey.shade600,
+                        color: FoaColors.of(context).muted,
                         height: 1.4),
                   ),
                 ),
@@ -359,7 +360,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
               '缓存目录：${ProjectStatsReader.pubCacheDir}/hosted/pub.dev'
               ' · 多个项目共用，删掉会拖慢下次打包',
               style: TextStyle(
-                  fontSize: 11, color: Colors.grey.shade600, height: 1.4),
+                  fontSize: 11, color: FoaColors.of(context).muted, height: 1.4),
             ),
           ],
         ),
@@ -382,13 +383,13 @@ class _ProjectPreviewState extends State<ProjectPreview> {
               const SizedBox(width: 3),
               Text(unit,
                   style:
-                      TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+                      TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
             ],
           ],
         ),
         const SizedBox(height: 2),
         Text(label,
-            style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+            style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
       ],
     );
   }
@@ -414,7 +415,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                 if (arts.length > 1)
                   Text('${arts.length} 个产物',
                       style: TextStyle(
-                          fontSize: 11, color: Colors.grey.shade600)),
+                          fontSize: 11, color: FoaColors.of(context).muted)),
               ],
             ),
             const SizedBox(height: 10),
@@ -424,12 +425,12 @@ class _ProjectPreviewState extends State<ProjectPreview> {
               Row(
                 children: [
                   Icon(Icons.inbox_outlined,
-                      size: 16, color: Colors.grey.shade600),
+                      size: 16, color: FoaColors.of(context).muted),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text('还没有构建产物——去「打包」页构建第一个 APK',
                         style: TextStyle(
-                            fontSize: 12, color: Colors.grey.shade600)),
+                            fontSize: 12, color: FoaColors.of(context).muted)),
                   ),
                 ],
               ),
@@ -532,7 +533,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                     fontSize: 12, fontFamily: 'monospace')),
           ),
           Text('${fmtBytes(a.sizeBytes)} · ${fmtRelativeTime(a.mtimeMs)}',
-              style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+              style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
         ],
       ),
     );

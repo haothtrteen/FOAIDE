@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'about_info.dart';
+import '../core/theme.dart';
 
 /// 「关于」独立页（alpha.61）。
 ///
@@ -26,13 +27,13 @@ class AboutPage extends StatelessWidget {
         children: [
           _header(context),
           const SizedBox(height: 16),
-          _authorCard(),
+          _authorCard(context),
           const SizedBox(height: 16),
-          _whatItDoesCard(),
+          _whatItDoesCard(context),
           const SizedBox(height: 16),
           _thirdPartyCard(context),
           const SizedBox(height: 16),
-          _licenseNoteCard(),
+          _licenseNoteCard(context),
         ],
       ),
     );
@@ -59,18 +60,18 @@ class AboutPage extends StatelessWidget {
             style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
         const SizedBox(height: 4),
         Text(AboutInfo.version,
-            style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
+            style: TextStyle(fontSize: 13, color: FoaColors.of(context).muted)),
         const SizedBox(height: 2),
         Text(AboutInfo.tagline,
             textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+            style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
       ],
     );
   }
 
   // ---------------- 作者 ----------------
 
-  Widget _authorCard() {
+  Widget _authorCard(BuildContext context) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(14),
@@ -80,9 +81,10 @@ class AboutPage extends StatelessWidget {
             const Text('作者',
                 style: TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 10),
-            _row(Icons.person_outline, '作者', AboutInfo.author),
+            _row(context, Icons.person_outline, '作者', AboutInfo.author),
             const SizedBox(height: 8),
             _copyRow(
+              context: context,
               icon: Icons.mail_outline,
               label: '联系方式',
               value: AboutInfo.email,
@@ -96,7 +98,7 @@ class AboutPage extends StatelessWidget {
 
   // ---------------- 这个 App 做什么 ----------------
 
-  Widget _whatItDoesCard() {
+  Widget _whatItDoesCard(BuildContext context) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(14),
@@ -112,7 +114,7 @@ class AboutPage extends StatelessWidget {
               'Flutter SDK，可以创建工程 → 编辑代码 → Web 预览热重载 → '
               '构建 APK → 安装，全程不碰电脑。',
               style: TextStyle(
-                  fontSize: 12, height: 1.55, color: Colors.grey.shade500),
+                  fontSize: 12, height: 1.55, color: FoaColors.of(context).muted),
             ),
           ],
         ),
@@ -136,7 +138,7 @@ class AboutPage extends StatelessWidget {
                 const Spacer(),
                 Text('${AboutInfo.components.length} 项',
                     style: TextStyle(
-                        fontSize: 11, color: Colors.grey.shade600)),
+                        fontSize: 11, color: FoaColors.of(context).muted)),
               ],
             ),
             const SizedBox(height: 4),
@@ -144,11 +146,11 @@ class AboutPage extends StatelessWidget {
               '以下组件不随本 App 的代码一起编译，而是在容器内或运行时分发使用。'
               '列出它们是尊重上游劳动，也让你清楚设备上多了什么。',
               style: TextStyle(
-                  fontSize: 11.5, height: 1.5, color: Colors.grey.shade600),
+                  fontSize: 11.5, height: 1.5, color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 10),
             for (final c in AboutInfo.components) ...[
-              _componentTile(c),
+              _componentTile(context, c),
               const SizedBox(height: 10),
             ],
           ],
@@ -157,7 +159,7 @@ class AboutPage extends StatelessWidget {
     );
   }
 
-  Widget _componentTile(AboutComponent c) {
+  Widget _componentTile(BuildContext context, AboutComponent c) {
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -183,12 +185,12 @@ class AboutPage extends StatelessWidget {
             const SizedBox(height: 2),
             Text('版本 ${c.version}',
                 style: TextStyle(
-                    fontSize: 11, color: Colors.grey.shade600)),
+                    fontSize: 11, color: FoaColors.of(context).muted)),
           ],
           const SizedBox(height: 6),
           Text(c.usage,
               style: TextStyle(
-                  fontSize: 11.5, height: 1.5, color: Colors.grey.shade500)),
+                  fontSize: 11.5, height: 1.5, color: FoaColors.of(context).muted)),
           const SizedBox(height: 6),
           Row(
             children: [
@@ -238,7 +240,7 @@ class AboutPage extends StatelessWidget {
 
   // ---------------- 许可说明 ----------------
 
-  Widget _licenseNoteCard() {
+  Widget _licenseNoteCard(BuildContext context) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(14),
@@ -256,7 +258,7 @@ class AboutPage extends StatelessWidget {
               '· Debian rootfs 内各软件包的许可见 /usr/share/doc/*/copyright；\n'
               '· 完整清单见仓库根目录 THIRD-PARTY-NOTICES.md。',
               style: TextStyle(
-                  fontSize: 11.5, height: 1.6, color: Colors.grey.shade500),
+                  fontSize: 11.5, height: 1.6, color: FoaColors.of(context).muted),
             ),
           ],
         ),
@@ -266,13 +268,13 @@ class AboutPage extends StatelessWidget {
 
   // ---------------- 小组件 ----------------
 
-  Widget _row(IconData icon, String label, String value) {
+  Widget _row(BuildContext context, IconData icon, String label, String value) {
     return Row(
       children: [
-        Icon(icon, size: 16, color: Colors.grey.shade500),
+        Icon(icon, size: 16, color: FoaColors.of(context).muted),
         const SizedBox(width: 8),
         Text('$label：',
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+            style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
         Expanded(
           child: SelectableText(value,
               style: const TextStyle(fontSize: 13)),
@@ -282,6 +284,7 @@ class AboutPage extends StatelessWidget {
   }
 
   Widget _copyRow({
+    required BuildContext context,
     required IconData icon,
     required String label,
     required String value,
@@ -289,10 +292,10 @@ class AboutPage extends StatelessWidget {
   }) {
     return Row(
       children: [
-        Icon(icon, size: 16, color: Colors.grey.shade500),
+        Icon(icon, size: 16, color: FoaColors.of(context).muted),
         const SizedBox(width: 8),
         Text('$label：',
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+            style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
         Expanded(
           child: SelectableText(value,
               style: const TextStyle(fontSize: 13)),

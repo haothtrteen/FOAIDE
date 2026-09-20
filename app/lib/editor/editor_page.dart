@@ -463,7 +463,7 @@ class EditorPageState extends State<EditorPage> {
                 child: path == null
                     ? Text('未打开文件',
                         style:
-                            TextStyle(fontSize: 13, color: Colors.grey.shade500))
+                            TextStyle(fontSize: 13, color: FoaColors.of(context).muted))
                     : Tooltip(
                         message: path,
                         child: Row(
@@ -521,13 +521,13 @@ class EditorPageState extends State<EditorPage> {
             Text(
               // 内嵌模式没有自己的 ☰：树在工作台抽屉/横屏左栏
               widget.embed ? '从工作台侧边文件树选择文件' : '从侧边栏选择文件开始编辑',
-              style: TextStyle(color: Colors.grey.shade500),
+              style: TextStyle(color: FoaColors.of(context).muted),
             ),
             if (!widget.embed &&
                 MediaQuery.of(context).orientation == Orientation.portrait)
               Text(
                 '（点左上角 ☰ 打开文件浏览）',
-                style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+                style: TextStyle(color: FoaColors.of(context).muted, fontSize: 12),
               ),
           ],
         ),

@@ -38,6 +38,39 @@ class DownloadException implements Exception {
   String toString() => message;
 }
 
+/// 单个镜像的探测结果（Bug 464：把失败原因**留证**，不再一律吞掉）。
+///
+/// 背景：`_probe` 原先 `catch (_) { return (m, null); }` —— 任何异常都被
+/// 吞成"不可用"。用户只看到「所有镜像源探测失败（网络不通或超时）」，
+/// 无法判断是 DNS 没解析、TLS 握手失败、还是被墙/超时。cloudflared 下载
+/// 反复失败却无从下手，根因就在这里：**失败信息在源头就丢了**。
+///
+/// 现在每个镜像都留下 [error] 与 [elapsed]，UI 可逐条展示。
+class MirrorProbe {
+  final MirrorSource mirror;
+  final bool ok;
+  final Duration? elapsed;
+
+  /// 失败原因（ok=false 时非空）：如 `SocketException: Failed host lookup`。
+  final String? error;
+
+  const MirrorProbe({
+    required this.mirror,
+    required this.ok,
+    this.elapsed,
+    this.error,
+  });
+
+  /// 面向用户的一行摘要。
+  String get summary {
+    if (ok) {
+      final ms = elapsed?.inMilliseconds ?? 0;
+      return '${mirror.name}：可用（${ms}ms）';
+    }
+    return '${mirror.name}：失败（${error ?? '未知原因'}）';
+  }
+}
+
 /// SDK 下载器（Step 3 核心，Flutter SDK 阶段复用）：
 /// 镜像并发竞速选源 → 多线程分段并发下载（多镜像并行）→ 分片级断点续传
 /// → 拼接 + SHA-256 校验 → 分片失败/卡住自动换镜像。
@@ -86,39 +119,63 @@ class SdkDownloader {
     Duration timeout = const Duration(seconds: 12),
     DownloadCancelToken? token,
   }) async {
-    final results = await Future.wait(
-      mirrors.map((m) => _probe(m, timeout, token)),
-    );
-    final ok = results.where((e) => e.$2 != null).toList()
-      ..sort((a, b) => a.$2!.compareTo(b.$2!));
+    final probes = await diagnose(mirrors, timeout: timeout, token: token);
+    final ok = probes.where((p) => p.ok).toList()
+      ..sort((a, b) => (a.elapsed ?? Duration.zero)
+          .compareTo(b.elapsed ?? Duration.zero));
     if (ok.isEmpty) {
-      throw DownloadException('所有镜像源探测失败（网络不通或超时）');
+      // Bug 464：把每个源的具体失败原因带出去，别再只说"网络不通"。
+      // 用户据此能区分"DNS 解析不了"（该换 DNS）与"超时"（该换网络）。
+      final detail = probes.map((p) => '· ${p.summary}').join('\n');
+      throw DownloadException('所有镜像源探测失败：\n$detail');
     }
-    return ok.map((e) => e.$1).toList();
+    return ok.map((p) => p.mirror).toList();
   }
 
-  static Future<(MirrorSource, Duration?)> _probe(
+  /// Bug 464：逐镜像探测并**保留失败原因**（供「下载诊断」按钮与错误文案用）。
+  static Future<List<MirrorProbe>> diagnose(
+    List<MirrorSource> mirrors, {
+    Duration timeout = const Duration(seconds: 12),
+    DownloadCancelToken? token,
+  }) async {
+    return Future.wait(
+      mirrors.map((m) => _probeDetailed(m, timeout, token)),
+    );
+  }
+
+  static Future<MirrorProbe> _probeDetailed(
     MirrorSource m,
     Duration timeout,
     DownloadCancelToken? token,
   ) async {
-    if (token?.isCancelled ?? false) return (m, null);
+    if (token?.isCancelled ?? false) {
+      return MirrorProbe(mirror: m, ok: false, error: '已取消');
+    }
     final sw = Stopwatch()..start();
     final client = HttpClient()..connectionTimeout = timeout;
     try {
-      final req = await client
-          .getUrl(Uri.parse(m.url))
-          .timeout(timeout);
+      final req = await client.getUrl(Uri.parse(m.url)).timeout(timeout);
       req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-${probeBytes - 1}');
       final resp = await req.close().timeout(timeout);
       if (resp.statusCode != 206 && resp.statusCode != 200) {
-        return (m, null);
+        await resp.drain<void>().catchError((_) {});
+        return MirrorProbe(
+          mirror: m,
+          ok: false,
+          error: 'HTTP ${resp.statusCode}',
+        );
       }
-      // 读完 64KB 即视为"可达且够快"（首块到达时间 ≈ 整体读取时间）
       await resp.drain<void>().timeout(timeout);
-      return (m, sw.elapsed);
-    } catch (_) {
-      return (m, null);
+      return MirrorProbe(mirror: m, ok: true, elapsed: sw.elapsed);
+    } on SocketException catch (e) {
+      // DNS / 连接被拒 / 网络不可达——最常见
+      return MirrorProbe(mirror: m, ok: false, error: '网络：${e.osError?.message ?? e.message}');
+    } on HandshakeException catch (e) {
+      return MirrorProbe(mirror: m, ok: false, error: 'TLS 握手失败：${e.message}');
+    } on TimeoutException {
+      return MirrorProbe(mirror: m, ok: false, error: '超时（${timeout.inSeconds}s）');
+    } catch (e) {
+      return MirrorProbe(mirror: m, ok: false, error: e.toString());
     } finally {
       client.close(force: true);
     }

@@ -57,6 +57,22 @@ class ProotBridge {
     return (m['removed'] as num?)?.toInt() ?? 0;
   }
 
+  /// Bug 464：从**已知路径**安装 proroot（供一键下载用）。
+  ///
+  /// 与 [prorootImport] 的区别：那个走系统目录选择器（用户选）、
+  /// 这个直接吃 Dart 侧刚下载好的暂存目录路径。落位逻辑完全复用
+  /// 原生 `prorootInstall(srcDirPath)`——递归找同名文件、拷进 jniLibs
+  /// 等价的私有目录、setExecutable、验 ELF 魔数。
+  ///
+  /// [stagingDirPath] 必须是原生可读的**宿主路径**（下载落点见
+  /// `ProrootDownload`）。
+  Future<ProrootInstallResult> prorootInstallFromDir(
+      String stagingDirPath) async {
+    final raw = await _channel.invokeMethod(
+        'prorootInstallFromDir', {'path': stagingDirPath});
+    return ProrootInstallResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
   /// 冒烟测试：在容器里真跑一次 proroot。
   ///
   /// 之所以必须有这一步：proroot 官方要求 Ubuntu arm64 rootfs，
@@ -65,6 +81,31 @@ class ProotBridge {
   Future<ProrootProbeResult> prorootProbe() async {
     final raw = await _channel.invokeMethod('prorootProbe');
     return ProrootProbeResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
+  }
+
+  // ---------------- Bug 464 · 主题 → 系统栏同步 ----------------
+
+  /// 把 App 当前亮度推给原生，由原生设状态栏/导航栏颜色（含图标明暗）。
+  ///
+  /// 为什么必须走原生：Android 15+（SDK_INT≥35）上 Flutter 引擎
+  /// **无条件跳过** `Window.setStatusBarColor`/`setNavigationBarColor`，
+  /// Dart 侧 `SystemChrome`/`AppBarTheme.systemOverlayStyle` 的颜色
+  /// 在这类设备上完全失效（Bug 410 已实证）。原生侧设色是唯一途径。
+  ///
+  /// 为什么不能靠原生的 `applySystemBarColorsForTheme()`：它只能读
+  /// **系统** `uiMode`，而 App 主题由 Dart `ThemeController` 控制，两者
+  /// 可以不一致（App 切浅色、系统仍深色）→ 状态栏与顶栏割裂（Bug 464）。
+  /// 所以亮度必须由 Dart 侧推过来。
+  ///
+  /// [dark] = true 表示 App 当前为深色主题。
+  /// 失败静默：这是纯装饰性调用，模型层不该因系统栏设色失败而中断
+  /// 主题切换（个别设备/ROM 可能没有该实现）。
+  Future<void> syncSystemBarTheme({required bool dark}) async {
+    try {
+      await _channel.invokeMethod('syncSystemBarTheme', {'dark': dark});
+    } catch (_) {
+      // 忽略：主题切换不因系统栏设色失败而回滚
+    }
   }
 
   // ---------------- Step 6 · 流式执行（构建日志） ----------------

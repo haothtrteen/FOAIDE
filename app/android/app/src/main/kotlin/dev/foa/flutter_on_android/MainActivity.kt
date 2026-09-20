@@ -161,6 +161,24 @@ class MainActivity : FlutterActivity() {
                         "prorootStatus" -> result.success(prorootStatus())
                         "prorootRemove" -> result.success(prorootRemove())
                         "prorootProbe" -> result.success(prorootProbe())
+                        // Bug 464：一键下载后从**已知路径**安装（不走文件选择器）。
+                        // Dart 侧已把 5 个 .so 下载到暂存目录，这里复用
+                        // prorootInstall() 的落位逻辑（递归找/拷贝/验 ELF）。
+                        "prorootInstallFromDir" -> {
+                            val p = call.argument<String>("path") ?: ""
+                            result.success(prorootInstall(p))
+                        }
+                        // ---- Bug 464 · 主题 → 系统栏同步 ----
+                        // Dart 侧 ThemeController 切主题后主动推送，原生按
+                        // **App 主题**（而非系统 uiMode）设系统栏色。
+                        // 为什么需要这条通道：applySystemBarColorsForTheme()
+                        // 只能读系统深色标志，而 App 主题可独立于系统
+                        // （用户手动切浅色、系统仍是深色）→ 状态栏与顶栏割裂。
+                        "syncSystemBarTheme" -> {
+                            val dark = call.argument<Boolean>("dark") == true
+                            applySystemBarColors(dark)
+                            result.success(true)
+                        }
                         "prorootImport" -> {
                             // 走系统目录选择器，用户选一个含 .so 的目录。
                             // 原生侧不能自己开 Activity 并等结果（会阻塞
@@ -763,7 +781,26 @@ class MainActivity : FlutterActivity() {
         val night = (resources.configuration.uiMode and
                 android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
                 android.content.res.Configuration.UI_MODE_NIGHT_YES
-        val color = if (night) 0xFF101418.toInt() else 0xFFF5F7F8.toInt()
+        applySystemBarColors(night)
+    }
+
+    /**
+     * Bug 464：按**显式主题**设系统栏色（不再读系统 uiMode）。
+     *
+     * [dark] 为 true 表示 App 当前是深色主题。
+     *
+     * 为什么抽成带参函数：`applySystemBarColorsForTheme()` 读的是**系统**
+     * 深色标志，而 App 主题由 Dart `ThemeController` 控制，二者可以不一致
+     * （用户把 App 切浅色、系统仍是深色）。此前这就是「顶栏浅、状态栏深」
+     * 的直接成因——启动时按系统设了一次深色，之后 Dart 切主题也改不动它
+     * （Android 15+ 引擎跳过运行时设色）。
+     * 现在 Dart 每次切主题都经 `syncSystemBarTheme` 推送真实亮度过来。
+     *
+     * 目标值必须与 `lib/core/theme.dart` 的 `FoaTheme.overlayFor()` 同源
+     * （深色 #101418 / 浅色 #F5F7F8）——两边不一致会重新引入本 bug。
+     */
+    private fun applySystemBarColors(dark: Boolean) {
+        val color = if (dark) 0xFF101418.toInt() else 0xFFF5F7F8.toInt()
         runOnUiThread {
             window?.statusBarColor = color
             window?.navigationBarColor = color
@@ -772,9 +809,9 @@ class MainActivity : FlutterActivity() {
                     window, window.decorView
                 )
                 // 深色背景 → 浅色图标；浅色背景 → 深色图标
-                controller.isAppearanceLightStatusBars = !night
+                controller.isAppearanceLightStatusBars = !dark
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    controller.isAppearanceLightNavigationBars = !night
+                    controller.isAppearanceLightNavigationBars = !dark
                 }
             }
         }

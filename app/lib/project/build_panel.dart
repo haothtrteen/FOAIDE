@@ -12,6 +12,7 @@ import '../toolchain/build_progress.dart';
 import '../toolchain/build_runner.dart';
 import '../toolchain/termux_backend.dart';
 import '../filemanager/fs_browser_bridge.dart';
+import '../core/theme.dart';
 
 /// 项目工作台 ·「打包」区（alpha.61 优化）。
 ///
@@ -315,7 +316,7 @@ class _BuildPanelState extends State<BuildPanel> {
               const SizedBox(height: 6),
               Text('构建需要容器环境，请先在主页完成环境安装',
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+                  style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
             ],
           ),
         ),
@@ -367,7 +368,7 @@ class _BuildPanelState extends State<BuildPanel> {
               '把 CPU 和内存打满，两边都跑不完。',
               textAlign: TextAlign.center,
               style: TextStyle(
-                  fontSize: 12, height: 1.6, color: Colors.grey.shade500),
+                  fontSize: 12, height: 1.6, color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
@@ -428,15 +429,15 @@ class _BuildPanelState extends State<BuildPanel> {
             Row(
               children: [
                 Text('已用 ${BuildRunner.fmtDur(r.elapsedSec)}',
-                    style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+                    style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
                 const SizedBox(width: 10),
                 Icon(Icons.notifications_active_outlined,
-                    size: 12, color: Colors.grey.shade600),
+                    size: 12, color: FoaColors.of(context).muted),
                 const SizedBox(width: 4),
                 Expanded(
                   child: Text('可退出页面，构建继续',
                       style: TextStyle(
-                          fontSize: 11, color: Colors.grey.shade600)),
+                          fontSize: 11, color: FoaColors.of(context).muted)),
                 ),
               ],
             ),
@@ -506,14 +507,14 @@ class _BuildPanelState extends State<BuildPanel> {
                               ? (failed
                                   ? const Color(0xFFFF7A7A)
                                   : const Color(0xFF4C8DFF))
-                              : Colors.grey.shade600,
+                              : FoaColors.of(context).muted,
                     ),
                   ),
                 ),
                 if (i == activeIdx && !doneAll && !failed)
                   Text('进行中',
                       style: TextStyle(
-                          fontSize: 10, color: Colors.grey.shade500)),
+                          fontSize: 10, color: FoaColors.of(context).muted)),
               ],
             ),
           ),
@@ -583,7 +584,7 @@ class _BuildPanelState extends State<BuildPanel> {
               style: TextStyle(
                 fontSize: 11,
                 color: !_checked
-                    ? Colors.grey.shade500
+                    ? FoaColors.of(context).muted
                     : _hasBlocking
                         ? const Color(0xFFFFB74D)
                         : const Color(0xFF3DDC84),
@@ -621,7 +622,7 @@ class _BuildPanelState extends State<BuildPanel> {
                               style: TextStyle(
                                   fontSize: 10.5,
                                   height: 1.4,
-                                  color: Colors.grey.shade500)),
+                                  color: FoaColors.of(context).muted)),
                         ],
                       ),
                     ),
@@ -658,7 +659,7 @@ class _BuildPanelState extends State<BuildPanel> {
             ),
             const SizedBox(height: 4),
             Text('开始前确认一下，构建中不可更改',
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+                style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
             const Divider(height: 20),
             _paramRow('项目', widget.projectName),
             _paramRow('构建目标', 'release APK（arm64-v8a）'),
@@ -677,7 +678,7 @@ class _BuildPanelState extends State<BuildPanel> {
                 Expanded(
                   child: Text('切换后端',
                       style: TextStyle(
-                          fontSize: 12, color: Colors.grey.shade500)),
+                          fontSize: 12, color: FoaColors.of(context).muted)),
                 ),
                 SegmentedButton<BuildBackend>(
                   segments: const [
@@ -717,7 +718,7 @@ class _BuildPanelState extends State<BuildPanel> {
           SizedBox(
             width: 76,
             child: Text(k,
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+                style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
           ),
           Expanded(
             child: Column(
@@ -729,7 +730,7 @@ class _BuildPanelState extends State<BuildPanel> {
                 if (note != null)
                   Text(note,
                       style: TextStyle(
-                          fontSize: 10, color: Colors.grey.shade600)),
+                          fontSize: 10, color: FoaColors.of(context).muted)),
               ],
             ),
           ),
@@ -796,7 +797,7 @@ class _BuildPanelState extends State<BuildPanel> {
         Text(
           '清理缓存会删除 build/ 与 .dart_tool/，下次构建更慢但能解决'
           '"缓存导致的玄学失败"',
-          style: TextStyle(fontSize: 10.5, height: 1.5, color: Colors.grey.shade600),
+          style: TextStyle(fontSize: 10.5, height: 1.5, color: FoaColors.of(context).muted),
         ),
       ],
     );
@@ -846,7 +847,7 @@ class _BuildPanelState extends State<BuildPanel> {
                 if (r.elapsedSec > 0)
                   Text('耗时 ${BuildRunner.fmtDur(r.elapsedSec)}',
                       style: TextStyle(
-                          fontSize: 11, color: Colors.grey.shade500)),
+                          fontSize: 11, color: FoaColors.of(context).muted)),
               ],
             ),
             if (ok && r.apkGuest != null) ...[
@@ -919,7 +920,7 @@ class _BuildPanelState extends State<BuildPanel> {
           const SizedBox(height: 4),
           Text('容器内路径：$guest',
               maxLines: 2,
-              style: TextStyle(fontSize: 10, color: Colors.grey.shade500)),
+              style: TextStyle(fontSize: 10, color: FoaColors.of(context).muted)),
           const SizedBox(height: 10),
           Row(
             children: [
@@ -976,7 +977,7 @@ class _BuildPanelState extends State<BuildPanel> {
       return Text(
         '打开日志看最后 20 行，通常能看到真正的错误原因。'
         '如果是莫名其妙的失败，先试"清理缓存"再构建。',
-        style: TextStyle(fontSize: 11, height: 1.6, color: Colors.grey.shade500),
+        style: TextStyle(fontSize: 11, height: 1.6, color: FoaColors.of(context).muted),
       );
     }
     return Container(
@@ -1039,7 +1040,7 @@ class _BuildPanelState extends State<BuildPanel> {
                 children: [
                   Text('日志预览（共 ${r.lines.length} 行）',
                       style:
-                          TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+                          TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
                   const Spacer(),
                   const Icon(Icons.unfold_more, size: 14, color: Colors.grey),
                   const SizedBox(width: 4),
@@ -1199,7 +1200,7 @@ class _LogSheetState extends State<_LogSheet> {
                         TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
                 const SizedBox(width: 8),
                 Text('${lines.length} 行',
-                    style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+                    style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
                 const Spacer(),
                 IconButton(
                   tooltip: _onlyErrors ? '显示全部' : '只看错误',
@@ -1263,7 +1264,7 @@ class _LogSheetState extends State<_LogSheet> {
                     child: Text(
                       _onlyErrors ? '没有匹配的错误行' : '暂无日志',
                       style:
-                          TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                          TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
                     ),
                   )
                 : NotificationListener<ScrollNotification>(

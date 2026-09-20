@@ -6,6 +6,7 @@ import 'core/theme.dart';
 import 'editor/web_preview_page.dart';
 import 'editor/web_preview_service.dart';
 import 'env/env_installer.dart';
+import 'env/proot_bridge.dart';
 import 'mcp/remote_takeover_page.dart';
 import 'toolchain/build_notify.dart';
 import 'toolchain/build_page.dart';
@@ -107,6 +108,14 @@ class _FoaAppState extends State<FoaApp> {
           // 上一次的状态，直到某个 AppBar 重新下发 systemOverlayStyle。
           builder: (context, child) {
             final dark = Theme.of(context).brightness == Brightness.dark;
+            // Bug 464：Android 15+ 引擎会跳过运行时设色，Dart 侧
+            // AnnotatedRegion 在那类设备上不生效——必须把**真实亮度**
+            // 推给原生由 Kotlin 设色。这里是最合适的唯一推点：
+            // builder 每次主题变化都会重建，且此处已算出 dark。
+            // 放到 postFrame 回调里，避免在 build 期间触发平台调用。
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              ProotBridge().syncSystemBarTheme(dark: dark);
+            });
             return AnnotatedRegion<SystemUiOverlayStyle>(
               value: FoaTheme.overlayFor(
                   dark ? Brightness.dark : Brightness.light),

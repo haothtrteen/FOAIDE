@@ -6,6 +6,7 @@ import '../mcp/cloudflared_install.dart';
 import '../mcp/mcp_schema.dart';
 import '../mcp/mcp_server.dart';
 import '../mcp/tunnel_service.dart';
+import '../core/theme.dart';
 
 /// 项目工作台 ·「AI 接管」面板（alpha.60）。
 ///
@@ -246,7 +247,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
                 if (running && t.remainSec != null)
                   Text('剩余 ${remainLabel(t.remainSec)}',
                       style: TextStyle(
-                          fontSize: 12, color: Colors.grey.shade500)),
+                          fontSize: 12, color: FoaColors.of(context).muted)),
               ],
             ),
             const SizedBox(height: 8),
@@ -261,7 +262,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
               const SizedBox(height: 4),
               Text('这个地址对公网开放，可让你的 AI 接入这台设备。',
                   style: TextStyle(
-                      fontSize: 12, color: Colors.grey.shade500)),
+                      fontSize: 12, color: FoaColors.of(context).muted)),
             ] else
               Text(
                 '开启后，你的 AI 客户端就能读取本项目文件、在容器内执行命令、'
@@ -269,7 +270,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
                 style: TextStyle(
                     fontSize: 12,
                     height: 1.45,
-                    color: Colors.grey.shade500),
+                    color: FoaColors.of(context).muted),
               ),
             // Bug 458：把 cloudflared 状态就地摆明，不让用户猜"为什么开不了"。
             if (_cfChecked && st == TunnelStatus.idle) ...[
@@ -341,7 +342,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
                 : '首次开启会自动下载隧道组件 cloudflared'
                     '（约 36MB，只下一次）',
             style: TextStyle(
-                fontSize: 11.5, color: Colors.grey.shade600, height: 1.4),
+                fontSize: 11.5, color: FoaColors.of(context).muted, height: 1.4),
           ),
         ),
       ],
@@ -366,7 +367,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
               '令牌、项目路径、可用工具、以及「慢是正常的」「构建与预览互斥」'
               '这些它必须知道的事——省掉它自己摸索的几轮往返。',
               style: TextStyle(
-                  fontSize: 12, color: Colors.grey.shade500, height: 1.45),
+                  fontSize: 12, color: FoaColors.of(context).muted, height: 1.45),
             ),
             const SizedBox(height: 12),
             Container(
@@ -431,13 +432,13 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
                 const Spacer(),
                 Text('最近 ${mcp.audit.length} 条 · 实时',
                     style: TextStyle(
-                        fontSize: 11, color: Colors.grey.shade600)),
+                        fontSize: 11, color: FoaColors.of(context).muted)),
               ],
             ),
             const SizedBox(height: 4),
             Text('AI 在你设备上的每次操作都会出现在这里——这是你的监督窗口。',
                 style: TextStyle(
-                    fontSize: 12, color: Colors.grey.shade500)),
+                    fontSize: 12, color: FoaColors.of(context).muted)),
             const SizedBox(height: 10),
             ValueListenableBuilder<int>(
               valueListenable: mcp.auditRevisionN,
@@ -445,7 +446,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
                 if (mcp.audit.isEmpty) {
                   return Text('（暂无记录）',
                       style: TextStyle(
-                          fontSize: 12, color: Colors.grey.shade600));
+                          fontSize: 12, color: FoaColors.of(context).muted));
                 }
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -501,7 +502,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
               '可用工具共 ${kTools.length} 项：'
               '${kTools.map((t) => t.name).join('、')}',
               style: TextStyle(
-                  fontSize: 11, color: Colors.grey.shade600, height: 1.5),
+                  fontSize: 11, color: FoaColors.of(context).muted, height: 1.5),
             ),
           ],
         ),
@@ -520,7 +521,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
             child: Icon(
               ok ? Icons.check_circle_outline : Icons.remove_circle_outline,
               size: 15,
-              color: ok ? const Color(0xFF3DDC84) : Colors.grey.shade600,
+              color: ok ? const Color(0xFF3DDC84) : FoaColors.of(context).muted,
             ),
           ),
           const SizedBox(width: 8),
@@ -533,7 +534,7 @@ class _AiTakeoverPanelState extends State<AiTakeoverPanel> {
                   if (note != null)
                     TextSpan(
                       text: '（$note）',
-                      style: TextStyle(color: Colors.grey.shade600),
+                      style: TextStyle(color: FoaColors.of(context).muted),
                     ),
                 ],
               ),

@@ -92,6 +92,71 @@ class FoaTheme {
               systemNavigationBarDividerColor: lightSurface,
               systemNavigationBarIconBrightness: Brightness.dark,
             );
+
+  // ---------------- Bug 464 · 主题感知语义色 ----------------
+  //
+  // 背景：此前全项目散落了 434 处硬编码颜色（`Colors.grey.shade500` 71 处、
+  // `Color(0xFFFFB74D)` 14 处…）。这些是**按深色主题调的**，切到浅色主题后
+  // 对比度就不对了（最典型：proroot 卡片用固定的 `Colors.orange.shade50`
+  // 做警告底，深色主题下是一块刺眼的亮橙）。
+  //
+  // 这里集中定义"随主题走"的语义色。用法：
+  //   final c = FoaColors.of(context);
+  //   Text('…', style: TextStyle(color: c.muted));
+
+  /// 次要文字/图标（原 `Colors.grey.shade500` 的语义位）。
+  static Color muted(Brightness b) =>
+      b == Brightness.dark ? const Color(0xFF9AA3AB) : const Color(0xFF6B7378);
+
+  /// 成功（原多数 `Color(0xFF3DDC84)` 的语义位，与种子色一致）。
+  static Color success(Brightness b) => seed;
+
+  /// 警告（原 `Color(0xFFFFB74D)`，浅色下需压深才够对比度）。
+  static Color warning(Brightness b) =>
+      b == Brightness.dark ? const Color(0xFFFFB74D) : const Color(0xFFB26A00);
+
+  /// 危险/错误（原 `Color(0xFFFF7A7A)`，浅色下同样需压深）。
+  static Color danger(Brightness b) =>
+      b == Brightness.dark ? const Color(0xFFFF7A7A) : const Color(0xFFC62828);
+
+  /// 警告底色（替代固定 `Colors.orange.shade50`）。
+  static Color warningContainer(Brightness b) =>
+      b == Brightness.dark
+          ? const Color(0xFF3A2A12)
+          : const Color(0xFFFFF3E0);
+
+  /// 警告描边。
+  static Color warningBorder(Brightness b) =>
+      b == Brightness.dark
+          ? const Color(0xFF7A5A22)
+          : const Color(0xFFFFCC80);
+
+  /// 代码块/日志底（原 `Colors.black.withValues(alpha: 0.25)`）。
+  static Color codeBg(Brightness b) =>
+      b == Brightness.dark
+          ? const Color(0xFF0B0E11)
+          : const Color(0xFFEEF1F3);
+}
+
+/// `FoaColors.of(context)` —— 主题感知语义色的便捷取用。
+///
+/// 用法：`final c = FoaColors.of(context);` 之后 `c.muted` / `c.warning` …
+/// 这些值都随当前 `Theme.of(context).brightness` 变化，切主题即生效。
+class FoaColors {
+  const FoaColors(this._b);
+  final Brightness _b;
+
+  static FoaColors of(BuildContext context) =>
+      FoaColors(Theme.of(context).brightness);
+
+  Brightness get brightness => _b;
+  Color get muted => FoaTheme.muted(_b);
+  Color get success => FoaTheme.success(_b);
+  Color get warning => FoaTheme.warning(_b);
+  Color get danger => FoaTheme.danger(_b);
+  Color get warningContainer => FoaTheme.warningContainer(_b);
+  Color get warningBorder => FoaTheme.warningBorder(_b);
+  Color get codeBg => FoaTheme.codeBg(_b);
 }
 
 /// 主题切换控制器：暗色 / 浅色 / 跟随系统。

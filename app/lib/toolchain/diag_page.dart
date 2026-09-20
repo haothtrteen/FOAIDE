@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../env/proot_bridge.dart';
 import 'qemu_compat.dart';
+import '../core/theme.dart';
 
 /// 故障诊断（alpha.59 引入，原名「远程排障」；alpha.60 更名）：
 /// 一键跑诊断命令包 → 结果一键复制 → 粘贴给 AI。
@@ -215,7 +216,7 @@ class _DiagPageState extends State<DiagPage> {
                     '即可获得针对性修复建议（替代截图猜谜）。\n'
                     '全部为只读探测命令，不影响构建/预览。',
                     style: TextStyle(
-                        fontSize: 12, color: Colors.grey.shade500, height: 1.4),
+                        fontSize: 12, color: FoaColors.of(context).muted, height: 1.4),
                   ),
                 ],
               ),
@@ -286,7 +287,7 @@ class _DiagPageState extends State<DiagPage> {
                   )
                 else if (out == null)
                   Icon(Icons.circle_outlined,
-                      size: 16, color: Colors.grey.shade500)
+                      size: 16, color: FoaColors.of(context).muted)
                 else
                   Icon(
                     _failed[i] ? Icons.error_outline : Icons.check_circle,
@@ -307,7 +308,7 @@ class _DiagPageState extends State<DiagPage> {
               const SizedBox(height: 4),
               Text(item.hint,
                   style: TextStyle(
-                      fontSize: 11, color: Colors.grey.shade500)),
+                      fontSize: 11, color: FoaColors.of(context).muted)),
             ],
             if (out != null) ...[
               const SizedBox(height: 8),

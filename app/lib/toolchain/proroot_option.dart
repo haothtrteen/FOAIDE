@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
+import '../core/theme.dart';
+import '../mcp/proroot_download.dart';
+import 'sdk_downloader.dart';
 
 /// 容器层加速选项：**proroot**（alpha.61 起可真正启用）。
 ///
@@ -73,6 +76,92 @@ class ProrootOption {
   static const String downloadHint =
       '到上方仓库的 Release / 源码树里取 $abi 构建的 5 个 .so，'
       '解压成一个目录后用下面的「导入」按钮选那个目录。';
+
+  // ---------------- Bug 464 · 一键从 GitHub 拉取 ----------------
+  //
+  // 设计取舍（为什么这么实现）：
+  //
+  // ① **不用 GitHub API**。`api.github.com` 有匿名速率限制（每小时 60 次，
+  //    按 IP 计），手机网络常是共享出口 IP，随时可能 403。改用
+  //    `raw.githubusercontent.com` 直取文件——raw 域不计数、不返回元数据，
+  //    够用且稳。
+  //
+  // ② **固定文件清单 + 逐个校验**。5 个文件的名字/大小/SHA 都写死在
+  //    [soAssets] 里，不动态发现。理由：proroot 是**专有许可、源码未公开**，
+  //    动态发现意味着"上游推什么就装什么"，无法审计变化。钉死版本后，
+  //    上游一旦改动，校验会失败并明确报错，而不是静默装上不同内容。
+  //
+  // ③ **sha256 校验而非只看大小**。子集下载/半截响应都可能凑出相同大小。
+  //    这里用 sha256 钉死内容（值是 2026-09-20 实测、并与 GitHub 侧
+  //    git blob sha1 交叉验证一致的）。
+  //
+  // ④ **不修改二进制**。许可原文："Redistribution of modified binaries is
+  //    not permitted." —— 我们只做**按字节原样下载**，不做 strip/重打包。
+  //    下载后落位到应用私有目录，不经任何改写。
+
+  /// 上游默认分支（raw 下载路径需要）。
+  static const String upstreamRef = 'main';
+
+  /// 5 个 .so 的下载清单：文件名 / 字节数 / sha256。
+  ///
+  /// sha256 为 2026-09-20 实测值，并与 GitHub contents API 返回的
+  /// git blob sha1 交叉验证一致（blob sha1 见 gitAssetSha1 注释）。
+  static const List<({String name, int size, String sha256})> soAssets = [
+    (
+      name: 'libproroot.so',
+      size: 43624,
+      sha256:
+          'a4e74d75b66cdc02b080adfe863dbf9951c3b30610d77beddc95488d5fe5de01',
+    ),
+    (
+      name: 'libproroot-runtime.so',
+      size: 375120,
+      sha256:
+          '8c47a0a7db32d84c179ebb5bf3640f655a3181860ece5886ae44d92858730c34',
+    ),
+    (
+      name: 'libproroot-linker.so',
+      size: 79408,
+      sha256:
+          '51a0ec5bfed00e572a0de09e22d9057e2befc386b78e426613d3e0ab03f4ecee',
+    ),
+    (
+      name: 'libproroot-bridge.so',
+      size: 23624,
+      sha256:
+          '1c5bc9537a270e8bf8b1c70222813f57b60b828bfb5503ddf8fe37685092de2f',
+    ),
+    (
+      name: 'libproroot-stub-loader.so',
+      size: 144144,
+      sha256:
+          '06c6624db3bdc45b9ced151cd781df439a37b47731d244b93e9d6a58cd48cde0',
+    ),
+  ];
+
+  /// 单个资产的原始下载地址（不依赖 API）。
+  static String rawUrl(String fileName) =>
+      'https://raw.githubusercontent.com/coderredlab/proroot/'
+      '$upstreamRef/arm64-v8a/$fileName';
+
+  /// 下载源（国内镜像优先，raw 直链兜底）。
+  ///
+  /// 与 cloudflared 同款思路：ghfast / gh-proxy 都能代理 raw.githubusercontent，
+  /// 国内可达性远好于直连（直连常被 DNS 污染或 TLS 中断）。
+  static List<MirrorSource> mirrorsFor(String fileName) => [
+        MirrorSource('ghfast',
+            'https://ghfast.top/https://raw.githubusercontent.com/'
+            'coderredlab/proroot/$upstreamRef/arm64-v8a/$fileName'),
+        MirrorSource('gh-proxy.com',
+            'https://gh-proxy.com/https://raw.githubusercontent.com/'
+            'coderredlab/proroot/$upstreamRef/arm64-v8a/$fileName'),
+        MirrorSource('github-raw', rawUrl(fileName)),
+      ];
+
+  /// 全部资产合计字节数（UI 显示"约 0.7MB"用）。
+  static int get totalBytes =>
+      soAssets.fold(0, (a, e) => a + e.size);
+
 
   /// 兼容性说明（[rootfsDistro] 为本项目的 rootfs 发行版）。
   ///
@@ -166,6 +255,54 @@ class _ProrootCardState extends State<ProrootCard> {
         _busy = false;
         _note = '无法查询 proroot 状态：$e';
         _noteOk = false;
+      });
+    }
+  }
+
+  /// Bug 464：一键从 GitHub 拉取 5 个 .so → 自动落位 → 刷新状态。
+  ///
+  /// 与 [_import]（系统文件选择器）并存：选择器对"已自己下好文件"的用户
+  /// 更灵活，一键下载对"什么都没准备"的用户更省事。两条路最终都汇到
+  /// 原生的 `prorootInstall` 落位逻辑，行为一致。
+  Future<void> _download() async {
+    final env = await _bridge.envInfo();
+    setState(() {
+      _busy = true;
+      _note = '正在下载 ${ProrootOption.soAssets.length} 个文件…';
+      _noteOk = true;
+    });
+    final logs = <String>[];
+    try {
+      final dl = ProrootDownload(_bridge);
+      final stagingDir = await dl.fetchAll(
+        env: env,
+        onLog: (l) {
+          logs.add(l);
+          if (mounted) setState(() => _note = l);
+        },
+      );
+      // 落位（复用原生的递归拷贝 + ELF 校验）
+      setState(() => _note = '落位中…');
+      final r = await _bridge.prorootInstallFromDir(stagingDir);
+      if (!mounted) return;
+      if (r.ok) {
+        // 成功才清暂存；失败保留，便于用户/我们排查
+        await dl.clearStaging(env);
+      }
+      setState(() {
+        _busy = false;
+        _noteOk = r.ok;
+        _note = r.ok
+            ? '已下载并导入 ${r.copied.length} 个文件，可以点「冒烟测试」验证'
+            : (r.error ?? '落位未完成');
+      });
+      await _refresh();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _noteOk = false;
+        _note = '一键下载失败：$e';
       });
     }
   }
@@ -313,7 +450,7 @@ class _ProrootCardState extends State<ProrootCard> {
     final muted = Theme.of(context)
         .textTheme
         .bodySmall
-        ?.copyWith(color: Colors.grey.shade500, height: 1.45);
+        ?.copyWith(color: FoaColors.of(context).muted, height: 1.45);
     final s = _status;
     final installed = s?.installed ?? false;
 
@@ -347,7 +484,7 @@ class _ProrootCardState extends State<ProrootCard> {
                     visualDensity: VisualDensity.compact,
                     materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     backgroundColor: installed
-                        ? const Color(0xFF3DDC84).withValues(alpha: 0.15)
+                        ? FoaTheme.seed.withValues(alpha: 0.15)
                         : null,
                   ),
               ],
@@ -385,15 +522,25 @@ class _ProrootCardState extends State<ProrootCard> {
             ],
 
             const SizedBox(height: 10),
-            // 三个动作：导入 / 测试 / 移除
+            // 四个动作：一键下载 / 导入 / 测试 / 移除
             Wrap(
               spacing: 8,
               runSpacing: 8,
               children: [
+                // Bug 464：一键从 GitHub 拉取（新用户的默认路径）
+                FilledButton.icon(
+                  onPressed: _busy ? null : _download,
+                  icon: const Icon(Icons.cloud_download_outlined, size: 16),
+                  label: Text(
+                      installed
+                          ? '重新下载'
+                          : '一键下载（${(ProrootOption.totalBytes / 1024).toStringAsFixed(0)}KB）',
+                      style: const TextStyle(fontSize: 12)),
+                ),
                 FilledButton.tonalIcon(
                   onPressed: _busy ? null : _import,
                   icon: const Icon(Icons.file_download_outlined, size: 16),
-                  label: Text(installed ? '重新导入' : '导入 proroot',
+                  label: Text(installed ? '从本地导入' : '导入 proroot',
                       style: const TextStyle(fontSize: 12)),
                 ),
                 OutlinedButton.icon(
@@ -407,7 +554,7 @@ class _ProrootCardState extends State<ProrootCard> {
                     icon: const Icon(Icons.delete_outline, size: 16),
                     label: const Text('移除', style: TextStyle(fontSize: 12)),
                     style: TextButton.styleFrom(
-                      foregroundColor: const Color(0xFFFF7A7A),
+                      foregroundColor: FoaColors.of(context).danger,
                     ),
                   ),
               ],
@@ -423,7 +570,7 @@ class _ProrootCardState extends State<ProrootCard> {
                 width: double.infinity,
                 padding: const EdgeInsets.all(8),
                 decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.25),
+                  color: FoaColors.of(context).codeBg,
                   borderRadius: BorderRadius.circular(6),
                 ),
                 child: SelectableText(
@@ -495,7 +642,7 @@ class _ProrootCardState extends State<ProrootCard> {
           SizedBox(
             width: 116,
             child: Text(k,
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+                style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
           ),
           Expanded(
             child: SelectableText(
@@ -503,7 +650,7 @@ class _ProrootCardState extends State<ProrootCard> {
               style: TextStyle(
                 fontSize: 11,
                 fontFamily: 'monospace',
-                color: warn ? const Color(0xFFFF7A7A) : null,
+                color: warn ? FoaColors.of(context).danger : null,
               ),
             ),
           ),
@@ -513,7 +660,9 @@ class _ProrootCardState extends State<ProrootCard> {
   }
 
   Widget _banner(String text, bool ok) {
-    final c = ok ? const Color(0xFF3DDC84) : const Color(0xFFFFB74D);
+    // Bug 464：改用主题感知语义色（浅色主题下 warning 会压深，避免对比度不足）
+    final fc = FoaColors.of(context);
+    final c = ok ? fc.success : fc.warning;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(8),
@@ -543,27 +692,28 @@ class _ProrootCardState extends State<ProrootCard> {
   static String _plain(String s) => s.replaceAll('**', '');
 
   Widget _warn(String text) {
+    // Bug 464：原先用固定的 `orange.shade50/200/800/900`——那是一套**只适合
+    // 浅色背景**的橙色阶。深色主题下 shade50 是近白底、shade900 是深褐字，
+    // 这块警告框会亮得刺眼且对比度失衡。改用随主题走的语义色。
+    final c = FoaColors.of(context);
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: Colors.orange.shade50,
+        color: c.warningContainer,
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: Colors.orange.shade200),
+        border: Border.all(color: c.warningBorder),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.warning_amber_rounded,
-              size: 16, color: Colors.orange.shade800),
+          Icon(Icons.warning_amber_rounded, size: 16, color: c.warning),
           const SizedBox(width: 6),
           Expanded(
             child: Text(
               _plain(text),
               style: TextStyle(
-                  fontSize: 11.5,
-                  height: 1.45,
-                  color: Colors.orange.shade900),
+                  fontSize: 11.5, height: 1.45, color: c.warning),
             ),
           ),
         ],

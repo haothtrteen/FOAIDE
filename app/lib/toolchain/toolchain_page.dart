@@ -13,6 +13,7 @@ import 'diag_page.dart';
 import 'sdk_downloader.dart';
 import 'sdk_installer.dart';
 import 'termux_backend.dart';
+import '../core/theme.dart';
 
 /// Step 3 工具链页：JDK 17 / Android SDK / Flutter SDK(官方 x64 · QEMU 转发) /
 /// x64 兼容层(QEMU) / 构建镜像配置。
@@ -2098,7 +2099,7 @@ class _NativeCard extends StatelessWidget {
               const SizedBox(height: 8),
               const Divider(height: 1),
               const SizedBox(height: 6),
-              for (final p in a.probes) _probeRow(p),
+              for (final p in a.probes) _probeRow(context, p),
               const SizedBox(height: 4),
               Text(
                 a.buildReady
@@ -2106,7 +2107,7 @@ class _NativeCard extends StatelessWidget {
                         'aapt2 / zipalign）均为 aarch64，理论上可去掉 QEMU。'
                     : '构建链上仍有非原生环节（dart / 快照架构 / gen_snapshot / '
                         'aapt2 / zipalign 任一未原生），这部分仍需 QEMU 转发。',
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+                style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted),
               ),
             ],
             if (_busy) ...[
@@ -2153,7 +2154,7 @@ class _NativeCard extends StatelessWidget {
               '与可选 gen_snapshot，dart / flutter_tools 仍走 QEMU 转发——'
               '两套后端共存，谁覆盖了谁就少一层翻译。\n'
               '体检本身只读，不会修改任何文件。',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+              style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 16),
             if (phase == NativePhase.downloading) ...[
@@ -2256,13 +2257,13 @@ class _NativeCard extends StatelessWidget {
     );
   }
 
-  Widget _probeRow(NativeProbe p) {
+  Widget _probeRow(BuildContext context, NativeProbe p) {
     final c = p.native
         ? const Color(0xFF3DDC84)
         : (p.kind == NativeProbeKind.qemuWrapper
             ? Colors.orangeAccent
             : (p.kind == NativeProbeKind.missing
-                ? Colors.grey.shade600
+                ? FoaColors.of(context).muted
                 : const Color(0xFFFF7A7A)));
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
@@ -2335,7 +2336,7 @@ class _AvfCard extends StatelessWidget {
 
     final color = supported
         ? (installed ? const Color(0xFF3DDC84) : const Color(0xFFFFC46B))
-        : Colors.grey.shade600;
+        : FoaColors.of(context).muted;
 
     return Card(
       child: Padding(
@@ -2386,7 +2387,7 @@ class _AvfCard extends StatelessWidget {
               '→ 在 VM 内自行安装 Flutter 环境后构建。\n\n'
               '本卡片仅做能力告知，不代表本 App 可代为驱动 VM。',
               style: TextStyle(
-                  fontSize: 11, height: 1.6, color: Colors.grey.shade500),
+                  fontSize: 11, height: 1.6, color: FoaColors.of(context).muted),
             ),
             if (supported && !installed) ...[
               const SizedBox(height: 10),
@@ -2707,7 +2708,7 @@ class _SdkCard extends StatelessWidget {
                         fontSize: 16, fontWeight: FontWeight.bold),
                   ),
                 ),
-                Icon(icon, size: 20, color: Colors.grey.shade500),
+                Icon(icon, size: 20, color: FoaColors.of(context).muted),
               ],
             ),
             const Divider(height: 20),
@@ -2747,7 +2748,7 @@ class _SdkCard extends StatelessWidget {
             ],
             const SizedBox(height: 12),
             Text(desc,
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+                style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
             const SizedBox(height: 16),
             Row(
               children: [
@@ -2976,7 +2977,7 @@ class _MirrorCard extends StatelessWidget {
               'gradle-wrapper.properties 指向腾讯云镜像；预下载 '
               'Gradle ${MirrorConfigurator.gradleVersion} 分发包（224MB）到 '
               'wrapper 缓存目录，首次构建不再访问国外源。',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+              style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 16),
             Row(
@@ -3159,7 +3160,7 @@ class _QemuCard extends StatelessWidget {
               '并内置分步冒烟验证（qemu → 动态链接器 → gen_snapshot --help）。\n'
               '注意：QEMU 为动态翻译，AOT 编译阶段会比原生慢；此层是官方 SDK 在 '
               'aarch64 上完成 flutter build apk 的必要补丁。',
-              style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+              style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 16),
             Row(

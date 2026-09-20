@@ -1,7 +1,7 @@
 name: foaide
 description: FOAIDE - a Flutter IDE that runs natively on Android, with a local Flutter SDK, in-device container, Web hot-reload preview and on-device APK building.
 publish_to: 'none'
-version: 0.1.0-alpha.62+62
+version: 0.1.0-alpha.63+63
 
 environment:
   sdk: '>=3.3.0 <4.0.0'

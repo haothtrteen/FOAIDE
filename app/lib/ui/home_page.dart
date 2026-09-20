@@ -301,7 +301,7 @@ class _HomePageState extends State<HomePage> {
                   '需自备移植产物导入。',
                   style: TextStyle(
                       fontSize: 12,
-                      color: Colors.grey.shade500,
+                      color: FoaColors.of(context).muted,
                       height: 1.5),
                 ),
               ],
@@ -378,7 +378,7 @@ class _HomePageState extends State<HomePage> {
                 Text(
                   '容器 /root/projects ↔ 外部 /sdcard/Android/data/<包名>/projects 双向同步，'
                   '让系统文件管理器 / 电脑可以直接读写项目文件。',
-                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                  style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
                 ),
                 const SizedBox(height: 12),
                 Row(
@@ -451,7 +451,7 @@ class _HomePageState extends State<HomePage> {
                 style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
             const SizedBox(width: 8),
             Text('${_projects.length} 个',
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
+                style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
             const Spacer(),
             IconButton(
               tooltip: '刷新工程列表',
@@ -483,7 +483,7 @@ class _HomePageState extends State<HomePage> {
               child: Column(
                 children: [
                   Icon(Icons.folder_open_outlined,
-                      size: 40, color: Colors.grey.shade600),
+                      size: 40, color: FoaColors.of(context).muted),
                   const SizedBox(height: 8),
                   const Text('暂无工程',
                       style: TextStyle(fontWeight: FontWeight.w600)),
@@ -491,7 +491,7 @@ class _HomePageState extends State<HomePage> {
                   Text(
                     '点击右下角「+」选择模板：离线空白工程（免 Git，秒建）或内置 Flutter 官方 Demo。',
                     textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                    style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
                   ),
                 ],
               ),
@@ -802,7 +802,7 @@ class _CreateDemoSheetState extends State<_CreateDemoSheet> {
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                        fontSize: 10, color: Colors.grey.shade500, height: 1.3),
+                        fontSize: 10, color: FoaColors.of(context).muted, height: 1.3),
                   ),
                 ],
               ),

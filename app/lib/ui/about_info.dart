@@ -13,7 +13,7 @@ class AboutInfo {
   static const String appName = 'FOAIDE';
 
   /// 版本号。**必须与 pubspec.yaml 的 version 同步**（有单测守住）。
-  static const String version = 'v0.1.0-alpha.62+62';
+  static const String version = 'v0.1.0-alpha.63+63';
 
   /// 一句话说明（关于页副标题）。
   static const String tagline = '在 Android 上原生构建 Flutter 应用';

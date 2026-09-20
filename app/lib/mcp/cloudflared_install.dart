@@ -44,6 +44,18 @@ class CloudflaredInstall {
   /// 期望字节数（GitHub Releases 元数据；用于分片下载）。
   static const int expectedSize = 37466252;
 
+  /// 期望 SHA-256（Bug 464 新增）。
+  ///
+  /// 在此之前 cloudflared **没有内容校验**——只比字节数。字节数对但内容坏
+  /// （镜像返回错误页、被中间层注入、CDN 缓存了半截文件）时，下载会"成功"，
+  /// 直到容器里 `--version` 跑不起来才报错，且报的是"架构不匹配"这种误导
+  /// 信息。加上 sha256 后，坏内容在下载阶段就被拦下。
+  ///
+  /// 值取自 2026-09-20 实测（ghfast.top 与 ghproxy.net 两个镜像下载后
+  /// `sha256sum` 结果一致，交叉验证过）。
+  static const String sha256 =
+      '3d97437c71848bd8df68041e12436b484a661d95073ea1937f01a845ce88faa3';
+
   /// 下载源（国内镜像优先，GitHub 直链兜底）。
   ///
   /// Bug 456 教训：这里原本只有 2 个源，而 `SdkDownloader` 当时要求分片必须
@@ -52,17 +64,42 @@ class CloudflaredInstall {
   /// GitHub 系域名的连通性波动很大，多一个镜像就多一条活路。
   ///
   /// 本列表的每个源都在 2026-09-20 实测过 Range 可达性（206 + 正确字节数）：
-  /// ghfast / ghproxy.net 均通，GitHub 直链作为兜底保留。
+  /// ghfast / ghproxy.net / gh-proxy.com 均通，GitHub 直链作为兜底保留。
   /// 曾尝试加入 `github.moeyy.xyz`，实测 DNS 无法解析，**故不纳入**——
   /// 宁可少一个源，也不要摆一个永远超时、白白拖慢竞速的假选项。
+  ///
+  /// Bug 464：源从 3 个扩到 4 个。用户反复报"下载不了"，而本地实测三个源
+  /// 全通——说明失败是**特定网络下的可达性问题**。这类问题无法靠"换个源"
+  /// 根治，只能：(a) 多留几条路，(b) 把每个源的具体失败原因暴露给用户
+  /// （见 [diagnose]），让用户能判断是 DNS 还是超时。
   static const List<MirrorSource> mirrors = [
     MirrorSource('ghfast', 'https://ghfast.top/https://github.com/'
         'cloudflare/cloudflared/releases/download/$version/$assetName'),
     MirrorSource('ghproxy.net', 'https://ghproxy.net/https://github.com/'
         'cloudflare/cloudflared/releases/download/$version/$assetName'),
+    MirrorSource('gh-proxy.com', 'https://gh-proxy.com/https://github.com/'
+        'cloudflare/cloudflared/releases/download/$version/$assetName'),
     MirrorSource('github', 'https://github.com/cloudflare/cloudflared/'
         'releases/download/$version/$assetName'),
   ];
+
+  /// Bug 464：逐镜像探测并汇报**具体失败原因**（供 UI「下载诊断」用）。
+  ///
+  /// 存在的理由：cloudflared 下载失败的用户反馈无法定位——三源在开发机上
+  /// 全通，说明是用户网络的点对点问题。不给原因，用户只能反复重试。
+  /// 返回可直接展示的多行文本。
+  static Future<String> diagnose() async {
+    try {
+      final probes = await SdkDownloader.diagnose(mirrors);
+      final okCount = probes.where((p) => p.ok).length;
+      final head = okCount > 0
+          ? '✓ $okCount/${probes.length} 个镜像可达'
+          : '✗ 所有镜像都不可达（网络问题，非本 App 故障）';
+      return '$head\n${probes.map((p) => '· ${p.summary}').join('\n')}';
+    } catch (e) {
+      return '诊断本身失败：$e';
+    }
+  }
 
   /// 确保 cloudflared 可用（幂等）。
   /// 返回 null = 就绪；否则错误文案。
@@ -95,8 +132,26 @@ class CloudflaredInstall {
         onMirrorUsed: (m) => onLog?.call('· 使用镜像源：${m.name}'),
       );
     } catch (e) {
-      return 'cloudflared 下载失败：$e（国内网络可稍后重试；'
-          '或改用「系统浏览器」手动下载后放入容器 /opt/foa-bin/）';
+      // Bug 464：失败文案带上**逐源诊断**，让用户能区分"网络不通"与
+      // "程序 bug"。原文案（"下载失败：… 国内网络可稍后重试"）等于没说。
+      final diag = await diagnose();
+      return 'cloudflared 下载失败：$e\n\n各镜像探测结果：\n$diag\n\n'
+          '若全部不可达：多为网络问题（DNS/防火墙），可换网络后重试；'
+          '或手动下载后放入容器 /opt/foa-bin/。';
+    }
+
+    // ②.5 SHA-256 校验（Bug 464 新增）
+    // 必须在落位**之前**：字节数相同但内容损坏（镜像错误页、半截缓存）
+    // 到了容器里才炸，报的还是"架构不匹配"这种误导信息。
+    try {
+      final ok = await SdkDownloader.verifySha256(savePath, sha256);
+      if (!ok) {
+        return 'cloudflared 校验失败（内容与官方不一致，可能镜像损坏或被篡改）：\n'
+            '期望 $sha256\n路径 $savePath\n'
+            '已保留可疑文件供排查；重试会重新下载。';
+      }
+    } catch (e) {
+      return 'cloudflared 校验时出错：$e';
     }
 
     // ③ 落位 + 校验可执行（在容器内做——宿主侧没有 chmod）

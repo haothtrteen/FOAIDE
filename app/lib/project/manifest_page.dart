@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../editor/fs_bridge.dart';
 import 'manifest_codec.dart';
+import '../core/theme.dart';
 
 /// 项目工作台 ·「清单」区（alpha.61 重做）。
 ///
@@ -1194,7 +1195,7 @@ class ManifestPageState extends State<ManifestPage> {
             Padding(
               padding: const EdgeInsets.only(left: 26),
               child: Text(subtitle,
-                  style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+                  style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
             ),
             const Divider(height: 22),
             ...children,
@@ -1217,7 +1218,7 @@ class ManifestPageState extends State<ManifestPage> {
               child: Text(hint,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 10, color: Colors.grey.shade600)),
+                  style: TextStyle(fontSize: 10, color: FoaColors.of(context).muted)),
             ),
           ],
         ],
@@ -1233,7 +1234,7 @@ class ManifestPageState extends State<ManifestPage> {
         style: TextStyle(
           fontSize: 10.5,
           height: 1.5,
-          color: warn ? const Color(0xFFFFB74D) : Colors.grey.shade500,
+          color: warn ? const Color(0xFFFFB74D) : FoaColors.of(context).muted,
         ),
       ),
     );

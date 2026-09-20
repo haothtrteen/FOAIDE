@@ -6,6 +6,7 @@ import 'cloudflared_install.dart';
 import 'mcp_schema.dart';
 import 'mcp_server.dart';
 import 'tunnel_service.dart';
+import '../core/theme.dart';
 
 /// 远程接管页（alpha.60）。
 ///
@@ -141,6 +142,74 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
     if (mounted) _snack('已复制$what');
   }
 
+  /// Bug 464：下载诊断——逐个镜像探测并展示**具体失败原因**。
+  ///
+  /// 为什么值得做成按钮：cloudflared 下载失败的用户反馈无法复现——开发机
+  /// 上几个镜像全通，说明是用户网络的点对点问题。不把 DNS/超时/TLS 的
+  /// 区别摆出来，用户只能盲目重试，我们也没法判断该修哪里。
+  Future<void> _diagnoseDownload() async {
+    setState(() => _busy = true);
+    final text = await CloudflaredInstall.diagnose();
+    if (!mounted) return;
+    setState(() => _busy = false);
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('cloudflared 下载源诊断'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '逐个探测 ${CloudflaredInstall.mirrors.length} 个下载源'
+                '（${CloudflaredInstall.assetName}，'
+                '${(CloudflaredInstall.expectedSize / 1024 / 1024).toStringAsFixed(0)}MB）。',
+                style: const TextStyle(fontSize: 12, height: 1.4),
+              ),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: FoaColors.of(ctx).codeBg,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: SelectableText(
+                  text,
+                  style: const TextStyle(
+                      fontFamily: 'monospace', fontSize: 11, height: 1.5),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                '若显示"网络：Failed host lookup"→ DNS 解析问题，可换 DNS；\n'
+                '若显示"超时"→ 该源被限速或不通，换网络重试；\n'
+                '若显示"HTTP 404"→ 版本号可能已失效，请反馈。',
+                style: TextStyle(
+                    fontSize: 11, height: 1.5, color: FoaColors.of(ctx).muted),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('关闭'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: text));
+              Navigator.pop(ctx);
+              _snack('诊断结果已复制');
+            },
+            child: const Text('复制'),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// 生成给 AI 的接入说明（含令牌，故要提示用户注意）。
   String _handoff() => buildHandoffPrompt(
         tunnelUrl: t.url,
@@ -201,7 +270,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
               style: TextStyle(
                   fontSize: 11.5,
                   height: 1.45,
-                  color: Colors.grey.shade600),
+                  color: FoaColors.of(context).muted),
             ),
           ],
         ),
@@ -297,7 +366,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                 if (t.remainSec != null && running)
                   Text('剩余 ${remainLabel(t.remainSec)}',
                       style: TextStyle(
-                          fontSize: 12, color: Colors.grey.shade500)),
+                          fontSize: 12, color: FoaColors.of(context).muted)),
               ],
             ),
             if (t.busy) ...[
@@ -359,6 +428,12 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                       label: const Text('复制地址'),
                     ),
                 ],
+                // Bug 464：下载失败时给用户一个能自查的入口
+                OutlinedButton.icon(
+                  onPressed: _busy ? null : _diagnoseDownload,
+                  icon: const Icon(Icons.network_check, size: 18),
+                  label: const Text('下载源诊断'),
+                ),
               ],
             ),
           ],
@@ -386,7 +461,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                       '项目路径与注意事项——AI 无需自己摸索环境。'
                   : '隧道就绪后这里会生成一段可直接粘贴给 AI 的接入说明。',
               style: TextStyle(
-                  fontSize: 12, color: Colors.grey.shade500, height: 1.4),
+                  fontSize: 12, color: FoaColors.of(context).muted, height: 1.4),
             ),
             const SizedBox(height: 10),
             Wrap(
@@ -417,14 +492,14 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
               style: TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 11,
-                  color: Colors.grey.shade500),
+                  color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 4),
             Text(
               '· 令牌每次开启都会轮换，停止后立即失效。\n'
               '· 「地址+令牌」组合等同于这台机器的钥匙，请勿发到公开场合。',
               style: TextStyle(
-                  fontSize: 11, color: Colors.grey.shade600, height: 1.4),
+                  fontSize: 11, color: FoaColors.of(context).muted, height: 1.4),
             ),
           ],
         ),
@@ -447,7 +522,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
             Text(
               '以下能力通过 MCP 协议暴露给远程 AI，共 ${kTools.length} 项：',
               style:
-                  TextStyle(fontSize: 12, color: Colors.grey.shade500),
+                  TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 8),
             ...kTools.map((tool) => Padding(
@@ -492,7 +567,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
               '④ 容器内看不到 Android 宿主的文件与相册；'
               '⑤ AI 无法直接触发 APK 构建（会抢锁并阻塞你，需你自己操作）。',
               style: TextStyle(
-                  fontSize: 11, color: Colors.grey.shade600, height: 1.5),
+                  fontSize: 11, color: FoaColors.of(context).muted, height: 1.5),
             ),
           ],
         ),
@@ -516,7 +591,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                 const Spacer(),
                 Text('最近 ${mcp.audit.length} 条',
                     style: TextStyle(
-                        fontSize: 11, color: Colors.grey.shade600)),
+                        fontSize: 11, color: FoaColors.of(context).muted)),
               ],
             ),
             const SizedBox(height: 6),
@@ -526,7 +601,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                 if (mcp.audit.isEmpty) {
                   return Text('（暂无记录——AI 的每次操作都会出现在这里）',
                       style: TextStyle(
-                          fontSize: 12, color: Colors.grey.shade600));
+                          fontSize: 12, color: FoaColors.of(context).muted));
                 }
                 final recent = mcp.audit.reversed.take(30).toList();
                 return Column(

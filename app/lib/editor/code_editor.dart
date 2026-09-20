@@ -27,6 +27,7 @@ import 'completion.dart';
 import 'dart_syntax_checker.dart';
 import 'hint_prefs.dart';
 import '../env/proot_bridge.dart';
+import '../core/theme.dart';
 
 /// 代码编辑器：语法高亮 + 行号 + 等宽字体 + 轻量补全/语法检查。
 ///
@@ -574,7 +575,7 @@ class CodeEditorState extends State<CodeEditor> {
 
   Widget _buildStatusBar() {
     final (Color color, IconData icon, String text) = _checking
-        ? (Colors.grey.shade500, Icons.hourglass_empty, '检查中…')
+        ? (FoaColors.of(context).muted, Icons.hourglass_empty, '检查中…')
         : _issues.isEmpty
             ? (const Color(0xFF3DDC84), Icons.check_circle_outline, '语法 OK')
             : (const Color(0xFFFF7A7A), Icons.error_outline, '${_issues.length} 个问题');
