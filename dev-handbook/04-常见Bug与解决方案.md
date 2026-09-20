@@ -3587,6 +3587,19 @@ AOT_LOAD_OUT=...dispatch_table_generator.cc: 432: error: Missing table selector 
 
 ### Bug 447：真机 SIGILL 真因锁定——qemu TCG 按 CPU 模型门控 SIMD 指令；`-cpu max` 一行修复
 
+> **⚠️ 2026-09-19 批注（Bug 449 平反，保留原文作误诊标本）**：
+> 本条目的"真因锁定"结论**已被推翻**。真机直控通道打通后做了三组对照
+> 实验——`-cpu max` / 默认 / `-cpu qemu64` 跑**同一个真实 AOT dill**
+> （47MB，正宗 frontend_server AOT+TFA 产物）——**全部 rc=0**：
+> arm64 host 的 qemu 默认模型对 gen_snapshot **并没有门控**（Dart 编译器
+> 运行时自己检测 CPU 特性，无 AVX 走标量路径）。当时"沙箱 `-cpu qemu64`
+> rc=132 与真机 exit -4 逐位一致"是**不同故障撞出同一个信号码**的巧合
+> （SIGILL 是执行域故障的常见终点），这个"逐位一致"把方向带偏了两个版本；
+> 沙箱 rc=134 实为 dill 缺 AOT/TFA 元数据（"Missing table selector
+> metadata"），当时被误读成"业务报错=环境好"。
+> **真因见 Bug 449**：linux-x64/ 裸真身被直接 exec。`-cpu max` 修复本身
+> 保留（无害的防御纵深）。gen_snapshot 从第一天起就没毛病。
+
 **日期**：2026-09-19（alpha.53）
 **症状**：真机 alpha.52 构建在 AOT 57% 崩：`gen_snapshot exit -4`（SIGILL）、
 `impellerc failure:` ×2（同样 -4）。转发层全程完好（`AOT_FP` 前后全 ok）、
@@ -3665,9 +3678,546 @@ AOT_LOAD=rc=132      → wrapper(-cpu max) 还 SIGILL → 看 AOT_LOAD_DEF
 
 ---
 
+### Bug 449：五个版本的 exit -4 真因——dart 经 qemu 自报 x64，全部工具解析到 linux-x64/ 裸真身
+
+**日期**：2026-09-19（真机直控裁决当日；alpha.55 固化）
+**出现版本**：alpha.49 ~ alpha.53（AOT 阶段 `exit -4` 的最终真因；
+更早的 alpha.37~48 是它的各层外围：Bug 428/429/433/439/441/442/444/445）
+
+**症状**：构建在 AOT/Shader 阶段 `Dart snapshot generator failed with
+exit code -4`（SIGILL）、`impellerc failure:` ×2。转发层全程完好
+（AOT_FP 全 ok、REASSERT 正常）、内存充足、所有诊断探针全绿——
+Bug 446 的"能启动 ≠ 能编译"结论也错了：连真实 AOT 负载探针都是绿的。
+
+**裁决通道**：cloudflared quick tunnel + HTTP 命令服务直控真机
+（wget 无 curl、无 ps/pgrep 用 /proc 遍历、CF 隧道在构建负载下频繁
+1033/524 断连，靠用户手动重启换 URL 维持）。
+
+**五轮裁决实验（时间线）**：
+
+| # | 实验 | 结果 | 排除的假设 |
+|---|---|---|---|
+| 1 | gen_snapshot --version 三 CPU 模型 | 全 rc=0 | qemu 本体/加载方式 |
+| 2 | impellerc 最小 GLSL 真编译 | 全 rc=0，产出 1084B SPIRV | qemu + shader 输入 |
+| 3 | 沙箱拷来的 8.6MB dill | 全 rc=134 | ——（误读：非"业务报错"，是 dill 缺 AOT/TFA 元数据） |
+| 4 | 正宗 AOT dill（dartaotruntime + frontend_server_aot.snapshot --aot --tfa 自编，47.4MB）三模型 | **全部 rc=0**（max 4m58s / def 5m27s / q64 5m27s，产物逐字节同尺寸） | **TCG 门控（Bug 447 被平反）** |
+| 5 | 构建自带的 22.6MB dill 手工喂 gen_snapshot | rc=0 | dill 输入 |
+
+→ **gen_snapshot 从第一天起就没毛病；唯一还站着的是"构建流程喂的路径
+不对"。给引擎目录埋点（wrapper 里 echo 命中日志），真相出来了。**
+
+**真因证据链（埋点实锤）**：
+
+1. App 部署的 dart 是 **x86_64 二进制经 qemu 运行**（dart-sdk/bin 原位
+   包装，Bug 428 系列的产物）→ dart VM 内 `Abi.current()` 自报 **x64**；
+2. flutter_tools `getCurrentHostPlatform()` 据此判定 **linux_x64**
+   ——artifacts.dart 只对 darwin_arm64 做 x64 回退，**linux_arm64 没做**
+   （flutter/flutter#152281）；
+3. 于是 gen_snapshot（android-{arm,arm64,x64}-release 三个 target 全部）、
+   impellerc、font-subset **全部解析到 `linux-x64/` 原目录**；
+4. 该目录下是裸 x64 ELF（兼容层只包了 linux-arm64/ 对称位），arm64 内核
+   exec → SIGILL = exit -4；
+5. **埋点证据：linux-x64 位命中日志 X64_GEN / X64_IMPELLER 刷屏，
+   维护了一个多星期的 linux-arm64/ 对称 wrapper 零命中——从构建第一天起
+   就没被调用过一次。**
+
+**修复（真机现场实证 → alpha.55 固化）**：
+
+1. **linux-x64 原位包装**：官方名字位 `gen_snapshot` 改名 `.foa-real`，
+   原路径放 wrapper（真身感知：对称段 gen 直接指 `.foa-real`，不过两层
+   sh）。覆盖：android-{arm,arm64,x64}-release + 顶层 linux-x64 的
+   gen_snapshot ×3、impellerc、font-subset。真机修完 build7 直接产出
+   **app-release.apk 43.0MB**（x86_64 工具链经 qemu 在 arm64 真机全链路
+   首次全绿）。
+2. **precache 自愈**：wrapReassertScript 新增 REASSERT_INPLACE 段——
+   precache 会把官方 ELF 写回原位冲掉 wrapper，构建前无条件再断言
+   （`*.foa-real` 是私有名，precache 不会碰，mv 覆盖同名真身也安全）。
+3. **AOT_FP 角色判定升级**：`*.foa-real` → REAL 期望 raw；其余（含
+   linux-x64/ 普通名字）→ SLOT 期望 wrapper；指纹列表补
+   `gen_snapshot.foa-real` 条目。
+4. **AOT_LOAD_DEF 探针改指 `.foa-real`**（裸 qemu 执行不了 `#!` 脚本）。
+5. **verify 冒烟补 GEN_INPLACE / IMPELLERC_INPLACE**（验证不到的路径
+   就是会崩的路径——Bug 437 原位版）。
+6. **卸载还原**：uninstallScript 增加 linux-x64 位 `.foa-real` → 原名
+   循环。
+7. **NDK strip 补位（连带暴露）**：AOT 修通后第一次跑到 gradle
+   `:app:stripReleaseDebugSymbols` 才发现 NDK 是空壳（只有
+   source.properties，Bug 427 的省 2GB 设计）——此前五版全死在 AOT，
+   strip 执行期从未到达，窟窿一直没暴露。修复：**不装完整 NDK**，apt 装
+   Debian llvm（arm64 原生、不过 qemu、能剥任意架构 ELF），symlink
+   llvm-strip/llvm-objcopy 进 NDK 期望路径（`ndkStripTools`，构建前
+   探测→补位，失败不阻断）。
+8. **chk/复核脚本收敛**：qemuCompatEnsure 的全量比对原先 chk 与复核两份
+   手抄已开始漂移（miss 标签不一致），收敛到 `wrapCheckScript(tag)` 单一定义。
+
+**教训**：
+
+- **二进制架构自报不可信，以调用路径埋点实证。** dart 说自己是 x64、
+  诊断说转发层完好、负载探针说 AOT 能跑——全都对，但拼出来的"构建应该
+  能过"是错的。唯一可靠的是**在真实调用路径上埋点**，看构建那一刻到底
+  exec 了哪个文件。这条也写进了 SKILL 排障表。
+- **"逐位一致的 rc"不等于"同因"。** Bug 447 的 `-cpu qemu64` rc=132 与
+  真机 exit -4 逐位一致，貌似铁证，实为两个不同故障撞同一个信号码。
+  SIGILL 是执行域故障的常见终点，用它做"同因"推断之前必须先隔离变量。
+- **维护了没人走的路径，等于没修。** 对称 wrapper 精心维护了一个多星期、
+  每版都自愈/再断言——而构建根本不经过它。修复的第一步永远是确认
+  "真实调用路径是哪条"。
+- **空壳设计的窟窿会在最深处暴露。** NDK 空壳骗配置期检测的设计没错，
+  但要清楚它只兜住了配置期；每一层"从未被执行过的代码路径"都是隐藏的
+  破产点，链路打通是逐层兑现欠账的过程。
+- **诊断脚本本身要过 bash -n 门禁。** 本条收尾时 AOT_FP 段因复制粘贴
+  产生"两个 for 头、一个 done"的语法错误（bash 直接拒绝整个预检脚本），
+  单测 dash/bash 语法门禁（bug449 测试组）由此设立：**凡被执行的脚本
+  必须可被单测语法检查**。
+
+---
+
+### Bug 451：工具链页假警报——红字 `invalid ELF header`、INPLACE 却全绿、构建照样成功（2026-09-19，alpha.56 修复）
+
+**症状**：真机工具链页（x64 兼容层已启用）显示：
+
+```
+IMPELLERC 不可用（AOT 会在 shader 阶段崩）· font-subset 不可用
+error while loading shared libraries: .../linux-x64/impellerc: invalid ELF header
+```
+
+而同一页面 `GEN_SNAPSHOT / GEN_INPLACE / IMPELLERC_INPLACE` 全部正常，
+**且同一状态下真机一键构建端到端成功出 APK**（15.0MB 用户项目，199.1s）。
+用户发截图问："这是不是有问题啊？"
+
+**排查**：绿与红并存、构建又不失败——先按"评分探针 vs 真实调用路径"
+脱钩去查，两层病灶：
+
+1. **报警来源**：verify 的评分探针还在测**对称位**
+   （`linux-arm64/<tool>`，alpha.53 时代旧对称包装）。而 Bug 449 已实证
+   构建走**原位**（`linux-x64/<tool>` → `.foa-real`），不走对称位。
+   对称位的旧 wrapper 的真身参数烘死指向 `linux-x64/<tool>`——
+   Bug 449 原位包装后，该位置变成了 `#!` 开头的 shell 文本（原位=wrapper）。
+   探针执行它：qemu + ld.so 加载 shell 文本 →
+   `error while loading shared libraries: <自身路径>: invalid ELF header`。
+   （invalid ELF header 的语义不是"ELF 坏了"，是"**喂给加载器的不是 ELF**"。）
+2. **为什么一直修不掉**：engineWrapScript 的对称段有
+   `#! → continue` 幂等短路——"目标已是脚本形态就跳过重建"。
+   旧对称 wrapper 恰好是 `#!` 形态，短路永远命中，新包装永远写不进去。
+   **形态合法、指向已死**——Bug 445"形态合法但内容被覆盖"的换位复发。
+
+**修复**（alpha.56，qemu_compat.dart）：
+
+1. engineWrapScript 两处对称段（引擎层 + 顶层）改**无条件重建**：
+   `linux-arm64/` 里本来就该全是「指向 `.foa-real` 的转发脚本」，
+   不存在合法裸 ELF，不需要看形态——与 heal 无条件删同款逻辑。
+2. verify 评分改以 **INPLACE 探针为准**（真实调用路径同源）：
+   `kv('GEN_INPLACE') ?? kv('GEN_SNAPSHOT')` 模式，GEN/IMPELLERC/
+   FONT_SUBSET 三项全改；对称位探测降级为**观测行**
+   （"对称位异常（兜底路径，不影响构建；重新应用兼容层可修）"），
+   不再参与合格判定。impellerc 失败文案同步改为
+   "构建会在 shader 阶段崩"（web 目标不走 AOT 但 shader 照崩，
+   文案别把死因说窄）。
+3. 补 `FONT_SUBSET_INPLACE` 冒烟；bug449 测试组新增回归用例：
+   旧对称 wrapper 指向 `#!` 位 → engineWrap 后必须重建成
+   含 `.foa-real` 的新形态（280 测试全绿）。
+
+**教训**：
+
+- **幂等短路的判据不能只看自身形态。** "已是脚本就跳过"遇上
+  "脚本但指向已死"会永久卡死：要么校验指向目标的存活，要么
+  无条件重建（当目录的合法形态本来就恒定时，无条件重建更简单）。
+- **评分探针必须与真实调用路径同源。** 刚实证"构建走原位不走对称"，
+  verify 却还在测对称位——可用性报告与实际链路脱钩，报警必然失真。
+- **假警报的真害是让人不敢信任何颜色。** 绿（INPLACE 全）+ 红
+  （IMPELLERC 报警）+ 构建成功三者并存，用户只能问"这是不是有问题"。
+  观测信息（可修的异常）与合格判定（阻断性的失败）必须分层呈现。
+
+---
+
+### Bug 452：日志已打印 `✓ Built ...`，进度条却停在 95%「打包与签名」不动（2026-09-19，alpha.58 修复）
+
+**症状**：真机构建 25 分钟后，日志最后一行已是
+`✓ Built build/app/outputs/flutter-apk/app-release.apk (15.0MB)`，
+但进度条停在「打包与签名 APK 95%」转圈不走。用户判读为
+"卡在最后一步签名"。
+
+**判读**：`✓ Built` 打印在 Gradle 打包+签名**完成之后**——构建本体
+已经成功。卡住的是**收尾判定**：flutter 工具偶发 Built 后 hang 不退出
+（dart VM 收尾不退出），平台侧 execStream 的 running 恒真 →
+BuildRunner._poll 永远等不到退出事件 → `_finish` 不触发 → 不 markDone。
+
+顺带一个好消息藏在同一份日志里：出现了**两次**
+`Running Gradle task 'assembleRelease'`——第一次失败 → 指纹采集
+命中 BAD → clean + reassert + 重启构建 → 第二次 66.7s 成功。
+这是 Bug 445 的 heal 自愈链路**第一次在真机实战按设计工作**。
+
+**修复**（alpha.58，build_runner.dart）：
+
+1. `_appendChunk` 检测 Built 行（`builtMarker`）→ 记录命中时刻
+   `_builtAt`，并立即向日志输出
+   "✓ Gradle 打包+签名完成，等待 flutter 工具收尾…"——先止住误读；
+2. `_poll` 里纯函数 `builtGraceElapsed`（宽限 90s）到期且仍 building →
+   强制 `_finish(0)`：走产物定位 + markDone + 成功状态，与自然退出
+   完全同一条收尾路径；
+3. 单测固化：宽限判定四态（未命中/未到期/到期/常量合理性）。
+
+**教训**：
+
+- **"成功输出"与"进程退出"是两个事件。** 长任务的完成判定不能只
+  依赖退出码——日志里的成功标记（Built / BUILD SUCCESS）是更早、
+  更稳的事实，值得作为独立信号锚定。
+- **进度条停滞时先看日志尾部。** 95% 不是 gradle 的 95%，是插值器
+  的 95%；日志已经宣布成功了，UI 就该同步。
+
+---
+
+### Bug 453：通知栏点「Web 预览」通知却跳到 APK 构建页（2026-09-19，alpha.59 修复）
+
+**症状**：预览运行中，用户点通知栏「Web 预览 · my_flutter 运行中」，
+打开的却是 APK 构建页。
+
+**根因**：通知由原生前台服务发出，点击回发 Dart 的只有一个
+navigate 信号——**不带类别**。Dart 侧 `_openNotifyTarget` 无法区分
+这条通知来自构建还是预览，默认进了构建页。
+
+**修复**（alpha.59，零原生改动）：
+
+1. `BuildNotify` 加 `static String lastRoute = 'build'`——原生不传
+   类别，Dart 侧按"最近一次启动的任务"分流；
+2. `BuildRunner.start` 置 `'build'`、`WebPreviewService.start` 置
+   `'preview'`；
+3. `_openNotifyTarget`：`lastRoute == 'preview'` 且有项目名且预览
+   busy → 进 WebPreviewPage；否则构建页兜底。
+
+**教训**：
+
+- **单活跃通知场景下，"最近启动者"即事实类别。** 构建与预览本就
+  被启动互斥挡住并发，静态字段分流零协议成本，不值得为它改原生
+  通道加序列化字段。
+- 通知是 App 的"门面导航"：每新增一种前台任务类型，回发路由就要
+  分叉一次——加任务类型时把 lastRoute 的赋值一并写进 start。
+
+---
+
+### Bug 454：Web 预览永久停在「正在编译…」——DDC 期间没有任何就绪标志，也没有超时兜底（2026-09-19，alpha.60 修复）
+
+**症状**：点「Web 预览」后日志停在
+
+```
+Launching lib/main.dart on Web Server in debug mode...
+```
+
+进度条一直是「正在编译…」，左上角计时走到 10 分钟仍无内嵌 WebView
+出现。用户合理怀疑："是已经 launching 了但没拉起 webview？还是没
+构建好？"
+
+**根因（两条叠在一起）**：
+
+1. **假状态**：`WebPreviewService` 判定"编译完成"只看日志里是否出现
+   `readyMarkers` 里的 5 个词。DDC 编译期（`Launching...` /
+   `Waiting for connection...`）**不输出其中任何一个**——测试里已
+   显式断言这两行 `isReadyLine == false`。于是状态机永远卡在
+   `starting`。
+2. **无兜底**：唯一的终态出口是"进程退出"。只要进程还活着，无论
+   跑多久，UI 都只能继续显示「正在编译…」。而 WebView 只在
+   `running` 分支构造——**永不加载**。
+
+即："编译中"是一个**没有超时、没有旁路证据**的状态，任何一次
+标志词漂移都会让用户对着进度条干等到天荒地老。
+
+**修复**（alpha.60，三件事，无原生改动）：
+
+1. **端口探测作为旁路证据**：新增 `probePort()`，用 `dart:io`
+   `HttpClient` 每 3 秒探 `127.0.0.1:8090`（1.5s 连接超时），
+   返回 200/404/503 都算"在听"。
+   
+   > 这里更正手册 02 的一个错误结论：原写"App 侧 HttpClient 探测
+   > 不可用"。实际上 Android 的明文流量拦截发生在 **Java 框架层**
+   > （`NetworkSecurityPolicy` / OkHttp / WebView），Dart `dart:io`
+   > 的 `HttpClient` 走 **NDK 原生 socket**，不受该策略约束——项目
+   > 自身的 `sdk_downloader.dart` 用 HttpClient 直连 http 镜像源
+   > 就是活证据。
+2. **三段裁决** `readyDecision()`：
+   - 命中标志词 → `ready`；
+   - 未命中但**端口已通** → 继续等宽限期（DDC 可能还没写完产物），
+     宽限期（420s）到仍未命中 → **`degrade` 降级放行**；
+   - 端口不通 → `waiting`。
+   
+   降级的设计取向：宁可让用户看到"可能还没编译完的页面"，也不要
+   让他对着「正在编译中」干等——**假进度比真空白更伤信任**。
+3. **心跳与埋点**：`starting` 期间每 15 秒打一行
+   `[heartbeat] 已运行 Xs（端口：通/未通）`；转入 `running` 时打印
+   **首次就绪耗时** `firstReadySec`。慢不怕，怕的是"不知道还要多久"。
+4. 附带：`startCommand` 末尾加 `--no-pub`（预览前已确保依赖就位，
+   省掉一次 pub 解析）；`_appendChunk` 补对 `partial` 行做
+   `isReadyLine` 判定（标志词落在没有尾换行的最后一段时会被永久漏判）。
+
+**验证**：`test/web_preview_test.dart` 新增 11 个测试，覆盖三段裁决
+（含 420/3/15 常量契约）、进度文案、心跳行、`--no-pub` 回归防护。
+
+**教训**：
+
+- **"进行中"状态必须有超时或旁路证据。** 只靠"解析日志关键字 +
+  等进程退出"的终态设计，等于把可用性押在标志词永不漂移上。
+- **降级放行优于永久等待。** 拿不到确定性时，给用户一个可能不完美
+  的结果 + 明确告知，好过给他一个完美但永远不来的承诺。
+- **先验证"能不能探测"再设计探测。** 这次差点因为手册里一句错误
+  结论（HttpClient 不可用）而放弃最直接的旁路证据——结论要能被代码
+  反例推翻。
+
+---
+
 ## 十二、提交 Bug 记录模板
 
 发现新 Bug 并解决后，按以下格式追加到对应分类：
+
+### Bug 455：cloudflared 下载失败——分片下载强制要求 HTTP 206，遇 200 直接换源（2026-09-19，alpha.61 修复）
+
+**症状**：远程接管页点「启动隧道」，卡在「正在下载 cloudflared」，最后报
+「下载失败：所有源都不可用」。
+
+**原因**：
+`SdkDownloader._downloadSegment` 对分片请求**强制要求 206**：
+
+```dart
+if (resp.statusCode != 206) {
+  throw DownloadException('服务器不支持 Range（HTTP 200）');
+}
+```
+
+cloudflared 当时只配了 2 个源（ghfast + GitHub 直链，后者国内不通）。
+ghfast 实测对 Range 是回 206 的，但"源数量不足 + 强依赖 206"这个组合
+本身脆弱：任何一个中间层（CDN、反代）把 206 降级成 200，整条链就必失败。
+
+**解决**（`lib/toolchain/sdk_downloader.dart`）：
+
+1. **整包兜底**：Range 不可用时退化为单流整包下载。实现上把整包当覆盖
+   `[0, expectedSize)` 的一个分片写入 `.p0`，其余分片清空（长度 0 天然
+   "已完成"），拼接与 SHA 校验逻辑**无需改动**。
+2. **必须由分片 0 执行**：非 0 分片遇到 200 直接静默返回，否则会与并发
+   分片互相踩（重复写同一个文件）。分片布局经静态字段
+   `_currentSegsHint` / `_currentPartsHint` 传递。
+3. **`rafClosed` 标志位**：整包兜底路径需提前释放 raf，`finally` 二次
+   close 会抛 `FileSystemException('File closed')` 把成功变失败。
+   —— 这个 Bug 是被单元测试抓出来的，不是真机。
+4. **扩镜像源**：cloudflared 加到 3 个源。`github.moeyy.xyz` 实测 DNS
+   无法解析，**故不纳入**——宁可少一个源，也不要摆一个永远超时、
+   白白拖慢竞速的假选项。
+
+**验证**：`test/bug456_range_fallback_test.dart`（3 用例）起**本地真实
+HTTP 服务器**返回 200，断言整包兜底能正确落盘并通过 SHA 校验；
+再起一个返回 206 的服务器，断言走原分片路径。不靠断言源码文本来"验"。
+
+**出现版本**：alpha.60 及以前
+**修复版本**：alpha.61
+
+---
+
+### Bug 456：浅色主题下顶栏与状态栏颜色割裂（2026-09-19，alpha.61 修复）
+
+**症状**：切换到浅色主题后，AppBar 是浅色，但状态栏/导航栏仍是深色，
+看起来像"上面被切掉一块"。
+
+**原因**（**三处叠加**，只改一处不会好）：
+
+1. `FoaTheme.light()` 里 `statusBarColor: Colors.transparent`；
+2. AppBar 背景也是 transparent → 于是透出 `styles.xml` 里的
+   `foa_bg = #101418`（深色窗口背景）；
+3. `main.dart` 硬编码了深色 `SystemUiOverlayStyle`，**在任何主题下都生效**。
+
+**关键实证**：用 `javap -p -c` 反编译 Flutter 3.47.4 的
+`PlatformPlugin.class`，看到：
+
+```java
+if (SDK_INT < 35 && style.statusBarColor != null) window.setStatusBarColor(color);
+```
+
+即 **Java 层该传的颜色是传了的**，但 Android 15（SDK_INT≥35）上被
+**无条件跳过**。所以光在 Dart 侧改颜色不够，必须加 Kotlin 原生兜底。
+
+**解决**：
+
+- `theme.dart`：新增 `lightSurface = #F5F7F8`，浅色主题的
+  `statusBarColor` 改为它（不再 transparent），补
+  `systemNavigationBarColor` / `systemNavigationBarIconBrightness`；
+  新增 `FoaTheme.overlayFor(Brightness)` 集中一处。
+- `main.dart`：启动基线改为跟随平台亮度；`builder` 里加
+  `AnnotatedRegion<SystemUiOverlayStyle>` 使主题切换实时跟随。
+- `MainActivity.kt`：新增 `applySystemBarColorsForTheme()`，在
+  `configureFlutterEngine` 开头调用（API 35+ 兜底）。
+- `colors.xml` 新增 `foa_bg_light`；`styles.xml` 浅色侧全部改用它，
+  `values-night/styles.xml` 保持 `foa_bg`。
+
+**验证**：`test/bug457_statusbar_theme_test.dart`（12 用例）。其中一条
+是**跨文件同源断言**——`#F5F7F8` 这一个值同时存在于 Dart / Kotlin / XML
+四处，任何一处漂移就失败。这类"复制粘贴的常量"没有编译器保护，
+只能靠测试守。
+
+**出现版本**：alpha.60 及以前
+**修复版本**：alpha.61
+
+---
+
+### Bug 457：AI 接管子页面点「开始」跳去了「远程接管」页（2026-09-19，alpha.61 修复）
+
+**症状**：项目工作台「AI 接管」分区里的按钮，点击后跳到另一个页面
+（远程接管页），用户在项目上下文里操作到一半被"弹出去"。
+
+**原因**：这个按钮从一开始就是一个**纯跳转**——`_openTakeover()` 直接
+`Navigator.push` 到远程接管页。当时的设计假设是"配置隧道要完整页面"，
+但实际使用中用户在项目工作台里点它，期望的是**就地开始**。
+
+**解决**（`lib/project/ai_takeover_panel.dart` 重写）：移除跳转，改为
+就地交互——`_startInline()` / `_stopInline()` / `_confirmRisk()` /
+`_refreshCfState()` 全部在当前分区内完成：开启/停止/续期/复制地址。
+标题也从"远程接管"改成 `AI 接管 · <项目名>`，让用户清楚自己在哪一层。
+
+**教训（写进注释了）**：跨页跳转**丢掉的是上下文**——"我在哪个项目"
+这个心理锚点。同类问题在代码页的 AI 按钮上做了同样处理（就地切区而非
+弹新页）。
+
+**出现版本**：alpha.62 引入
+**修复版本**：alpha.61
+
+---
+
+### Bug 458：包名字符串散落在四处——两处规则靠"巧合"对齐（2026-09-19，alpha.62 修复）
+
+**症状**：不是崩溃，是**维护性隐患**。审计请求来自一句很准的问题：
+> "包名可以暂时不改，但是你有逻辑是写死的包名路径吗？这样以后维护会不会有问题，
+> 应该动态获取比较好。"
+
+全仓扫描后，真实情况是这样的（**大部分本来就是动态的，但有两处是"巧合"**）：
+
+| 位置 | 写法 | 判定 |
+| --- | --- | --- |
+| Kotlin `fileProviderAuthority` | `get() = "$packageName$SUFFIX"` | ✅ 运行时取，正确 |
+| Manifest authority | `${applicationId}.fileprovider` | ✅ Gradle 占位符，正确 |
+| Kotlin 全部路径 | 一律 `File(filesDir, ...)` / `cacheDir` | ✅ 没有一处拼 `/data/data/<pkg>` |
+| Dart 路径 | 一律从 `EnvInfo.filesDir` / `rootfsPath` 派生 | ✅ 正确 |
+| `PROJECTS_REL` 等 | `"rootfs/debian/..."` | ⚠️ 与包名无关（写死的是发行版名 `debian`），非本轮范围 |
+| **文件浏览器路径标签** | `return '/data/user/0/<pkg>'` | ❌ **字面量占位符**，直接显示给用户 |
+| **空白工程模板** | `PKG="com.example.$NAME"` + 目录 `com/example/$NAME` | ❌ **两处规则靠巧合对齐** |
+
+**两个真问题的细节**：
+
+1. **路径标签是假的**。`file_browser_page.dart` 的 `_envDirLabel()` 里，
+   宿主根路径被显示成 `/data/user/0/<pkg>` 这个**字面量**——用户看到
+   `<pkg>` 以为是省略号，复制出去粘贴必然扑空。改为从
+   `EnvInfo.packageName`（新增，原生 `packageName` 运行时返回）取真值；
+   取不到时才降级为占位符。
+
+2. **包名规则的"巧合对齐"**（这条才是真正的隐患）。
+   空白工程模板里包名写的是 `com.example.$NAME`，Kotlin 源码目录写的是
+   `com/example/$NAME`。当时**恰好**没问题，因为
+   `DemoProjectCreator.validateName` 的正则是 `^[a-z][a-z0-9_]*$`，
+   **要求首字符是字母**，所以 `$NAME` 永远合法。
+   但这是**两个文件里的规则靠巧合对齐**，不是有依赖关系的设计：
+   - Dart 侧的 pub 包名**允许**数字开头（`1to2` 合法）；
+   - Java 包名的段**不允许**数字开头；
+   - 一旦哪天放宽校验（比如为了对齐 pub 的宽松规则），
+     就会生成 `package com.example.1to2`，**gradle 直接编译失败**，
+     而失败信息埋在容器的 gradle 输出里，用户完全无从下手。
+
+**解决**：
+
+1. `EnvInfo` 增加 `packageName`（原生 `envInfo()` 回 `packageName`，
+   运行时真值而非 `BuildConfig.APPLICATION_ID`——后者在
+   `applicationIdSuffix` 场景要额外留意）；
+   `file_browser_page.dart` 的 `_envDirLabel()` 改用它。
+2. 新增 `demoAndroidIdentifier(name)` 作为包名**唯一推导点**：
+   `com.example.<name>`，首字符是数字时前置 `a`（`1to2` → `com.example.a1to2`）。
+   **只改包名、不改项目名**——项目名同时是目录名和 pub 包名，用户输入什么
+   就是什么；只有 Android 侧的 package 声明需要满足 Java 规则。
+3. 模板脚本改成 `PKG='__PKG__'` 占位符 + `PKGHEAD`/`PKGLAST` 从包名
+   反推目录（`com/example/a1to2`），**不再出现任何 `com/example/$NAME` 字面量**。
+4. 脚本末尾加自查：`MainActivity.kt` 路径与包名不符 / 包名未生效 → 直接
+   `exit 1`。**构建期才发现在这个场景下等于永远不发现**。
+
+**验证**（`test/blank_project_template_test.dart`，19 项）：
+
+| 断言 | 说明 |
+| --- | --- |
+| 推导结果在任何输入下都是合法 Java 包名 | 逐段验 `^[A-Za-z][A-Za-z0-9_]*$` |
+| `1to2` → `com.example.a1to2` | 核心用例 |
+| 渲染后无 `__NAME__`/`__PKG__` 残留 | 占位符替换完整 |
+| 代码行不出现 `com/example/` 字面量 | 只查非注释行（注释里举例子不算） |
+| `dash -n` 语法检查通过 | 脚本跑在容器 dash 下，真跑一次 |
+| 无 bashism（`[[` / `&> ` / `<<<` / `$RANDOM`） | 保持 POSIX sh 兼容 |
+
+配套：真机不需要跑，`dash -n` + 变量展开实测（`PKGHEAD="${PKG%.*}"` →
+`com.example`，`PKGLAST` → `a1to2`）即可确认。
+
+**教训**：
+
+- **"暂时没出问题"和"设计上不会出问题"是两件事**。这里三处包名规则
+  互不引用，全靠校验函数的严格度兜着——那道防线一旦松动，
+  错误就会以"gradle 编译失败"的形式出现在最难排查的位置。
+- **字面量占位符 `<pkg>` 出现在用户可见界面里，就是 bug 不是备注**。
+  用户分不清"这是省略写法"还是"我该去找这个路径"。
+- 审计这类问题的正确姿势是**先分类再动手**：这次 8 处里 6 处本来就对，
+  只有 2 处要改。一上来就"全部改成动态"会平白引入回归。
+
+**出现版本**：alpha.21（空白工程模板）起长期存在
+**修复版本**：alpha.62
+
+---
+
+### Bug 459：proroot 许可判断在 α.60 与 α.61 得出**相反结论**——"未修改"前提不成立（2026-09-19，alpha.62 定稿）
+
+**症状**：不是崩溃，是**文档自相矛盾**。同一份 `THIRD-PARTY-NOTICES.md`
+里，标题写着"候选但未内置"，表格状态栏写着"可选启用"，
+`about_info.dart` 写着"默认关闭、本项目不代为分发"——三处口径打架。
+用户看到"未内置"会以为功能根本不存在。
+
+**原因**：α.60 与 α.61 对同一份许可作出了**相反判断**，而文档只改了一部分。
+
+| | α.60 判断 | α.61 复核 |
+| --- | --- | --- |
+| 上游许可原文 | Proprietary，_"Free to use in your projects. **Redistribution of modified binaries is not permitted.**"_ | 同 |
+| 关键前提 | 我们内置的是**未修改**的二进制 → 不属于 "modified binaries" → **允许** | ❌ **前提不成立** |
+| 结论 | 不内置是**工程判断**（收益小、未验证） | 不内置是**合规必需** |
+| 文档口径 | "候选但未内置" | "可选启用（不代分发）" |
+
+**α.61 复核时想通的那一点**：proroot 用 **LD_PRELOAD + 二进制补丁**
+替代 proot 的 ptrace，**补丁就是它的实现手段**——上游发布的就是已补丁
+形态。我们把它放进 APK，分发的就是"修改过的二进制"（相对 proot 语义
+而言），**正好落在禁止条款里**。
+
+**解决**（统一为"可选启用、不代分发"）：
+
+1. `THIRD-PARTY-NOTICES.md`：标题 `候选但未内置` → `可选启用（不代分发）`；
+   正文 `不内置二进制的原因` → `不代分发二进制的原因`。
+2. `dev-handbook/05-许可证合规.md`：章节重写，**把 α.60→α.61 的
+   判断反转过程保留在文档里**（结论变了，理由更要留痕，否则下一个人
+   会再翻一遍）。
+3. 实现侧改成：用户自行从上游获取 → 系统目录选择器导入 →
+   本 App 只调用。**许可允许最终用户使用，限制的是我们代为分发。**
+4. **加断言防漂移**（`test/about_info_test.dart` +2 项）：
+   - `THIRD-PARTY-NOTICES.md` 不得再出现"候选但未内置"/"不内置二进制"；
+   - 必须出现"不随 APK 分发"；
+   - proroot 卡片文案必须点明"不代为分发"**和"许可"**——
+     说清是许可限制，用户才不会以为"这功能是不是没做完"。
+
+**为什么值得单开一条 Bug**：这不是技术缺陷，是**判断被推翻**。
+三次口径不一致（NOTICES 标题 / NOTICES 表格 / about 卡片）本身
+就是一个可复现的失效模式：**改结论时只改了"状态"字段，忘了改标题和
+叙述性文字**。人工 review 抓不到，因为没有"标准答案"可比对——
+只有写成断言才能守住。
+
+**教训**：
+
+- **许可判断要落到"具体动作"上，而不是停在关键词**。"未修改的二进制
+  可以再分发"这句话没错，但 proroot 的二进制**本来就是补丁形态**——
+  判断要问的是"我要分发的东西，和上游给的形态一样吗"。
+- **结论反转时，必须把旧结论一起写进文档**。只写新结论的话，
+  下一个人看到旧结论的残留（比如别的文件里的表述）会以为是矛盾，
+  又花一遍时间重新推导。
+- **"文档里的一句话"也需要断言**。这次三条口径打架，
+  是"没有测试会说文档错了"的典型——把关键措辞（"不代分发"、
+  "不随 APK 分发"）写成断言后，同类漂移不可能再发生。
+
+**出现版本**：alpha.60（proroot 告知卡首次落地）
+**修复版本**：alpha.62
+
+---
+
 
 ```
 ### Bug XXX · <一句话描述症状>
