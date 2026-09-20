@@ -839,8 +839,21 @@ class MainActivity : FlutterActivity() {
     /**
      * 构建 proot 命令（Step 1 定稿；Step 6 流式执行复用）。
      * proot/rootfs 未就绪时返回 ProotCmd(null, error)。
+     *
+     * **`error` 这个字段同时装两种形状的失败 map**，这是故意的、也是有代价的：
+     * - `buildProotCmd()` 走 [fail]（键 `exitCode`/`stdout`/`stderr`）；
+     * - `buildProrootCmd()` 走 [prorootFail]（键 `ok`/`error`）。
+     *
+     * 两条路径的 Dart 侧消费者是同一个方法，靠调用方自己知道该读哪个键——
+     * `exec`/`execStream` 的 `ProotResult.fromMap` 读 `stderr`，而
+     * `prorootProbe()` 的 `ProrootProbeResult.fromMap` 读 `error`。
+     * 混用不会编译报错，只会让错误文案在桥上**静默消失**，UI 退化成
+     * "操作失败了"这种没法排查的兜底文案。改这两个方法时务必对照 Dart 侧。
      */
-    private data class ProotCmd(val cmd: List<String>?, val error: Map<String, Any>?)
+    private data class ProotCmd(
+        val cmd: List<String>?,
+        val error: Map<String, Any?>?,
+    )
 
     private fun buildProotCmd(command: String): ProotCmd {
         // 先补齐依赖再定位 proot：findProot() 的 assets 兜底路径依赖本次同步
@@ -997,9 +1010,9 @@ class MainActivity : FlutterActivity() {
      * 拷完立刻验 ELF 魔数：用户很可能误选了 zip 或 arm64-v8a 之外的构建，
      * 提前说清比等他打开开关再报 exec format error 好得多。
      */
-    private fun prorootInstall(srcDirPath: String): Map<String, Any> {
+    private fun prorootInstall(srcDirPath: String): Map<String, Any?> {
         val src = File(srcDirPath)
-        if (!src.isDirectory) return fail(-400, "导入路径不存在：$srcDirPath")
+        if (!src.isDirectory) return prorootFail(-400, "导入路径不存在：$srcDirPath")
         val dir = prorootDir().apply { mkdirs() }
         val copied = mutableListOf<String>()
         for (name in PROROOT_SO_FILES) {
@@ -1013,7 +1026,10 @@ class MainActivity : FlutterActivity() {
         }
         val missing = prorootMissing()
         val bad = prorootPresent().filter { !isElf(it) }.map { it.name }
-        return mapOf(
+        // "error" 在失败时是 String、成功时是 null，所以整个 map 的类型参数必须
+        // 是 Any?。写成 Map<String, Any> 会被 Kotlin 拒绝（Map<String, Any?>
+        // 不能赋给 Map<String, Any>——`in` 位置逆变，值可读作 Any 就要求非空）。
+        return mapOf<String, Any?>(
             "ok" to (missing.isEmpty() && bad.isEmpty()),
             "copied" to copied,
             "missing" to missing,
@@ -1028,9 +1044,20 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
+     * proroot 相关的失败返回。
+     *
+     * **不要用 [fail]**：那个是给 exec/execStream 用的，键名是
+     * `exitCode`/`stdout`/`stderr`，而 Dart 侧 `ProrootInstallResult` /
+     * `ProrootProbeResult` 读的是 `error`。混用会让错误信息在桥上凭空消失，
+     * UI 只能显示"操作失败了"这种没有信息量的兜底文案。
+     */
+    private fun prorootFail(code: Int, message: String): Map<String, Any?> =
+        mapOf("ok" to false, "error" to message, "exitCode" to code)
+
+    /**
      * 清空 proroot 落位目录（用户想换一个版本/彻底退出时用）。
      */
-    private fun prorootRemove(): Map<String, Any> {
+    private fun prorootRemove(): Map<String, Any?> {
         val dir = prorootDir()
         val n = if (dir.isDirectory) dir.listFiles()?.size ?: 0 else 0
         dir.deleteRecursively()
@@ -1048,13 +1075,18 @@ class MainActivity : FlutterActivity() {
      * 超时给 25 秒：起不来的情况通常是 linker 直接失败（毫秒级），
      * 给太久只会让用户干等。
      */
-    private fun prorootProbe(): Map<String, Any> {
+    private fun prorootProbe(): Map<String, Any?> {
         val rootfs = File(filesDir, ROOTFS_REL)
         if (!File(rootfs, "bin/sh").exists()) {
-            return fail(-403, "rootfs 未安装：请先回主页初始化环境")
+            return prorootFail(-403, "rootfs 未安装：请先回主页初始化环境")
         }
         val built = buildProrootCmd("uname -a; echo FOA_PROBE_OK")
-        if (built.cmd == null) return built.error!!
+        if (built.cmd == null) {
+            // 注意这里**不能** `return built.error!!`：buildProrootCmd 的失败
+            // 结果和 exec 系列的 fail() 是同一套形状（stdout/stderr），
+            // 而 Dart 侧读的是 "error"。直接透传会让错误文案消失。
+            return prorootFail(-402, built.error?.get("error") as? String ?: "proroot 命令构造失败")
+        }
         return try {
             val pb = ProcessBuilder(built.cmd)
             applyProrootEnv(pb)
@@ -1083,7 +1115,7 @@ class MainActivity : FlutterActivity() {
             val finished = !proc.isAlive
             if (!finished) proc.destroyForcibly()
             val out = outBuf.toString()
-            mapOf(
+            mapOf<String, Any?>(
                 "ok" to (finished && out.contains("FOA_PROBE_OK")),
                 "exitCode" to (if (finished) proc.exitValue() else -999),
                 "output" to out.take(4000),
@@ -1095,7 +1127,7 @@ class MainActivity : FlutterActivity() {
                 } else null,
             )
         } catch (e: Exception) {
-            mapOf(
+            mapOf<String, Any?>(
                 "ok" to false,
                 "error" to "启动 proroot 失败：${e.message}",
                 "cmd" to built.cmd.joinToString(" "),
@@ -1135,7 +1167,7 @@ class MainActivity : FlutterActivity() {
         if (missing.isNotEmpty()) {
             return ProotCmd(
                 null,
-                fail(
+                prorootFail(
                     -404,
                     "proroot 未就绪：缺少 ${missing.size} 个文件（${missing.joinToString()}）。\n" +
                         "请在「工具链」页用「导入 proroot」把这 ${PROROOT_SO_FILES.size} 个 .so 放进应用。",
@@ -1148,7 +1180,7 @@ class MainActivity : FlutterActivity() {
         }
         val rootfs = File(filesDir, ROOTFS_REL)
         if (!File(rootfs, "bin/sh").exists()) {
-            return ProotCmd(null, fail(-403, "rootfs 未安装：请回到主页点击「初始化环境」。"))
+            return ProotCmd(null, prorootFail(-403, "rootfs 未安装：请回到主页点击「初始化环境」。"))
         }
 
         // 与 proot 完全同款的两段注入（原因见 buildProotCmd 注释）
@@ -1187,11 +1219,14 @@ class MainActivity : FlutterActivity() {
         timeoutSec: Long,
         bare: Boolean = false,
         proroot: Boolean = false,
-    ): Map<String, Any> {
+    ): Map<String, Any?> {
         val start = System.currentTimeMillis()
         if (bare) return execBare(command, timeoutSec)
         val built = if (proroot) buildProrootCmd(command) else buildProotCmd(command)
-        if (built.cmd == null) return built.error!!
+        // 走 proot 路径时 error 是 fail() 形状（Dart 侧读 stderr），
+        // 走 proroot 路径时是 prorootFail() 形状（Dart 侧读 error）——
+        // 两侧消费者确实不同（见 ProotCmd 注释），所以这里原样透传。
+        if (built.cmd == null) return built.error ?: fail(-500, "命令构造失败（无错误详情）")
 
         return try {
             val pb = ProcessBuilder(built.cmd)
@@ -1338,7 +1373,7 @@ class MainActivity : FlutterActivity() {
         timeoutSec: Long,
         bare: Boolean = false,
         proroot: Boolean = false,
-    ): Map<String, Any> {
+    ): Map<String, Any?> {
         if (bare) {
             // Termux 裸原生模式：同样走流式通道，但不套 proot
             return try {
@@ -1375,7 +1410,10 @@ class MainActivity : FlutterActivity() {
             }
         }
         val built = if (proroot) buildProrootCmd(command) else buildProotCmd(command)
-        if (built.cmd == null) return built.error!!
+        // 走 proot 路径时 error 是 fail() 形状（Dart 侧读 stderr），
+        // 走 proroot 路径时是 prorootFail() 形状（Dart 侧读 error）——
+        // 两侧消费者确实不同（见 ProotCmd 注释），所以这里原样透传。
+        if (built.cmd == null) return built.error ?: fail(-500, "命令构造失败（无错误详情）")
         return try {
             val pb = ProcessBuilder(built.cmd)
             if (proroot) {
@@ -1468,7 +1506,7 @@ class MainActivity : FlutterActivity() {
      * bare=true 时跳过 proot，直接在宿主 /system/bin/sh 里跑
      * （Termux 裸原生后端），与构建链的后端选择保持一致。
      */
-    private fun ptyStart(bare: Boolean, cols: Int, rows: Int): Map<String, Any> {
+    private fun ptyStart(bare: Boolean, cols: Int, rows: Int): Map<String, Any?> {
         val shim = PtyCmd.ensureBinary(assets, filesDir)
             ?: return fail(-404, "PTY 中继器未落位（assets/tools/foa_pty 缺失）。")
 

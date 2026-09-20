@@ -262,4 +262,85 @@ void main() {
       }
     });
   });
+
+  // 桥的键名契约：Kotlin 返回 map 的键 与 Dart 侧 fromMap 读的键 必须对齐。
+  // 这类错误**编译能过、测试不跑就发现不了**，只在真机上表现为
+  // "点了一下没反应"或"错误信息是空的"。
+  group('proroot · 桥接键名契约（Kotlin 返回 ↔ Dart 读取）', () {
+    final kt = File('android/app/src/main/kotlin/dev/foa/flutter_on_android/MainActivity.kt')
+        .readAsStringSync();
+    final models = File('lib/env/models.dart').readAsStringSync();
+
+    test('proroot 的失败返回用 error 键，不是 exec 那套 stderr', () {
+      // 背景：fail() 给 exec/execStream 用，键是 exitCode/stdout/stderr；
+      // 而 prorootInstall/prorootProbe 的 Dart 消费者读的是 error。
+      // 曾经 prorootProbe 里写 `return built.error!!`（proot 形状），
+      // 错误文案在桥上凭空消失，UI 只剩兜底文案。
+      expect(kt.contains('private fun prorootFail('), isTrue,
+          reason: 'proroot 需要自己的失败构造器，不能复用 exec 的 fail()');
+      expect(kt.contains('prorootFail('), isTrue);
+
+      // prorootFail 的 map 必须带 "error" 键
+      final at = kt.indexOf('private fun prorootFail(');
+      expect(at, greaterThanOrEqualTo(0));
+      final body = kt.substring(at, at + 300);
+      expect(body.contains('"error" to message'), isTrue,
+          reason: 'Dart 侧 ProrootProbeResult/ProrootInstallResult 读 m["error"]，'
+              '键名不对错误信息就丢了');
+    });
+
+    test('ProrootProbeResult.fromMap 读的键在 Kotlin 侧都产出了', () {
+      // 从 Dart 侧反查：它读什么，Kotlin 就必须给什么
+      final at = models.indexOf('factory ProrootProbeResult.fromMap');
+      expect(at, greaterThanOrEqualTo(0));
+      final body = models.substring(at, at + 500);
+      for (final k in ['ok', 'exitCode', 'output', 'cmd', 'error']) {
+        expect(body.contains("m['$k']"), isTrue,
+            reason: 'Dart 读 m["$k"]，这条断言只是防止 fromMap 被改后两边脱节');
+      }
+      // Kotlin 侧确实产出了这几个键（prorootProbe 内）
+      final ps = kt.indexOf('private fun prorootProbe(');
+      final pe = kt.indexOf('private fun applyProrootEnv(');
+      expect(pe, greaterThan(ps));
+      final pbody = kt.substring(ps, pe);
+      for (final k in ['ok', 'exitCode', 'output', 'cmd', 'error']) {
+        expect(pbody.contains('"$k" to '), isTrue,
+            reason: 'prorootProbe 没有产出 "$k"，Dart 侧会永远读到 null');
+      }
+    });
+
+    test('ProrootInstallResult.fromMap 读的键在 Kotlin 侧都产出了', () {
+      final at = models.indexOf('factory ProrootInstallResult.fromMap');
+      expect(at, greaterThanOrEqualTo(0));
+      final body = models.substring(at, at + 500);
+      for (final k in ['ok', 'copied', 'missing', 'notElf', 'error']) {
+        expect(body.contains("m['$k']"), isTrue, reason: 'Dart 读 m["$k"]');
+      }
+      final is0 = kt.indexOf('private fun prorootInstall(');
+      final is1 = kt.indexOf('private fun prorootRemove(');
+      expect(is1, greaterThan(is0));
+      final ibody = kt.substring(is0, is1);
+      for (final k in ['ok', 'copied', 'missing', 'notElf', 'error']) {
+        expect(ibody.contains('"$k" to '), isTrue,
+            reason: 'prorootInstall 没有产出 "$k"');
+      }
+    });
+
+    test('含可空值的返回 map 必须显式写 Any?（否则 Kotlin 编译不过）', () {
+      // Map<String, Any?> 不能赋给 Map<String, Any>：值是"out"位置（协变），
+      // 允许空值就打破了非空承诺。Kotlin 会直接报
+      // "Return type mismatch: expected 'Map<String, Any>', actual 'Map<String, Any?>'"。
+      // 这几处 error 键成功时为 null，所以声明与字面量都必须带 ?。
+      for (final sig in [
+        'private fun prorootStatus(): Map<String, Any?>',
+        'private fun prorootInstall(srcDirPath: String): Map<String, Any?>',
+        'private fun prorootRemove(): Map<String, Any?>',
+        'private fun prorootProbe(): Map<String, Any?>',
+        'private fun prorootFail(code: Int, message: String): Map<String, Any?>',
+      ]) {
+        expect(kt.contains(sig), isTrue,
+            reason: '签名应为可空值类型：$sig（键 error 成功时为 null）');
+      }
+    });
+  });
 }
