@@ -4489,13 +4489,25 @@ cat /sys/fs/cgroup/memory.current   # 确认降下来（实测 6.0GiB → 2.24Gi
 
 **验证**：
 
-- 重试构建通过，产出 `dist/FOA-v0.1.0-alpha.62-arm64.apk`。
+- 第三次构建通过，`assembleRelease` **1049.0s**，产出
+  `dist/FOA-v0.1.0-alpha.62-arm64.apk`（88,176,033 B）。
+- 四件套：`native-code: arm64-v8a`（仅此一个）/ `versionName='0.1.0-alpha.62'`
+  + `versionCode='62'` + `targetSdkVersion='28'` / `apksigner verify` 通过 /
+  无 proroot 二进制。另 `unzip -t` 无错、dex 仅 1 个 771KB 且第三方残留为空。
 - `platform/android/gradle.properties` 同步（diff 为空）。
+
+**⚠️ 本轮其实失败了两次，中间那次换了报错 → 见 Bug 462**：
+
+- 第 1 次（2474s）：`daemon disappeared` → 误判为"堆不够"，1.5g 改 **6g/3g**
+- 第 2 次（1089.9s）：`compileReleaseArtProfile > Failed requirement.`
+- 第 3 次（1049.0s）：6g/3g **下调**为 4g/2g → 通过
+
+**即第 1 次的诊断下错了药**：6g/3g 本身超过 8GiB cgroup 上限。
 
 **教训**：
 
 - **容器里永远以 cgroup 为准，别看 `free -m`**。`free` 读的是宿主机视图，
-  与进程实际可用内存可以差一个数量级。
+  与进程实际可用内存可以差一个数量级（本轮 126GB vs 8GiB）。
 - **同一个报错文案可能是相反的修法**。"daemon disappeared" 既可能是堆太小、
   也可能是堆配置超过容器上限——**先查上限，再决定加还是减**，
   靠症状关键词条件反射改数字会来回横跳（本轮就横跳了一次）。
@@ -4507,6 +4519,138 @@ cat /sys/fs/cgroup/memory.current   # 确认降下来（实测 6.0GiB → 2.24Gi
 
 **出现版本**：alpha.62（出包阶段）
 **修复版本**：alpha.62
+
+---
+
+### Bug 462：`compileReleaseArtProfile > Failed requirement.`——上一轮被击杀留下的半成品中间态（2026-09-19，alpha.62 出包自愈）
+
+**症状**：
+
+Bug 461 第一次失败（daemon 被击杀）后，把堆从 1.5g 调到 6g/3g 重跑，
+**换了报错**：
+
+```
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:compileReleaseArtProfile'.
+> A failure occurred while executing
+  com.android.build.gradle.internal.tasks.CompileArtProfileTask$CompileArtProfileWorkAction
+   > Failed requirement.
+
+Running Gradle task 'assembleRelease'...    1089.9s
+Gradle task assembleRelease failed with exit code 1
+```
+
+注意 `Failed requirement.` 这句是 Guava `Preconditions.checkState` 的
+**无信息量断言**——AGP 内部用它表达"某个我以为成立的前提不成立"，
+不带任何上下文。`--stacktrace` 也拿不到更多信息。
+
+**原因**：
+
+**不是代码错误，是脏中间态。** 判据来自一个反证实验：
+
+```bash
+./gradlew :app:compileReleaseArtProfile --stacktrace
+# → 42 分钟后「无输出」（grep 无匹配 = 无 Failed requirement）
+# → 即：同一个任务单独跑是**通过的**
+```
+
+同一个任务、同一份源码，单独跑能过而串在 `assembleRelease` 里报错，
+说明它读到的中间产物不一致——这些产物是**上一轮被 OOM killer 击杀时
+写到一半留下的**。AGP 的 ArtProfile 任务要合并
+`merged_art_profile` / `combined_art_profile` / `binary_art_profile` 等多级
+中间态（见 `build/app/intermediates/art_profile/` 下的 6 个子目录），
+被杀进程中开会留下一组自相矛盾的文件，`checkState` 正好撞上。
+
+**解决**：
+
+**不需要任何"修复动作"**——重新触发一次让任务重算即可。本次流程：
+
+```bash
+# 1) 先用反证确认"不是代码错"：单独重跑那个任务
+cd android && ./gradlew :app:compileReleaseArtProfile --stacktrace
+#    无输出 = 通过 → 排除代码问题，问题在中间态
+
+# 2) 释放 daemon 内存（Bug 461 的修法），再跑完整构建
+./gradlew --stop && pkill -f KotlinCompileDaemon
+cat /sys/fs/cgroup/memory.current
+
+# 3) 重跑 assembleRelease
+cd .. && flutter build apk --release --target-platform=android-arm64
+# → 1049.0s ✓ Built
+```
+
+> ⚠️ **别急着 `./gradlew clean`**。清 `build/` 能治好这类脏状态，
+> 但代价是重跑 AOT（41 分钟里的大头）。本题的正确做法是
+> **先做反证实验判断"是不是确定性失败"**，再决定动手范围——
+> 本次确认非确定性后，重跑一次就过，一分钟额外的清理成本都没花。
+
+**验证**：
+
+- `:app:compileReleaseArtProfile` 单独跑通过；完整 `assembleRelease`
+  重跑 **1049.0s 成功**。
+- 该任务的全部 6 个中间目录均正常再生成（`r8_art_profile` /
+  `binary_art_profile` / `binary_art_profile_metadata` /
+  `combined_art_profile` / `dex_metadata_directory` / `merged_art_profile`）。
+
+**教训**：
+
+| 要点 | 说明 |
+| --- | --- |
+| **无信息量断言要当"状态问题"读** | `Failed requirement.`、`checkState failed` 这类 Guava 断言几乎不指向源码 bug，优先怀疑输入/中间态 |
+| **"单独跑通过"是最便宜的反证** | 一条命令就能把"确定性代码错"和"非确定性状态错"分开，省下盲目 `clean` 的 41 分钟 |
+| **被杀进程会留半成品** | 上游任务是 OOM 击杀时，下游任务可能报**完全无关**的错——排查要先回顾"前面是不是死过一次" |
+| **别用 `clean` 当第一手段** | `clean` 永远"有效"，所以它掩盖诊断；**先判断确定性，再决定清理范围** |
+
+**出现版本**：alpha.62（出包阶段，Bug 461 的次生问题）
+**修复版本**：alpha.62
+
+---
+
+### Bug 463（元）：把"实测通过"写早了——错误经验比没有经验更危险（2026-09-19，流程类）
+
+**症状**：
+
+本轮出包过程中，在**构建还没跑完**的时候，就往
+`SKILL.md` 的实测记录里写下了这样一段结论：
+
+> 改 `-Xmx6g -XX:MaxMetaspaceSize=2g` + `kotlin.daemon.jvmargs=-Xmx3g`
+> 后**一次通过**（18分20秒，比失败的 41 分钟还快）。
+
+**实际结果**：那个配置在第 2 轮就失败了（Bug 462），第 3 轮把堆
+**下调**到 4g/2g 才通过。也就是说：**这句"实测通过"是错的**。
+
+**危害**：这比"没写"严重得多。
+
+- 读的人（包括几个月后的自己）会**直接照抄 6g/3g**，
+  而它正是超出 8GiB cgroup 上限、会被 OOM killer 击杀的那组值；
+- 一旦踩坑，人会先怀疑代码、怀疑缓存，**最后才怀疑"文档里的实测值"**——
+  因为"实测通过"这四个字暗示了证据强度，而它实际只是个**进行中的猜测**。
+
+**解决**：
+
+出包完成后回改该段，并把整轮的**三次**构建如实写出：
+第 1 次 2474s 失败 / 第 2 次 1089.9s 失败 / 第 3 次 1049.0s 通过，
+同时点明"第 1 次的诊断下错了药"。
+
+**教训**：
+
+- **区分"推测"和"实测"的措辞**。没跑完就写 `预计` / `待验证`，
+  别写 `实测通过` / `一次通过` / `已确认`。**措辞本身就是证据强度的承诺。**
+- **失败链比成功结论更有价值**。只写最终通过值（4g/2g），
+  下一个人看到 8GiB 机器可能又想"是不是该调大点"；写出"6g 曾把它跑挂"
+  才是真正拦住这次错误的护栏。
+- **别在长任务等待期写结论**。等待时手里只有"当前判断"，
+  而长任务恰恰是最容易推翻这个判断的场景（本轮就是）。
+  等待期适合写**过程记录**（命令、判据、反证实验），不适合写**结论**。
+- **本条的元教训**：文档漂移不只会发生在代码注释里（见 Bug 459
+  的 proroot 许可口径），**也会发生在"实测记录"里**——
+  而后者因为有"实测"二字，更不容易被质疑。**结论一旦落盘就会获得权威性**，
+  所以落盘前要确认它真的来自跑完的证据。
+
+**出现版本**：alpha.62（流程类，非代码）
+**修复版本**：alpha.62（回改 SKILL.md 实测段）
 
 ---
 
