@@ -49,13 +49,13 @@
   要求运行环境 glibc 2.36+ 与 GLIBCXX_3.4.30+——本项目 rootfs 正是 Debian 12 bookworm，
   满足；minbase 缺省没有 `libstdc++6`，落位流程会自动 apt 补上。
 
-## 候选但未内置
+## 可选启用（不代分发）
 
 | 组件 | 版本 | 许可证 | 状态 | 来源 |
 |---|---|---|---|---|
 | proroot（proot 的闭源替代，容器层加速） | v1.2.8 | **Proprietary**：_"Proprietary. Free to use in your projects. Redistribution of modified binaries is not permitted."_ | **可选启用**（alpha.61 起）：二进制**不随 APK 分发**，由用户自行从上游获取后在工具链页导入；默认关闭，启用前需通过冒烟测试 | https://github.com/coderredlab/proroot |
 
-**不内置二进制的原因**（完整论证见 `dev-handbook/05-许可证合规.md`）：
+**不代分发二进制的原因**（完整论证见 `dev-handbook/05-许可证合规.md`）：
 上游许可明确写"Redistribution of modified binaries is not permitted",
 且 proroot 的 `.so` 是**打过补丁的**（这正是它绕过 ptrace 的手段），
 因此包含在本项目 APK 里再分发属于"分发修改过的二进制"，**不被许可允许**。

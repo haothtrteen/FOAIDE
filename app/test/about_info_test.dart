@@ -101,6 +101,27 @@ void main() {
           reason: '新增组件必须同时登记进 THIRD-PARTY-NOTICES.md');
       expect(t.contains('proroot'), isTrue);
     });
+
+    test('THIRD-PARTY-NOTICES 不再把 proroot 写成"候选但未内置"', () {
+      final t = File('THIRD-PARTY-NOTICES.md').readAsStringSync();
+      // alpha.61 起 proroot 已进入可用流程，只是"不代分发"。
+      // 写成"未内置"会与手册 02/05 和卡片文案互相矛盾——
+      // 用户看到"未内置"会以为功能不存在。
+      expect(t.contains('候选但未内置'), isFalse,
+          reason: '该措辞已过期：proroot 现在可选启用（只是不代分发）');
+      expect(t.contains('不内置二进制'), isFalse,
+          reason: '同理，二进制确实不内置，但表述应为"不代分发"'
+              '以区分"功能没有"和"我们帮你装不了"');
+      expect(t.contains('不随 APK 分发'), isTrue,
+          reason: '必须点明分发方式——这关系到上游许可的判断');
+    });
+
+    test('proroot 卡片文案要点明"不代为分发"的原因', () {
+      final p = AboutInfo.components.firstWhere((c) => c.name == 'proroot');
+      expect(p.usage.contains('不代为分发'), isTrue);
+      expect(p.usage.contains('许可'), isTrue,
+          reason: '不让用户以为"这功能是不是没做完"——要说清是许可限制');
+    });
   });
 
   group('GPL 披露', () {
