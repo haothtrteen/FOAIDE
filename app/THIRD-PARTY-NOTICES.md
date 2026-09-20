@@ -53,7 +53,7 @@
 
 | 组件 | 版本 | 许可证 | 状态 | 来源 |
 |---|---|---|---|---|
-| proroot（proot 的闭源替代，容器层加速） | v1.2.8 | **Proprietary**：_"Proprietary. Free to use in your projects. Redistribution of modified binaries is not permitted."_ | **可选启用**（alpha.61 起）：二进制**不随 APK 分发**，由用户自行从上游获取后在工具链页导入；默认关闭，启用前需通过冒烟测试 | https://github.com/coderredlab/proroot |
+| proroot（proot 的闭源替代，容器层加速） | v1.2.8 | **Proprietary**：_"Proprietary. Free to use in your projects. Redistribution of modified binaries is not permitted."_ | **可选启用**（alpha.61 起）：二进制**不随 APK 分发**；alpha.63 起提供「一键下载」或「从本地导入」两条路，均在用户设备上运行时获取；默认关闭，启用前需通过冒烟测试 | https://github.com/coderredlab/proroot |
 
 **不代分发二进制的原因**（完整论证见 `dev-handbook/05-许可证合规.md`）：
 上游许可明确写"Redistribution of modified binaries is not permitted",
@@ -61,6 +61,21 @@
 因此包含在本项目 APK 里再分发属于"分发修改过的二进制"，**不被许可允许**。
 故实现为：用户自己从上游取 → 通过系统目录选择器导入到 App 私有目录 →
 本 App 只负责调用。许可本身允许最终用户使用——限制的是我们代为分发。
+
+**alpha.63「一键下载」的合规口径**（新增，需留意）：
+
+新增的一键下载**不改变上述法律定性**，理由三条：
+
+1. **仍是"运行时、在用户设备上"获取**，不是我们打包进 APK 再分发。
+   下载动作由用户点击触发、发往上游 raw 域名，我们只提供便利入口
+   （等同于内置浏览器打开下载页，不构成再分发）。
+2. **按字节原样下载，不做任何修改**——不 strip、不重打包、不改名。
+   许可禁止的是"分发**修改过的**二进制"，原样传递不在禁止之列。
+3. **钉死版本与校验和**：锁定 v1.2.8 及其 SHA-256，上游若变更则校验
+   失败并报错，而不是静默装上不同内容——这既是安全考量，也保证我们
+   "传递的就是上游那一份"这一事实可被验证。
+
+若上游未来调整许可措辞（例如禁止任何形式代取），**此功能须一并下线**。
 
 另需注意（技术判断，非合规判断）：源码未公开（无法自审自修）、
 官方要求 Ubuntu arm64 rootfs 而本项目是 Debian bookworm（未验证组合）、
