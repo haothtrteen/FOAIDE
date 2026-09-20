@@ -229,7 +229,9 @@ put() {
   [ -x "$1" ] || return 0
   # Bug 439：共享库不能包装（e_machine/e_type 与 PIE 可执行文件相同）
   case "$1" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) return 0 ;; esac
-  m=$(dd if="$1" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  # Bug 449：真身感知——原位包装后 <f> 是 wrapper，真身在 <f>.foa-real
+  real="$1"; [ -f "$1.foa-real" ] && real="$1.foa-real"
+  m=$(dd if="$real" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
   case "$m" in 7f454c46*3e) ;; *) return 0 ;; esac
   # ---------------- Bug 445：不信任转发位的"形态"，无条件重建 ----------------
   # 旧写法是 `[ -f "$2" ] && head -c 2 "$2" | grep -q '#!' → 跳过`（幂等）。
@@ -240,7 +242,7 @@ put() {
   # 不存在"合法的裸 ELF"。所以这里可以无条件重建，比看形态更可靠。
   # `gen` 内部是覆盖写（`cat > "$1"`），不需要先删。
   mkdir -p "$(dirname "$2")"
-  gen "$2" "$1"
+  gen "$2" "$real"
   n=$((n+1))
 }
 n=0
@@ -256,6 +258,28 @@ for hd in "$E"/linux-*/; do
   for f in "$hd"/*; do put "$f" "$ha/${f##*/}"; done
 done
 echo "REASSERT=$n"
+# ---------------- Bug 449：linux-x64 原位再断言 ----------------
+# 对称位（linux-arm64/）被 precache 冲掉时上面的 put 兜底；而
+# **linux-x64/ 原位被 precache 冲掉**（写回 x64 真身覆盖 wrapper）时，
+# 构建会拿到裸 ELF → SIGILL。这段与 engineWrapScript 的原位段同款：
+# 非 .foa-real、非数据文件、可执行、x64 ELF、非 #! → 必须替换。
+# 放在 put 之后：put 已把对称位修好，这里再把原位修好，两层都齐。
+for d in "$E"/android-*/linux-x64 "$E"/linux-x64; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    [ -f "$f" ] || continue
+    [ -x "$f" ] || continue
+    case "$f" in *.foa-real) continue ;; esac
+    case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
+    if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
+    m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    case "$m" in 7f454c46*3e) ;; *) continue ;; esac
+    mv "$f" "$f.foa-real"
+    gen "$f" "$f.foa-real"
+    n=$((n+1))
+  done
+done
+echo "REASSERT_INPLACE=$n"
 # ---------------- Bug 442：dart-sdk/bin 转发层再断言 ----------------
 # 这里**原地**包装（真身就在同目录），不是 put 到别处，所以单独一段。
 # 为什么必须有：dart-sdk/bin 是 pub get / flutter build 的**入口**
@@ -416,18 +440,22 @@ done
 # 现在改成**带角色标签**输出，一眼能看出哪行异常：
 #   SLOT  = 转发位，期望 wrapper
 #   REAL  = 真身，  期望 raw
+# 判定角色（Bug 449 修正）：原位包装后 linux-x64/ 下的普通名字**也是
+# wrapper**（SLOT），真身一律在 *.foa-real（REAL）。
+#   - `*.foa-real`                                → REAL，期望 raw
+#   - 其它（linux-arm64/ 位、linux-x64/ 位、dart）→ SLOT，期望 wrapper
 for u in \
   @ENGINE@/linux-arm64/impellerc \
   @ENGINE@/linux-x64/impellerc \
   @ENGINE@/android-arm64-release/linux-arm64/gen_snapshot \
   @ENGINE@/android-arm64-release/linux-x64/gen_snapshot \
+  @ENGINE@/android-arm64-release/linux-x64/gen_snapshot.foa-real \
   @ENGINE@/linux-arm64/font-subset \
   @FLUTTER@/bin/cache/dart-sdk/bin/dart ; do
   [ -e "$u" ] || { echo "AOT_FP=$(basename "$u")=missing"; continue; }
   h=$(dd if="$u" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
-  # 判定角色：路径含 linux-x64（且不是 dart）→ 真身
   case "$u" in
-    */linux-x64/*) role=REAL; want=raw ;;
+    *.foa-real)    role=REAL; want=raw ;;
     *)             role=SLOT; want=wrapper ;;
   esac
   case "$h" in
@@ -497,7 +525,9 @@ for bd in @PROJ@/build @PROJ@/build/app /root/projects/*/build /root/build; do
   #   两者都 132           → -cpu max 也救不了 → arm64 TCG 后端问题，
   #                          下一步换 Debian trixie 静态 qemu 9.x
   #   DEF=0/134            → 默认模型也没门，SIGILL 另有源头
-  dgs=@ENGINE@/android-arm64-release/linux-x64/gen_snapshot
+  # Bug 449（alpha.55）：linux-x64/gen_snapshot 原位包装后是 wrapper（#!），
+  # 裸 qemu 没法执行 shell 脚本——真身要显式指向 .foa-real。
+  dgs=@ENGINE@/android-arm64-release/linux-x64/gen_snapshot.foa-real
   if [ -x "$dgs" ]; then
     ( cd "$ld_dir" && @QEMU@ -L / @LOADER@ "$dgs" --deterministic \
         --snapshot_kind=app-aot-elf --elf="$ld_dir/def.so" "$dill" ) \
@@ -519,10 +549,26 @@ echo "QEMU_CHAIN_DONE=1"
 ''';
 
   /// 引擎产物同步：若尚未下载 → flutter precache --android（走 flutter-io.cn），
-  /// 再为每个 android-*/linux-x64 生成 linux-arm64/ 转发脚本。
+  /// 再做两层包装：
+  ///   ① **原位包装**（Bug 449，alpha.55）：linux-x64/ 下每个可执行 x64 ELF
+  ///      本身改名 <tool>.foa-real，原路径放 qemu 转发脚本；
+  ///   ② **对称包装**（Bug 428/429）：linux-arm64/ 放指向 .foa-real 真身的
+  ///      转发脚本（上游若修复 ABI 检测改查 linux-arm64 时仍有兜底）。
   ///
-  /// 公开（原 `_engineSyncScript`）供 [ToolchainEnsure.qemuCompatEnsure]
-  /// 在构建前幂等重建转发层（Bug 428：precache 会覆写 linux-arm64/）。
+  /// 为什么必须原位包装（Bug 449，2026-09-19 真机直控实测铁证）：
+  /// App 部署的 dart 是 **x86_64 二进制经 qemu 运行**（dart-sdk/bin 的
+  /// 原位 wrapper），dart VM 里 `Abi.current()` 自报 **x64** →
+  /// flutter_tools `getCurrentHostPlatform()` 判定 **linux_x64** →
+  /// gen_snapshot（android-{arm,arm64,x64}-release 三个 target 全部）、
+  /// impellerc、font-subset 全部解析到 **linux-x64/ 原目录**。此前维护的
+  /// linux-arm64/ 对称 wrapper 从构建第一天起就没被调用过一次（真机埋点：
+  /// X64_GEN / X64_IMPELLER 命中、linux-arm64 位零命中）。裸 x64 ELF 在
+  /// arm64 内核上 exec → SIGILL = 五个版本阴魂不散的 exit -4。
+  /// 真机修复实证：linux-x64 位包 wrapper 后完整 release 构建全绿
+  /// （app-release.apk 43.0MB 构建成功）。
+  ///
+  /// 顺序注意：**先原位、后对称**。对称段用真身感知（<f>.foa-real 存在则
+  /// 指向真身），保证 linux-arm64 位直接指向真身、只过一层 sh。
   static const String engineWrapScript = r'''
 E=@ENGINE@
 [ -d "$E" ] || { echo ENGINE_MISSING; exit 0; }
@@ -535,6 +581,32 @@ if ! ls -d "$E"/android-*/linux-x64 >/dev/null 2>&1; then
 fi
 __FOA_GEN__
 n=0
+# ---- Bug 449：linux-x64 原位包装（先做，让对称段拿到 .foa-real 真身）----
+# 真因链条（改这里之前必须读完）：App 部署的 dart 是 x86_64 经 qemu 跑，
+# dart VM 内 Abi.current() 自报 x64 → flutter_tools 判定 linux_x64 →
+# gen_snapshot/impellerc/font-subset 全部解析到 linux-x64/ 原目录。
+# 埋点实锤：X64_GEN/X64_IMPELLER 命中、linux-arm64 对称位零命中。
+# 判据（与 dart-sdk/bin、SDK build-tools 的原位模式一致）：
+#   非 .foa-real、非 so/snapshot 等数据文件、可执行、x86_64 ELF、
+#   且当前不是 #! 脚本（已是 wrapper 则幂等跳过）。
+# precache 覆盖场景自愈：precache 会把官方名字（gen_snapshot 等）写回
+# x64 真身 → 本段下次运行时重新包装 ✓；.foa-real 是我们的私有名，
+# precache 不会碰它。
+for d in "$E"/android-*/linux-x64 "$E"/linux-x64; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    [ -f "$f" ] || continue
+    [ -x "$f" ] || continue
+    case "$f" in *.foa-real) continue ;; esac
+    case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
+    if head -c 2 "$f" 2>/dev/null | grep -q '#!'; then continue; fi
+    m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    case "$m" in 7f454c46*3e) ;; *) continue ;; esac
+    mv "$f" "$f.foa-real"
+    gen "$f" "$f.foa-real"
+    n=$((n+1))
+  done
+done
 for d in "$E"/android-*/linux-x64; do
   [ -d "$d" ] || continue
   a="${d%/linux-x64}/linux-arm64"
@@ -542,28 +614,30 @@ for d in "$E"/android-*/linux-x64; do
   for f in "$d"/*; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
+    case "$f" in *.foa-real) continue ;; esac
     case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
-    m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    # Bug 449：真身感知——原位包装后真身在 <f>.foa-real
+    real="$f"; [ -f "$f.foa-real" ] && real="$f.foa-real"
+    m=$(dd if="$real" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     w="$a/${f##*/}"
-    # Bug 428 关键修复：判定"是否已是转发脚本"，而非"文件是否存在"。
-    # flutter precache 在 arm64 宿主上会往 linux-arm64/ 写它下载的
-    # **真 x64 二进制**（上游 artifacts.dart 未对 linux_arm64 做 x64
-    # 回退，见 flutter/flutter#152281），覆盖掉我们先前放的包装脚本。
-    # 旧逻辑 [ -f "$w" ] 见文件存在就跳过 → 永久卡在错误状态 → SIGILL。
-    if [ -f "$w" ] && head -c 2 "$w" 2>/dev/null | grep -q '#!'; then
-      continue   # 已是转发脚本，幂等跳过
-    fi
-    gen "$w" "$f"
+    # Bug 428 关键修复：判定"是否已是转发脚本"，而非"文件是否存在"
+    # （precache 会往 linux-arm64/ 写真 x64 二进制）。
+    # Bug 451（alpha.56，真机工具链页假警报）：**光看自己形态合法还不够**
+    # ——alpha.53 时代生成的旧 wrapper 真身参数烘死指向 linux-x64/<tool>
+    # （当时的裸 ELF）。Bug 449 原位包装后该位置变成 #! 脚本，旧 wrapper
+    # 拿 qemu+ld.so 加载 shell 文本 → invalid ELF header。形态合法、
+    # 指向已死，`#! → continue` 短路让它永远刷不掉。与 Bug 445 教训同款：
+    # **linux-arm64/ 里本来就该全是「指向 .foa-real」的转发脚本**，
+    # 无条件重建（gen 是覆盖写），不再信任任何既存形态。
+    gen "$w" "$real"
     n=$((n+1))
   done
 done
 # ---- Bug 429：顶层宿主工具目录（$E/linux-x64 → $E/linux-arm64）----
 # impellerc / font-subset / flutter_tester 等**宿主工具**在引擎根下的
-# linux-x64/（不在 android-*/ 里）。artifacts.dart 的 HostArtifact.
-# impellerc 取 engineDir/<hostPlatform>/impellerc，arm64 宿主 →
-# linux-arm64/impellerc。不包装则 shader 编译直接 SIGILL（真机 57%
-# "impellerc failure"）。同样全量遍历、按 #! 判定、幂等。
+# linux-x64/（不在 android-*/ 里）。同样全量遍历、按 #! 判定、幂等，
+# 且真身感知（.foa-real 优先）。
 for hd in "$E"/linux-*/; do
   hd="${hd%/}"
   [ -d "$hd" ] || continue
@@ -573,14 +647,16 @@ for hd in "$E"/linux-*/; do
   for f in "$hd"/*; do
     [ -f "$f" ] || continue
     [ -x "$f" ] || continue
+    case "$f" in *.foa-real) continue ;; esac
     case "$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac
-    m=$(dd if="$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    real="$f"; [ -f "$f.foa-real" ] && real="$f.foa-real"
+    m=$(dd if="$real" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
     case "$m" in 7f454c46*3e) ;; *) continue ;; esac
     w="$ha/${f##*/}"
-    if [ -f "$w" ] && head -c 2 "$w" 2>/dev/null | grep -q '#!'; then
-      continue
-    fi
-    gen "$w" "$f"
+    # Bug 451：同引擎层对称段——无条件重建，不信任既存形态（旧 wrapper
+    # 可能指向已变成 #! 文本的 linux-x64/ 位）。impellerc/font-subset 的
+    # 对称位正是真机假警报的来源。
+    gen "$w" "$real"
     n=$((n+1))
   done
 done
@@ -678,11 +754,17 @@ smoke() {
 smoke @ENGINE@/android-arm64-release/linux-arm64/gen_snapshot GEN_SNAPSHOT
 smoke @ENGINE@/linux-arm64/impellerc IMPELLERC
 smoke @ENGINE@/linux-arm64/font-subset FONT_SUBSET
+# Bug 449：原位包装位冒烟——构建实际调用的就是这几个路径
+smoke @ENGINE@/android-arm64-release/linux-x64/gen_snapshot GEN_INPLACE
+smoke @ENGINE@/linux-x64/impellerc IMPELLERC_INPLACE
+# Bug 451：font-subset 原位冒烟（评分以 INPLACE 为准，见 verify 评分逻辑）
+smoke @ENGINE@/linux-x64/font-subset FONT_SUBSET_INPLACE
 # Bug 437：报告转发脚本指向的目标是否仍是 x64 ELF（被 pub get 覆盖会变成
 # arm64 或损坏文件，此时脚本还在、REASSERT 也是 0，但一跑就崩）
+# Bug 449：目标一律是 .foa-real 真身（linux-x64 位本身已是 wrapper）
 for pair in \
-  "@ENGINE@/linux-arm64/impellerc:@ENGINE@/linux-x64/impellerc" \
-  "@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot:@ENGINE@/android-arm64-release/linux-x64/gen_snapshot" ; do
+  "@ENGINE@/linux-arm64/impellerc:@ENGINE@/linux-x64/impellerc.foa-real" \
+  "@ENGINE@/android-arm64-release/linux-arm64/gen_snapshot:@ENGINE@/android-arm64-release/linux-x64/gen_snapshot.foa-real" ; do
   s="${pair%%:*}"; d="${pair##*:}"
   [ -f "$d" ] || { echo "TARGET_MISSING=$(basename "$s") 目标 $d 不存在"; continue; }
   m=$(dd if="$d" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d ' \n')
@@ -715,6 +797,16 @@ S=@SDK@
 E=@ENGINE@
 F=@FLUTTER@
 rm -rf "$E"/android-*/linux-arm64 2>/dev/null
+# Bug 449：引擎 linux-x64 位现在是原位包装（真身 .foa-real），卸载时还原
+for d in "$E"/android-*/linux-x64 "$E"/linux-x64; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*.foa-real; do
+    [ -f "$f" ] || continue
+    b="${f%.foa-real}"
+    rm -f "$b"
+    mv "$f" "$b"
+  done
+done
 if [ -d "$F/bin/cache/dart-sdk/bin" ]; then
   for f in "$F/bin/cache/dart-sdk/bin"/*.foa-real; do
     [ -f "$f" ] || continue
@@ -812,11 +904,21 @@ echo UNINSTALL_OK
     final qemu = kv('QEMU') ?? '';
     if (qemu.isEmpty) return null;
     final loaderOk = kv('LOADER') == 'yes';
-    final genOk = kv('GEN_SNAPSHOT') == 'yes';
-    // Bug 437：impellerc / font-subset 也纳入判定——它们才是真机 AOT
-    // 阶段实际执行、也确实崩过的工具
-    final impOk = kv('IMPELLERC') == 'yes';
-    final fsOk = kv('FONT_SUBSET') == 'yes';
+    // Bug 451（alpha.56）：评分以 **INPLACE 探针**（linux-x64/ 原位位，
+    // Bug 449 实锤的构建实际执行路径）为准；对称位探针降级为观测行——
+    // 它们跑的是 linux-arm64/ 兜底路径，上游修复 ABI 检测后才有意义。
+    // 旧版把 IMPELLERC=no 直接渲染成「AOT 会在 shader 阶段崩」，而该
+    // 探针可能因旧 wrapper 指向失效而 no（真机 2026-09-19 截图假警报），
+    // 与构建实际结果脱节。
+    final genOk = (kv('GEN_INPLACE') ?? kv('GEN_SNAPSHOT')) == 'yes';
+    final impOk = (kv('IMPELLERC_INPLACE') ?? kv('IMPELLERC')) == 'yes';
+    final fsOk = (kv('FONT_SUBSET_INPLACE') ?? kv('FONT_SUBSET')) == 'yes';
+    // 对称位（兜底路径）观测：异常只提示可修，不再吓人
+    final symBad = <String>[
+      if (kv('GEN_SNAPSHOT') != 'yes') 'gen_snapshot',
+      if (kv('IMPELLERC') != 'yes') 'impellerc',
+      if (kv('FONT_SUBSET') != 'yes') 'font-subset',
+    ];
     final dartOk = kv('DART') == 'yes';
     final aaptOk = kv('AAPT2') == 'yes';
     final gradleOk = kv('GRADLE') == 'yes';
@@ -838,10 +940,16 @@ echo UNINSTALL_OK
       ..write(loaderOk ? ' · x86_64 动态链接器可运行' : ' · 多架构库缺失')
       ..write(dartOk ? ' · flutter 工具链已转发' : ' · flutter 工具链未转发（装 Flutter 后重新应用）')
       ..write(genOk ? ' · gen_snapshot 冒烟通过' : ' · gen_snapshot 不可用')
-      ..write(impOk ? ' · impellerc 冒烟通过' : ' · impellerc 不可用（AOT 会在 shader 阶段崩）')
+      ..write(impOk ? ' · impellerc 冒烟通过' : ' · impellerc 不可用（构建会在 shader 阶段崩）')
       ..write(fsOk ? ' · font-subset 冒烟通过' : ' · font-subset 不可用')
       ..write(aaptOk ? ' · aapt2 已接管' : ' · SDK 工具未接管')
       ..write(gradleOk ? ' · AGP 已指向本地 aapt2' : ' · gradle 未配置');
+    // Bug 451：对称位只作观测——构建走的是原位位（INPLACE），对称位异常
+    // 不影响构建，重新应用兼容层即可修（alpha.56 起对称段无条件重建）
+    if (symBad.isNotEmpty) {
+      buf.write('\n对称位异常（兜底路径，不影响构建；重新应用兼容层可修）：'
+          '${symBad.join('、')}');
+    }
     if (diags.isNotEmpty) {
       buf.write('\n诊断详情：\n${diags.map((d) => '  • $d').join('\n')}');
     }
@@ -1093,6 +1201,17 @@ fi
   /// 因为它是"尽力而为"的修复动作，不该阻断构建流程。
   /// 自愈脚本正文（公开供单测导出，做 shell 语法与内容断言）。
   static const String healScript = _healScript;
+
+  // 以下三个同样公开供单测导出（Bug 449 收尾时定下的规矩：
+  // **凡是被执行过的 shell 脚本都必须可被单测 bash -n / 断言**——
+  // buildPreflightScript 的 AOT_FP 段曾出现「两个 for 头、一个 done」
+  // 的语法错误，正是"脚本只经 Dart 字符串拼、没人看过成品"造成的）。
+  /// flutter 工具链（dart-sdk/bin）原位包装脚本。
+  static const String flutterWrapScript = _flutterWrapScript;
+  /// 兼容层验证脚本（冒烟 + TARGET 检查）。
+  static const String verifyScript = _verifyScript;
+  /// 兼容层卸载脚本（含 linux-x64 原位包装还原）。
+  static const String uninstallScript = _uninstallScript;
 
   static Future<String> heal(ProotBridge bridge) async {
     try {

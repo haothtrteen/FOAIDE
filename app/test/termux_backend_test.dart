@@ -6,8 +6,8 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/env/models.dart';
-import 'package:flutter_on_android/toolchain/termux_backend.dart';
+import 'package:foaide/env/models.dart';
+import 'package:foaide/toolchain/termux_backend.dart';
 
 void main() {
   // ---------------- parsePackagesIndex ----------------

@@ -37,6 +37,45 @@ import 'sdk_downloader.dart';
 /// 构建后端：proot 容器（稳定）/ termux 裸原生（实验性）。
 enum BuildBackend { proot, termux }
 
+/// 容器层实现（alpha.61）：proot（ptrace，稳定）或 proroot（LD_PRELOAD，快）。
+///
+/// **与 [BuildBackend] 是两个正交维度**：
+/// - BuildBackend 决定"在不在容器里"（proot/termux 二选一，termux 不进容器）；
+/// - ContainerLayer 决定"进容器时用哪套路径翻译"。
+/// 所以 termux 后端下 ContainerLayer 无意义（当前 UI 会把开关置灰）。
+enum ContainerLayer { proot, proroot }
+
+/// 容器层偏好的持久化（filesDir/foa-container.json）。
+///
+/// 默认 **proot**：proroot 是专有软件、要求 Ubuntu rootfs（本项目是
+/// Debian，属未验证组合），不该被默认打开。
+class ContainerPrefs {
+  static const String fileName = 'foa-container.json';
+
+  static File _file(EnvInfo env) => File('${env.filesDir}/$fileName');
+
+  static Future<ContainerLayer> load(EnvInfo env) async {
+    try {
+      final f = _file(env);
+      if (!await f.exists()) return ContainerLayer.proot;
+      final raw = jsonDecode(await f.readAsString());
+      if (raw is! Map<String, dynamic>) return ContainerLayer.proot;
+      return switch (raw['layer']) {
+        'proroot' => ContainerLayer.proroot,
+        _ => ContainerLayer.proot,
+      };
+    } catch (_) {
+      return ContainerLayer.proot;
+    }
+  }
+
+  static Future<void> save(EnvInfo env, ContainerLayer layer) async {
+    final f = _file(env);
+    await f.parent.create(recursive: true);
+    await f.writeAsString(jsonEncode({'layer': layer.name}));
+  }
+}
+
 /// 后端切换的持久化（filesDir/foa-backend.json）。
 ///
 /// null = 用户还没选过（首次进工具链页会弹询问并给推荐）。

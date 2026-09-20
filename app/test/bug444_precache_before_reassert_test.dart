@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/toolchain/build_runner.dart';
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/build_runner.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 
 /// Bug 444：把 flutter build 内部的构件下载**提前**到 reassert 之前。
 ///

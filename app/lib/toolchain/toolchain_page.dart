@@ -7,7 +7,9 @@ import '../env/proot_bridge.dart';
 import 'jdk_installer.dart';
 import 'local_install_picker.dart';
 import 'native_arm64.dart';
+import 'proroot_option.dart';
 import 'qemu_compat.dart';
+import 'diag_page.dart';
 import 'sdk_downloader.dart';
 import 'sdk_installer.dart';
 import 'termux_backend.dart';
@@ -154,6 +156,10 @@ class _ToolchainPageState extends State<ToolchainPage> {
 
   // ---- 后端切换（proot 容器 / termux 裸原生）----
   BuildBackend? _backend; // null = 未选择（首次进入会弹询问）
+
+  /// 容器层（proot / proroot）。null = 尚未加载完。
+  /// 与 _backend 正交：termux 裸原生不进容器，此时该项无意义。
+  ContainerLayer? _layer;
   // ---- Termux 裸原生 ----
   TermuxPhase _termuxPhase = TermuxPhase.idle;
   String _termuxInfo = '';
@@ -175,6 +181,8 @@ class _ToolchainPageState extends State<ToolchainPage> {
     try {
       final env = await _bridge.envInfo();
       final b = await BackendPrefs.load(env);
+      final l = await ContainerPrefs.load(env);
+      if (mounted) setState(() => _layer = l);
       if (!mounted) return;
       setState(() => _backend = b);
       if (b == null) {
@@ -192,6 +200,15 @@ class _ToolchainPageState extends State<ToolchainPage> {
     try {
       final env = await _bridge.envInfo();
       await BackendPrefs.save(env, b);
+    } catch (_) {}
+  }
+
+  /// 切换容器层（proot ↔ proroot），写盘持久化。
+  Future<void> _setLayer(ContainerLayer l) async {
+    setState(() => _layer = l);
+    try {
+      final env = await _bridge.envInfo();
+      await ContainerPrefs.save(env, l);
     } catch (_) {}
   }
 
@@ -1492,6 +1509,17 @@ class _ToolchainPageState extends State<ToolchainPage> {
                     onUninstall: _qemuUninstall,
                   ),
                   const SizedBox(height: 12),
+                  // 容器层加速（proroot）：alpha.61 起真正可启用。
+                  // 放在「x64 兼容层」之后——两者都作用于容器层，
+                  // 读者心智上属于同一块。
+                  ProrootCard(
+                    enabled: _layer == ContainerLayer.proroot,
+                    onChanged: _layer == null
+                        ? null
+                        : (v) => _setLayer(
+                            v ? ContainerLayer.proroot : ContainerLayer.proot),
+                  ),
+                  const SizedBox(height: 12),
                   _NativeCard(
                     phase: _nativePhase,
                     audit: _nativeAudit,
@@ -1571,6 +1599,22 @@ class _ToolchainPageState extends State<ToolchainPage> {
                   const SizedBox(height: 12),
                   _AvfCard(env: _env),
                 ],
+                // 故障诊断（alpha.59 引入，alpha.60 更名）：两种后端通用——
+                // 命令走 proot 容器普通通道，只读探测，不与构建/预览抢
+                // Flutter 启动锁。注意与「远程接管」区分：本项是**本机采集**
+                // 信息给 AI 看；远程接管是把设备交给远程 AI 执行。
+                const SizedBox(height: 12),
+                Card(
+                  child: ListTile(
+                    leading: const Icon(Icons.medical_services_outlined),
+                    title: const Text('故障诊断'),
+                    subtitle: const Text('一键采集设备诊断信息，复制给 AI 分析'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const DiagPage()),
+                    ),
+                  ),
+                ),
               ],
             ),
     );

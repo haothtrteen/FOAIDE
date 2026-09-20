@@ -9,7 +9,7 @@
 
     <application
         android:name="${applicationName}"
-        android:label="FlutterOnAndroid"
+        android:label="FOAIDE"
         android:icon="@mipmap/ic_launcher">
         <!-- proot 走 jniLibs 路径需要 so 落地为真实文件：AGP 9 起由
              build.gradle.kts 的 packaging.jniLibs.useLegacyPackaging = true 控制
@@ -42,10 +42,14 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
-        <!-- Step 6：构建产物 APK 安装——FileProvider 授权 content:// 给系统安装器 -->
+        <!-- Step 6：构建产物 APK 安装——FileProvider 授权 content:// 给系统安装器。
+             authority 用 ${applicationId} 占位符（AGP 在合并清单时替换为真实包名），
+             与 MainActivity.fileProviderAuthority 同源——改包名时无需改这里。
+             历史教训：曾写死完整包名，与 Kotlin 侧各存一份，改包名漏改一处会在
+             安装 APK 时抛 IllegalArgumentException。 -->
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="dev.foa.flutter_on_android.fileprovider"
+            android:authorities="${applicationId}.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data

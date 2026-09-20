@@ -18,6 +18,109 @@ import 'sdk_installer.dart';
 class ToolchainEnsure {
   final ProotBridge _bridge = ProotBridge();
 
+  // ---------------- 脚本常量（const 化供单测做语法与契约断言）----------------
+  // 教训（Bug 449 收尾时发现）：同一段 shell 在 chk 与复核里各抄一份，
+  // 两份已经开始漂移（miss 标签一个带 engine: 前缀一个不带）——
+  // 而 buildPreflightScript 的 AOT_FP 段曾因同类复制粘贴产生
+  // 「两个 for 头、一个 done」的语法错误。脚本必须收敛到单一定义。
+
+  /// NDK strip 探针：任一 NDK 版本的 llvm-strip 已在位（文件或
+  /// symlink、可执行）→ STRIP_OK。glob 不展开时 `[ -e ]` 守卫安全跳过。
+  static const String ndkStripProbeScript = 'ok=0; '
+      'for s in /opt/android-sdk/ndk/*/toolchains/llvm/prebuilt/'
+      'linux-x86_64/bin/llvm-strip; do '
+      '  [ -e "\$s" ] || continue; [ -x "\$s" ] && ok=1; '
+      'done; '
+      '[ "\$ok" = 1 ] && echo STRIP_OK || echo STRIP_MISSING';
+
+  /// NDK strip 补位正文（前置 [AptTools.repairDpkg] 由调用方拼接）：
+  /// Debian llvm 已装 → 直接 symlink；没装 → 安装再 symlink。
+  /// 遍历 NDK 版本目录再拼路径，而非 glob 整条子路径——空壳 NDK 没有
+  /// toolchains 子树，`ndk/*/toolchains/.../bin` 不展开时 mkdir 会
+  /// 创建带 `*` 字面量的垃圾目录。`ndk/*/` 层级 ndkStub 已保证存在，
+  /// 且 `[ -d ]` 守卫让不展开的字面量安全跳过。
+  static const String ndkStripEnsureScript =
+      'command -v llvm-strip >/dev/null 2>&1 || '
+      'DEBIAN_FRONTEND=noninteractive apt-get update -qq && '
+      'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq '
+      '--no-install-recommends -o Acquire::Retries=3 llvm '
+      '2>&1 | tail -n 5; '
+      'command -v llvm-strip >/dev/null 2>&1 || { echo LLVM_UNAVAILABLE; exit 0; }; '
+      'for d in /opt/android-sdk/ndk/*/; do '
+      '  [ -d "\$d" ] || continue; '
+      '  b="\${d}toolchains/llvm/prebuilt/linux-x86_64/bin"; '
+      '  mkdir -p "\$b"; '
+      '  ln -sf "\$(command -v llvm-strip)" "\$b/llvm-strip"; '
+      '  ln -sf "\$(command -v llvm-objcopy)" "\$b/llvm-objcopy"; '
+      'done; '
+      'echo STRIP_FIXED';
+
+  /// 转发层全量比对脚本（qemuCompatEnsure 的 chk 与复核共用，Bug 449）。
+  ///
+  /// [tag] 是输出标记（chk 用 WRAP_CHECK，复核用 VERIFY），其余完全一致。
+  ///
+  /// 契约（Bug 449 修订）：
+  /// - 原位包装后 `linux-x64/<tool>` 是 wrapper、真身在 `<tool>.foa-real`；
+  ///   真身解析 `<f>.foa-real` 优先，保证读的是真 ELF 而不是 sh 脚本。
+  /// - 两个位都必须是 `#!`：① 原位 `<f>`（构建实际调用的路径）
+  ///   ② 对称 `<linux-arm64>/<f>`（上游修复 ABI 检测后的兜底路径）。
+  /// - SDK 侧本来就是原位制，只查原位一个位。
+  /// - 任一不满足记入 miss；n/ok 计数由调用方解析。
+  static String wrapCheckScript(String tag) =>
+      'miss=""; n=0; ok=0; '
+      // 引擎层：android-*/linux-x64（原位）→ android-*/linux-arm64（对称）
+      'for d in ${QemuCompat.engineDir}/android-*/linux-x64; do '
+      '  [ -d "\$d" ] || continue; '
+      '  a="\${d%/linux-x64}/linux-arm64"; '
+      '  for f in "\$d"/*; do '
+      '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+      '    case "\$f" in *.foa-real) continue ;; esac; '
+      '    case "\$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac; '
+      '    real="\$f"; [ -f "\$f.foa-real" ] && real="\$f.foa-real"; '
+      '    m=\$(dd if="\$real" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+      '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+      '    n=\$((n+1)); w="\$a/\${f##*/}"; '
+      '    if [ -f "\$f" ] && head -c 2 "\$f" 2>/dev/null | grep -q "#!" '
+      '       && [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
+      '      ok=\$((ok+1)); '
+      '    else miss="\$miss engine:\${f##*/}"; fi; '
+      '  done; '
+      'done; '
+      // 宿主层：顶层 linux-x64 → linux-arm64（impellerc/font-subset 所在）
+      'for hd in ${QemuCompat.engineDir}/linux-*/; do '
+      '  hd="\${hd%/}"; [ -d "\$hd" ] || continue; '
+      '  case "\$hd" in */linux-x64) ;; *) continue ;; esac; '
+      '  ha="\${hd%/linux-x64}/linux-arm64"; '
+      '  for f in "\$hd"/*; do '
+      '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+      '    case "\$f" in *.foa-real) continue ;; esac; '
+      '    case "\$f" in *.so|*.so.*|*.snapshot|*.dill|*.json|*.jar|*.zip) continue ;; esac; '
+      '    real="\$f"; [ -f "\$f.foa-real" ] && real="\$f.foa-real"; '
+      '    m=\$(dd if="\$real" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+      '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+      '    n=\$((n+1)); w="\$ha/\${f##*/}"; '
+      '    if [ -f "\$f" ] && head -c 2 "\$f" 2>/dev/null | grep -q "#!" '
+      '       && [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
+      '      ok=\$((ok+1)); '
+      '    else miss="\$miss host:\${f##*/}"; fi; '
+      '  done; '
+      'done; '
+      // SDK 层：build-tools/* 与 platform-tools 顶层 x86_64 ELF（原地包装制）
+      'for d in ${QemuCompat.sdkHome}/build-tools/* ${QemuCompat.sdkHome}/platform-tools; do '
+      '  [ -d "\$d" ] || continue; '
+      '  for f in "\$d"/*; do '
+      '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
+      '    case "\$f" in *.foa-real) continue ;; esac; '
+      '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
+      '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
+      '    n=\$((n+1)); '
+      '    if head -c 2 "\$f" 2>/dev/null | grep -q "#!"; then '
+      '      ok=\$((ok+1)); '
+      '    else miss="\$miss sdk:\${f##*/}"; fi; '
+      '  done; '
+      'done; '
+      'echo "$tag n=\$n ok=\$ok miss=\$miss"';
+
   /// 容器 CA 根证书确保（Bug 425 根因修复，2026-09-18 真机三连卡 4%）。
   ///
   /// debian minbase rootfs **不带 ca-certificates**（实测 tar 内
@@ -97,6 +200,49 @@ class ToolchainEnsure {
     }
   }
 
+  /// NDK strip 工具补位（Bug 449 附属，alpha.55，2026-09-19 真机实证）。
+  ///
+  /// 症状：构建跑到 gradle `:app:stripReleaseDebugSymbols` 报
+  /// `A problem occurred starting process 'command '.../llvm-strip''`
+  /// ——rootfs 里的 NDK 是**空壳**（只有 source.properties，见
+  /// [AndroidSdkInstaller.ensureNdkStub]：专为骗过 AGP 配置期的 NDK
+  /// 检测、省下 2GB 完整 NDK）。此前五个版本全部死在更早的 AOT 阶段，
+  /// strip 任务从未真正执行过——空壳兜不住执行期的事实一直没暴露。
+  /// 工具链全链路打通后第一次摸到 strip → 炸。
+  ///
+  /// 修复：**不装 NDK**（继续省 2GB），用 Debian 原生 llvm 顶位：
+  /// `apt-get install llvm` 后把 /usr/bin/llvm-strip、llvm-objcopy
+  /// symlink 进 NDK 的期望路径。llvm 工具是 arm64 原生二进制（native
+  /// 跑、不过 qemu），且 llvm-strip 能剥离任意架构的 ELF（包括 x86_64
+  /// 的 app.so），比 NDK 自带的 x86_64 版本更合适。
+  ///
+  /// 注意与 [ndkStub] 的分工：ndkStub 保障「AGP 配置期」不炸（空壳 +
+  /// source.properties），本方法保障「strip 执行期」不炸（真工具）。
+  /// 两者都要在构建前确保。返回 null=就位/已补位，非 null=错误文案。
+  Future<String?> ndkStripTools({bool bare = false}) async {
+    if (bare) return null; // termux 后端无此布局（未投产）
+    try {
+      // 任一 NDK 版本的 llvm-strip 已在位（文件或 symlink、可执行）→ 秒过
+      final probe = await _bridge.exec(
+        ndkStripProbeScript,
+        timeoutSec: 30,
+      );
+      if (probe.stdout.contains('STRIP_OK')) return null;
+
+      // Debian llvm：已装 → 直接 symlink；没装 → 修 dpkg 后安装再 symlink
+      final ensure = await _bridge.exec(
+        '${AptTools.repairDpkg}$ndkStripEnsureScript',
+        timeoutSec: 900,
+      );
+      if (ensure.stdout.contains('STRIP_FIXED')) return null;
+      final out = ensure.stderr.isNotEmpty ? ensure.stderr : ensure.stdout;
+      return 'llvm-strip 补位失败（NDK 空壳无 strip 工具，且 Debian llvm '
+          '安装失败——strip 阶段会卡构建）：\n${_tail(out)}';
+    } catch (e) {
+      return 'llvm-strip 补位检查失败：$e';
+    }
+  }
+
   /// x64 兼容层构建前重新确保（Bug 428 根因修复，2026-09-18 真机 47%）。
   ///
   /// 症状：AOT 编译段 `Dart snapshot generator failed with exit code -4`
@@ -149,60 +295,17 @@ class ToolchainEnsure {
       );
       if (!probe.stdout.contains('QEMU_YES')) return null;
 
-      const E = QemuCompat.engineDir;
       const S = QemuCompat.sdkHome;
 
-      // ---- 全量比对：遍历所有 linux-x64 下 x86_64 ELF，逐个校验对应
-      //      linux-arm64 转发脚本存在且为 #! 脚本。输出缺失清单。 ----
+      // ---- 全量比对（Bug 449 修订）：原位包装后，linux-x64/<tool> 是
+      //      wrapper、真身在 <tool>.foa-real。检查两个位都必须是 #!：
+      //      ① 原位 <f>（构建实际调用的路径）
+      //      ② 对称 <linux-arm64>/<f>（上游修复 ABI 检测后的兜底路径）
+      //      任一不是 #! 即缺口。SDK 侧本来就是原位制，不变。
+      //      脚本本体收敛到 wrapCheckScript（chk 与复核共用同一份，
+      //      防止两份手抄版漂移——AOT_FP 的 for 不闭合就是这么来的）。----
       final chk = await _bridge.exec(
-        'miss=""; n=0; ok=0; '
-        // 引擎层：android-*/linux-x64 → android-*/linux-arm64
-        'for d in $E/android-*/linux-x64; do '
-        '  [ -d "\$d" ] || continue; '
-        '  a="\${d%/linux-x64}/linux-arm64"; '
-        '  for f in "\$d"/*; do '
-        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
-        // 仅 x86_64 ELF（魔数 7f454c46 + e_machine 3e）
-        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
-        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
-        '    n=\$((n+1)); w="\$a/\${f##*/}"; '
-        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
-        '      ok=\$((ok+1)); '
-        '    else miss="\$miss engine:\${f##*/}"; fi; '
-        '  done; '
-        'done; '
-        // Bug 429：顶层宿主工具目录（$E/linux-x64 → $E/linux-arm64）
-        // impellerc / font-subset / flutter_tester 等宿主工具在此，
-        // arm64 宿主按 HostArtifact 取 linux-arm64/<name>，不包装则 SIGILL
-        'for hd in $E/linux-*/; do '
-        '  hd="\${hd%/}"; [ -d "\$hd" ] || continue; '
-        '  case "\$hd" in */linux-x64) ;; *) continue ;; esac; '
-        '  ha="\${hd%/linux-x64}/linux-arm64"; '
-        '  for f in "\$hd"/*; do '
-        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
-        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
-        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
-        '    n=\$((n+1)); w="\$ha/\${f##*/}"; '
-        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
-        '      ok=\$((ok+1)); '
-        '    else miss="\$miss host:\${f##*/}"; fi; '
-        '  done; '
-        'done; '
-        // SDK 层：build-tools/* 与 platform-tools 顶层 x86_64 ELF（原地包装制）
-        'for d in $S/build-tools/* $S/platform-tools; do '
-        '  [ -d "\$d" ] || continue; '
-        '  for f in "\$d"/*; do '
-        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
-        '    case "\$f" in *.foa-real) continue ;; esac; '
-        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
-        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
-        '    n=\$((n+1)); '
-        '    if head -c 2 "\$f" 2>/dev/null | grep -q "#!"; then '
-        '      ok=\$((ok+1)); '
-        '    else miss="\$miss sdk:\${f##*/}"; fi; '
-        '  done; '
-        'done; '
-        'echo "WRAP_CHECK n=\$n ok=\$ok miss=\$miss"',
+        wrapCheckScript('WRAP_CHECK'),
         timeoutSec: 120,
       );
       final out = chk.stdout;
@@ -235,35 +338,9 @@ class ToolchainEnsure {
         timeoutSec: 600,
       );
 
-      // 复核：再跑一次全量比对，仍缺则如实报告缺口名
+      // 复核：再跑一次全量比对（与 chk 同一份脚本），仍缺则如实报告缺口名
       final v = await _bridge.exec(
-        'miss=""; n=0; ok=0; '
-        'for d in $E/android-*/linux-x64; do '
-        '  [ -d "\$d" ] || continue; '
-        '  a="\${d%/linux-x64}/linux-arm64"; '
-        '  for f in "\$d"/*; do '
-        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
-        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
-        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
-        '    n=\$((n+1)); w="\$a/\${f##*/}"; '
-        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
-        '      ok=\$((ok+1)); else miss="\$miss \${f##*/}"; fi; '
-        '  done; '
-        'done; '
-        'for hd in $E/linux-*/; do '
-        '  hd="\${hd%/}"; [ -d "\$hd" ] || continue; '
-        '  case "\$hd" in */linux-x64) ;; *) continue ;; esac; '
-        '  ha="\${hd%/linux-x64}/linux-arm64"; '
-        '  for f in "\$hd"/*; do '
-        '    [ -f "\$f" ] || continue; [ -x "\$f" ] || continue; '
-        '    m=\$(dd if="\$f" bs=1 count=19 2>/dev/null | od -An -tx1 | tr -d " \\n"); '
-        '    case "\$m" in 7f454c46*3e) ;; *) continue ;; esac; '
-        '    n=\$((n+1)); w="\$ha/\${f##*/}"; '
-        '    if [ -f "\$w" ] && head -c 2 "\$w" 2>/dev/null | grep -q "#!"; then '
-        '      ok=\$((ok+1)); else miss="\$miss host:\${f##*/}"; fi; '
-        '  done; '
-        'done; '
-        'echo "VERIFY n=\$n ok=\$ok miss=\$miss"',
+        wrapCheckScript('VERIFY'),
         timeoutSec: 120,
       );
       final vline = v.stdout.split('\n').firstWhere(

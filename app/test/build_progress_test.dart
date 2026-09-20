@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/toolchain/build_progress.dart';
+import 'package:foaide/toolchain/build_progress.dart';
 
 void main() {
   group('BuildProgressTracker · 阶段识别', () {

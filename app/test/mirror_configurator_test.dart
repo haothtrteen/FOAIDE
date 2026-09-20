@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/toolchain/sdk_installer.dart';
+import 'package:foaide/toolchain/sdk_installer.dart';
 
 /// Bug 426 固化：init.gradle 必须是无注入的 beforeSettings 前插形态。
 ///

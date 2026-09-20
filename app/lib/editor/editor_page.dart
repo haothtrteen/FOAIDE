@@ -6,6 +6,8 @@ import 'code_editor.dart';
 import 'editor_last_file.dart';
 import 'file_tree.dart';
 import 'fs_bridge.dart';
+import 'web_preview_page.dart';
+import 'web_preview_service.dart';
 
 /// Step 2 · 文件浏览器 + 代码编辑器。
 ///
@@ -29,9 +31,14 @@ class EditorPage extends StatefulWidget {
   /// 联动。独立页模式（主页「编辑器」入口）完全不变。
   final bool embed;
 
+  /// AI 助手入口（alpha.61）：透传给 [CodeEditor]，显示在状态栏字号那一栏。
+  /// 由宿主注入回调（工作台把它接到 AI 接管面板），避免编辑器反向依赖
+  /// 项目/MCP 等上层模块——编辑器保持"不知道 AI 是什么"的纯粹性。
+  final VoidCallback? onAiAssist;
+
   EditorPage(
       {super.key, FsBridge? bridge, this.initialDir, this.initialPath,
-      this.embed = false})
+      this.embed = false, this.onAiAssist})
       : bridge = bridge ?? FsBridge();
 
   @override
@@ -145,7 +152,15 @@ class EditorPageState extends State<EditorPage> {
       return false;
     }
     setState(() => _dirty = false);
-    _toast('已保存');
+    // alpha.59「保存即刷新」：预览运行中，保存本身就是最可靠的"文件
+    // 变更"信号——直接热重载，替代手动按键/第三方文件监控工具
+    //（flutsim 卖点的零成本实现：挂到保存动作上，无轮询）
+    var msg = '已保存';
+    if (WebPreviewService.I.status == WebPreviewStatus.running) {
+      final err = await WebPreviewService.I.hotReload();
+      if (err == null) msg = '已保存 · 已触发热重载';
+    }
+    _toast(msg);
     _treeKey.currentState?.reload();
     return true;
   }
@@ -225,6 +240,71 @@ class EditorPageState extends State<EditorPage> {
     if (!ok && mounted) _toast('无法打开链接');
   }
 
+  // ---------------- 实时运行预览（alpha.57） ----------------
+
+  /// 预览按钮：运行中单击 = 直达热重载（改代码后最短路径），
+  /// 控制台入口放 SnackBar action；否则打开预览控制台页（idle 自动启动）。
+  Future<void> _onPreviewTap() async {
+    final svc = WebPreviewService.I;
+    if (svc.status == WebPreviewStatus.running) {
+      final err = await svc.hotReload();
+      if (!mounted) return;
+      if (err != null) {
+        _toast(err);
+        return;
+      }
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(SnackBar(
+          content: const Text('已触发热重载'),
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          action: SnackBarAction(
+            label: '预览控制台',
+            onPressed: () => _openPreviewPage(),
+          ),
+        ));
+      return;
+    }
+    await _openPreviewPage();
+  }
+
+  Future<void> _openPreviewPage() async {
+    final root = await _resolveProjectRoot();
+    if (!mounted) return;
+    if (root == null) {
+      _toast('未定位到项目根（需先打开项目内文件）');
+      return;
+    }
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => WebPreviewPage(projectRoot: root),
+    ));
+  }
+
+  /// 定位当前编辑文件所属 Flutter 项目根（预览入口用）：
+  /// 优先工作台传入的 initialDir（pubspec 校验），否则从当前文件
+  /// 向上找 pubspec.yaml。探测走 Kotlin 文件通道（FsBridge.read），
+  /// 不占 proot executor——预览/构建运行时该入口仍可用。
+  Future<String?> _resolveProjectRoot() async {
+    final dir = widget.initialDir;
+    if (dir != null && dir.isNotEmpty) {
+      final probe = await widget.bridge.read('$dir/pubspec.yaml');
+      if (probe.ok) return dir;
+    }
+    final p = _currentPath;
+    if (p == null) return null;
+    const projectsRoot = '/root/projects';
+    var d = p.contains('/') ? p.substring(0, p.lastIndexOf('/')) : p;
+    while (d.startsWith('$projectsRoot/') && d != projectsRoot) {
+      final probe = await widget.bridge.read('$d/pubspec.yaml');
+      if (probe.ok) return d;
+      final idx = d.lastIndexOf('/');
+      if (idx <= projectsRoot.length) break;
+      d = d.substring(0, idx);
+    }
+    return null;
+  }
+
   void _toast(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -288,6 +368,23 @@ class EditorPageState extends State<EditorPage> {
   List<Widget> _editorActions({double iconSize = 24}) {
     return [
       if (_currentPath != null) ...[
+        // 实时运行预览（alpha.57）：Web 预览入口；运行中变直达热重载键
+        //（statusN 驱动变脸：绿 = 预览在跑）
+        ValueListenableBuilder<WebPreviewStatus>(
+          valueListenable: WebPreviewService.I.statusN,
+          builder: (ctx, st, _) {
+            final running = st == WebPreviewStatus.running;
+            return IconButton(
+              iconSize: iconSize,
+              tooltip: running ? '热重载（Web 预览运行中）' : '实时运行预览（Web）',
+              onPressed: _onPreviewTap,
+              icon: Icon(
+                running ? Icons.refresh : Icons.play_circle_outline,
+                color: running ? const Color(0xFF3DDC84) : null,
+              ),
+            );
+          },
+        ),
         IconButton(
           iconSize: iconSize,
           tooltip: '撤销更改',
@@ -450,6 +547,8 @@ class EditorPageState extends State<EditorPage> {
           _content = t;
           if (!_dirty) setState(() => _dirty = true);
         },
+        // alpha.61：AI 入口由宿主注入；为 null 时编辑器不渲染该按钮
+        onAiAssist: widget.onAiAssist,
       ),
     );
   }

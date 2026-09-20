@@ -1,17 +1,19 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../editor/editor_page.dart';
 import '../editor/file_tree.dart';
 import '../editor/fs_bridge.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
-import '../toolchain/build_notify.dart';
-import '../toolchain/build_page.dart';
 import '../toolchain/build_runner.dart';
 import '../toolchain/termux_backend.dart';
+import 'ai_takeover_panel.dart';
+import 'build_panel.dart';
+import 'manifest_codec.dart';
+import 'manifest_page.dart';
+import 'project_preview.dart';
 
 /// 项目工作台（alpha.33）：点工程卡片先到这里，而不是直接构建。
 ///
@@ -37,7 +39,7 @@ class ProjectPage extends StatefulWidget {
   State<ProjectPage> createState() => _ProjectPageState();
 }
 
-enum _Section { overview, code, manifest, build }
+enum _Section { overview, code, manifest, build, ai }
 
 extension _SectionLabel on _Section {
   String get label => switch (this) {
@@ -45,6 +47,7 @@ extension _SectionLabel on _Section {
         _Section.code => '代码',
         _Section.manifest => '清单',
         _Section.build => '打包',
+        _Section.ai => 'AI 接管',
       };
 
   IconData get icon => switch (this) {
@@ -52,6 +55,7 @@ extension _SectionLabel on _Section {
         _Section.code => Icons.code,
         _Section.manifest => Icons.fact_check_outlined,
         _Section.build => Icons.build_outlined,
+        _Section.ai => Icons.smart_toy_outlined,
       };
 }
 
@@ -71,7 +75,7 @@ class _ProjectPageState extends State<ProjectPage> {
   String _loadError = '';
   BuildBackend _backend = BuildBackend.proot;
 
-  // ---- 清单数据 ----
+  // ---- 清单快照（只读，供「预览」卡展示；编辑在 ManifestPage 内自持）----
   String _pubName = '';
   String _description = '';
   String _appId = '';
@@ -79,11 +83,12 @@ class _ProjectPageState extends State<ProjectPage> {
   String _verName = '';
   String _verCode = '';
   int _depCount = 0;
-  final List<String> _permissions = [];
-  final _verNameCtl = TextEditingController();
-  final _verCodeCtl = TextEditingController();
-  bool _dirty = false;
-  bool _saving = false;
+
+  /// 清单页状态句柄：驱动 AppBar 的保存按钮与跳区确认。
+  final ManifestPageController _manifestCtl = ManifestPageController();
+
+  /// 清单页句柄：AppBar 的保存按钮要触发页面内的保存流程。
+  final GlobalKey<ManifestPageState> _manifestKey = GlobalKey();
 
   // ---- 打包面板轮询（不碰 BuildRunner.onUiChanged——那是 BuildPage 的）----
   Timer? _uiTimer;
@@ -91,14 +96,27 @@ class _ProjectPageState extends State<ProjectPage> {
   @override
   void initState() {
     super.initState();
+    // 清单页保存成功后要立刻反映到「预览」卡（版本号/应用名），
+    // 否则用户在两个区之间来回切会看到过期数据。
+    _manifestCtl.addListener(_onManifestChanged);
     _load();
   }
+
+  void _onManifestChanged() {
+    // 从"脏"变"干净"= 刚保存完 → 重读快照
+    if (!_manifestCtl.dirty && !_manifestCtl.saving && _manifestLoaded) {
+      _refreshManifestSnapshot();
+    }
+    _manifestLoaded = true;
+  }
+
+  bool _manifestLoaded = false;
 
   @override
   void dispose() {
     _uiTimer?.cancel();
-    _verNameCtl.dispose();
-    _verCodeCtl.dispose();
+    _manifestCtl.removeListener(_onManifestChanged);
+    _manifestCtl.dispose();
     super.dispose();
   }
 
@@ -137,106 +155,63 @@ class _ProjectPageState extends State<ProjectPage> {
 
   String _guestPath(String rel) => '/root/projects/${widget.projectName}/$rel';
 
-  /// 解析 pubspec / AndroidManifest / build.gradle（清单区数据源）。
+  /// 读取清单快照（只读），供「预览」卡展示。
+  ///
+  /// alpha.61：解析逻辑全部委托给 [ManifestCodec]（纯函数、有单测）。
+  /// 这里以前是一堆就地写的正则，既没测过又和清单页各写一份、
+  /// 容易改一处漏一处——现在两处共用同一套解析。
   Future<void> _readManifest(EnvInfo env) async {
     final pub = await _fb.read(_guestPath('pubspec.yaml'));
     if (pub.ok) {
-      final t = pub.content;
-      _pubName = RegExp(r'^name:\s*(.+)$', multiLine: true)
-          .firstMatch(t)
-          ?.group(1)
-          ?.trim() ??
-          widget.projectName;
-      _description = RegExp(r'^description:\s*(.+)$', multiLine: true)
-          .firstMatch(t)
-          ?.group(1)
-          ?.trim() ??
-          '';
-      final ver = RegExp(r'^version:\s*(.+)$', multiLine: true)
-          .firstMatch(t)
-          ?.group(1)
-          ?.trim();
-      final plus = ver?.indexOf('+') ?? -1;
-      _verName = (plus >= 0 ? ver?.substring(0, plus) : ver)?.trim() ?? '1.0.0';
-      _verCode = (plus >= 0 ? ver?.substring(plus + 1) : '1')?.trim() ?? '1';
-      final depStart = t.indexOf('dependencies:');
-      _depCount = 0;
-      if (depStart >= 0) {
-        for (final line in t.substring(depStart).split('\n').skip(1)) {
-          if (line.isNotEmpty && !line.startsWith(' ') && !line.startsWith('#')) {
-            break;
-          }
-          if (line.trim().isNotEmpty && !line.trim().startsWith('#')) {
-            _depCount++;
-          }
-        }
-      }
+      final r = ManifestCodec.parsePubspec(pub.content);
+      _pubName = r.name.isEmpty ? widget.projectName : r.name;
+      _description = r.description;
+      _verName = r.verName;
+      _verCode = r.verCode;
+      _depCount = ManifestCodec.countDependencies(pub.content);
     }
     final mf = await _fb.read(_guestPath('android/app/src/main/AndroidManifest.xml'));
     if (mf.ok) {
-      _label = RegExp(r'android:label="([^"]*)"').firstMatch(mf.content)?.group(1) ?? '';
-      _permissions.addAll(
-        RegExp(r'android:name="([^"]*)"')
-            .allMatches(mf.content)
-            .map((m) => m.group(1)!)
-            .where((n) => n.contains('permission'))
-            .map((n) => n.split('.').last),
-      );
+      _label = ManifestCodec.parseManifest(mf.content).label;
     }
     for (final f in const ['android/app/build.gradle', 'android/app/build.gradle.kts']) {
       final g = await _fb.read(_guestPath(f));
-      if (g.ok) {
-        _appId = RegExp(r'applicationId\s*=?\s*"([^"]*)"')
-                .firstMatch(g.content)
-                ?.group(1) ??
-            '';
-        if (_appId.isNotEmpty) break;
+      if (!g.ok) continue;
+      final appId = ManifestCodec.parseGradle(g.content).appId;
+      if (appId.isNotEmpty) {
+        _appId = appId;
+        break;
       }
     }
-    _verNameCtl.text = _verName;
-    _verCodeCtl.text = _verCode;
   }
 
-  /// 保存版本：替换 pubspec 的 version 行（唯一允许的写操作——
-  /// applicationId 改了会与已装应用冲突，label 涉及 Manifest 多处匹配，
-  /// 都保持只读）。
-  Future<void> _saveVersion() async {
+  /// 清单页保存完成后刷新父页的快照（预览卡要立刻反映新版本号/新名字）。
+  Future<void> _refreshManifestSnapshot() async {
     final env = _env;
-    if (env == null || _saving) return;
-    final vn = _verNameCtl.text.trim();
-    final vc = _verCodeCtl.text.trim();
-    if (vn.isEmpty || !RegExp(r'^\d+\.\d+\.\d+([\-+.\w]*)?$').hasMatch(vn)) {
-      _toast('版本名格式应为 x.y.z（如 1.0.0）');
-      return;
-    }
-    if (vc.isEmpty || int.tryParse(vc) == null) {
-      _toast('版本代码应为整数');
-      return;
-    }
-    setState(() => _saving = true);
-    final r = await _fb.read(_guestPath('pubspec.yaml'));
-    if (!r.ok) {
-      if (!mounted) return;
-      setState(() => _saving = false);
-      _toast('读取 pubspec 失败：${r.error}');
-      return;
-    }
-    final newLine = 'version: $vn+$vc';
-    final t = r.content.replaceFirst(
-      RegExp(r'^version:.*$', multiLine: true),
-      newLine,
-    );
-    final w = await _fb.write(_guestPath('pubspec.yaml'), t);
+    if (env == null) return;
+    await _readManifest(env);
+    if (mounted) setState(() {});
+  }
+
+  /// 在内嵌编辑器中打开文件（文件树/清单入口共用）。
+  ///
+  /// 先探测可读：路径不存在时直接提示，而不是打开一个空白编辑器
+  /// 让用户以为"文件坏了"。
+  Future<void> _openFile(String rel) async {
+    final path = rel.startsWith('/') ? rel : _guestPath(rel);
+    final probe = await _fb.read(path);
     if (!mounted) return;
-    setState(() {
-      _saving = false;
-      if (w.ok) {
-        _verName = vn;
-        _verCode = vc;
-        _dirty = false;
+    if (!probe.ok) {
+      // 目录不可 read，交由编辑器自己处理（图标卡会传目录路径）
+      if (rel.startsWith('/') || !rel.contains('.')) {
+        setState(() => _section = _Section.code);
+        _openInEmbed(path);
+        return;
       }
-    });
-    _toast(w.ok ? '已保存 $newLine' : '保存失败：${w.error}');
+      _toast('读取失败：${probe.error}');
+      return;
+    }
+    _openInEmbed(path); // alpha.35：就地进内嵌编辑器，不跳页
   }
 
   void _toast(String msg) {
@@ -276,15 +251,24 @@ class _ProjectPageState extends State<ProjectPage> {
           ],
         ),
         actions: [
+          // AppBar 的保存按钮与清单页底部悬浮条是同一件事的两个入口：
+          // 大屏/横屏时底部条可能被键盘顶住，顶部这个更顺手。
+          // 状态由 ManifestPageController 反向驱动（本页不持有清单数据）。
           if (_section == _Section.manifest)
-            IconButton(
-              tooltip: '保存版本',
-              onPressed: _dirty && !_saving ? _saveVersion : null,
-              icon: _saving
-                  ? const SizedBox(
-                      width: 16, height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.save_outlined),
+            AnimatedBuilder(
+              animation: _manifestCtl,
+              builder: (context, _) => IconButton(
+                tooltip: _manifestCtl.dirty ? '保存清单改动' : '没有未保存的改动',
+                onPressed: _manifestCtl.dirty && !_manifestCtl.saving
+                    ? () => _manifestKey.currentState?.save()
+                    : null,
+                icon: _manifestCtl.saving
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.save_outlined),
+              ),
             ),
         ],
       ),
@@ -311,9 +295,12 @@ class _ProjectPageState extends State<ProjectPage> {
     );
   }
 
-  /// 四区 IndexedStack（alpha.35 融合）：全部保活——「代码」就地切换
-  /// 不丢编辑状态（未保存修改跨区保留），打包区 timer 由 _section 驱动
-  /// 照常工作。编辑器为 embed 模式（无 Scaffold，自带工具行）。
+  /// 五区 IndexedStack（alpha.35 融合，alpha.60 增「AI 接管」）：
+  /// 全部保活——「代码」就地切换不丢编辑状态（未保存修改跨区保留），
+  /// 打包区 timer 由 _section 驱动照常工作。编辑器为 embed 模式。
+  ///
+  /// ⚠️ children 顺序**必须与 [_Section] 枚举声明顺序一致**
+  /// （IndexedStack 用 `_section.index` 定位）。
   Widget _buildSections() {
     return IndexedStack(
       index: _section.index,
@@ -324,9 +311,20 @@ class _ProjectPageState extends State<ProjectPage> {
           embed: true,
           bridge: _fb,
           initialDir: '/root/projects/${widget.projectName}',
+          // alpha.61：代码页状态栏的 AI 按钮 → 切到「AI 接管」区。
+          // 就地切区而非弹新页：用户要的是"在当前上下文里用 AI"，
+          // 跳出去会丢掉"我在哪个项目"的心理锚点（同 Bug 458 的教训）。
+          onAiAssist: () => setState(() => _section = _Section.ai),
         ),
-        _buildManifest(),
+        ManifestPage(
+          key: _manifestKey,
+          projectName: widget.projectName,
+          bridge: _fb,
+          controller: _manifestCtl,
+          onOpenFile: _openFile,
+        ),
         _buildPanel(),
+        AiTakeoverPanel(projectName: widget.projectName),
       ],
     );
   }
@@ -527,135 +525,29 @@ class _ProjectPageState extends State<ProjectPage> {
 
   // ============================ 概览 ============================
 
+  /// 概览区（alpha.61 重做）：委托给 [ProjectPreview]。
+  ///
+  /// 原实现只有「一张信息卡 + 两个快捷入口」，用户反馈界面太空、
+  /// 关键状态（依赖缓存 / 最近构建 / 远程接管入口）都找不到。
+  /// 现在把状态面板独立成文件，本页只负责喂数据 + 接管跳区。
   Widget _buildOverview() {
-    final env = _env;
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      width: 48,
-                      height: 48,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF173F35),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: const Icon(Icons.flutter_dash,
-                          color: Color(0xFF3DDC84), size: 28),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(_pubName,
-                              style: const TextStyle(
-                                  fontSize: 16, fontWeight: FontWeight.bold)),
-                          if (_description.isNotEmpty)
-                            Text(_description,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    fontSize: 12,
-                                    color: Colors.grey.shade500)),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const Divider(height: 24),
-                _kv('包名', _appId.isEmpty ? '—' : _appId),
-                _kv('版本', '$_verName+$_verCode'),
-                _kv('依赖', '$_depCount 个'),
-                _kv('容器路径', '/root/projects/${widget.projectName}'),
-                _kv('构建后端',
-                    _backend == BuildBackend.termux ? 'Termux 裸原生（实验性）' : 'Proot 容器'),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: _quickCard(Icons.code, '写代码', '编辑 main.dart',
-                  () => setState(() => _section = _Section.code)),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: _quickCard(
-                  Icons.build_outlined, '打包', '构建 APK',
-                  () => setState(() => _section = _Section.build)),
-            ),
-          ],
-        ),
-        if (env != null && !env.rootfsInstalled) ...[
-          const SizedBox(height: 12),
-          const Text('rootfs 未初始化：构建/文件浏览需先在主页完成环境安装',
-              style: TextStyle(fontSize: 12, color: Color(0xFFFF7A7A))),
-        ],
-      ],
-    );
-  }
-
-  Widget _kv(String k, String v) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 76,
-            child: Text(k,
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
-          ),
-          Expanded(
-            child: SelectableText(v,
-                style: const TextStyle(
-                    fontSize: 13,
-                    fontFamily: 'monospace',
-                    color: Color(0xFFD6DEE8))),
-          ),
-        ],
+    return ProjectPreview(
+      projectName: widget.projectName,
+      env: _env,
+      info: ManifestInfo(
+        pubName: _pubName,
+        label: _label,
+        description: _description,
+        appId: _appId,
+        versionName: _verName,
+        versionCode: _verCode,
+        depCount: _depCount,
+        backendLabel: _backend == BuildBackend.termux
+            ? 'Termux 裸原生（实验性）'
+            : 'Proot 容器',
       ),
-    );
-  }
-
-  Widget _quickCard(IconData icon, String title, String sub, VoidCallback onTap) {
-    return Card(
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Row(
-            children: [
-              Icon(icon, size: 22, color: const Color(0xFF4C8DFF)),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(title,
-                        style: const TextStyle(
-                            fontSize: 14, fontWeight: FontWeight.w600)),
-                    Text(sub,
-                        style: TextStyle(
-                            fontSize: 11, color: Colors.grey.shade500)),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
+      onOpenCode: () => setState(() => _section = _Section.code),
+      onOpenBuild: () => setState(() => _section = _Section.build),
     );
   }
 
@@ -664,418 +556,40 @@ class _ProjectPageState extends State<ProjectPage> {
   // 文件树在抽屉下半区/横屏左栏（_buildSideTree），点文件就地打开；
   // 本节不再有自己的构建函数。
 
-  // ============================ 清单（模仿参考图 2） ============================
-
-  Widget _buildManifest() {
-    return ListView(
-      padding: const EdgeInsets.all(20),
-      children: [
-        Container(
-          width: 72,
-          height: 72,
-          decoration: BoxDecoration(
-            color: const Color(0xFF173F35),
-            borderRadius: BorderRadius.circular(14),
-          ),
-          child: const Icon(Icons.flutter_dash,
-              color: Color(0xFF3DDC84), size: 40),
-        ),
-        const SizedBox(height: 20),
-        _fieldLabel('应用名称（android:label，只读）'),
-        Text(_label.isEmpty ? '—' : _label,
-            style: const TextStyle(fontSize: 15, color: Color(0xFFC9CFD6))),
-        const Divider(height: 28),
-        _fieldLabel('应用包名（applicationId，只读）'),
-        Text(_appId.isEmpty ? '—' : _appId,
-            style: const TextStyle(
-                fontSize: 15,
-                fontFamily: 'monospace',
-                color: Color(0xFFC9CFD6))),
-        const Divider(height: 28),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _fieldLabel('版本名'),
-                  TextField(
-                    controller: _verNameCtl,
-                    style: const TextStyle(fontSize: 15),
-                    decoration: const InputDecoration(
-                      hintText: '1.0.0',
-                      isDense: true,
-                      border: UnderlineInputBorder(),
-                    ),
-                    onChanged: (_) => _markDirty(),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _fieldLabel('版本代码'),
-                  TextField(
-                    controller: _verCodeCtl,
-                    keyboardType: TextInputType.number,
-                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                    style: const TextStyle(fontSize: 15),
-                    decoration: const InputDecoration(
-                      hintText: '1',
-                      isDense: true,
-                      border: UnderlineInputBorder(),
-                    ),
-                    onChanged: (_) => _markDirty(),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        const Divider(height: 28),
-        ListTile(
-          contentPadding: EdgeInsets.zero,
-          leading: const Icon(Icons.extension_outlined,
-              color: Color(0xFF4C8DFF)),
-          title: Text('依赖（$_depCount 个，pubspec.yaml）',
-              style: const TextStyle(fontSize: 14)),
-          trailing: const Icon(Icons.chevron_right, size: 20),
-          onTap: () => _openFile('pubspec.yaml'),
-        ),
-        ListTile(
-          contentPadding: EdgeInsets.zero,
-          leading:
-              const Icon(Icons.verified_user_outlined, color: Color(0xFF4C8DFF)),
-          title: Text(
-              _permissions.isEmpty
-                  ? '权限（未声明）'
-                  : '权限（${_permissions.length}）',
-              style: const TextStyle(fontSize: 14)),
-          subtitle: _permissions.isEmpty
-              ? null
-              : Text(_permissions.take(4).join('、') +
-                  (_permissions.length > 4 ? ' …' : ''),
-              style: const TextStyle(fontSize: 11)),
-          trailing: const Icon(Icons.chevron_right, size: 20),
-          onTap: () => _openFile('android/app/src/main/AndroidManifest.xml'),
-        ),
-        if (_dirty) ...[
-          const SizedBox(height: 8),
-          FilledButton.icon(
-            onPressed: _saving ? null : _saveVersion,
-            icon: const Icon(Icons.save_outlined, size: 18),
-            label: const Text('保存版本（写回 pubspec.yaml）'),
-          ),
-        ],
-      ],
-    );
-  }
-
-  void _markDirty() {
-    final dirty = _verNameCtl.text != _verName || _verCodeCtl.text != _verCode;
-    if (dirty != _dirty) setState(() => _dirty = dirty);
-  }
-
-  Future<void> _openFile(String rel) async {
-    final path = _guestPath(rel);
-    final probe = await _fb.read(path);
-    if (!mounted) return;
-    if (!probe.ok) {
-      _toast('读取失败：${probe.error}');
-      return;
-    }
-    _openInEmbed(path); // alpha.35：就地进内嵌编辑器，不跳页
-  }
-
-  Widget _fieldLabel(String s) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: Text(s,
-          style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
-    );
-  }
 
   // ============================ 打包 ============================
 
+  /// 打包区（alpha.61 优化）：委托给 [BuildPanel]。
+  ///
+  /// 原实现把 UI 和构建控制混在一起（800 行的一个 State），
+  /// 现在拆出去——本页只负责喂 env / backend 和转发"开始构建"。
   Widget _buildPanel() {
-    final r = BuildRunner.I;
-    final env = _env;
-    final mine = r.active == widget.projectName;
-    final otherBuilding = r.building && !mine;
-
-    if (env != null && !env.rootfsInstalled) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Text('rootfs 未初始化：请先在主页完成环境安装',
-              style: TextStyle(color: Color(0xFFFF7A7A))),
-        ),
-      );
-    }
-    if (otherBuilding) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Text('「${r.active}」正在构建中——同一时间只能有一个构建任务',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 13, color: Colors.grey.shade500)),
-        ),
-      );
-    }
-
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        if (!r.building && r.status != BuildStatus.idle && mine) ...[
-          _buildResultCard(r),
-          const SizedBox(height: 12),
-        ],
-        if (!r.building) ...[
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('打包配置',
-                      style: TextStyle(
-                          fontSize: 15, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  Text(
-                    'flutter build apk --no-shrink --release'
-                    ' --target-platform=android-arm64\n'
-                    '后端：${_backend == BuildBackend.termux ? 'Termux 裸原生（不经 proot）' : 'Proot 容器'}',
-                    style: TextStyle(
-                        fontSize: 12,
-                        fontFamily: 'monospace',
-                        color: Colors.grey.shade500, height: 1.6),
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: FilledButton.icon(
-                          onPressed: _startBuild,
-                          icon: const Icon(Icons.play_arrow, size: 18),
-                          label: const Text('开始打包'),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _cleaning ? null : _cleanCache,
-                          icon: _cleaning
-                              ? const SizedBox(
-                                  width: 16, height: 16,
-                                  child: CircularProgressIndicator(
-                                      strokeWidth: 2))
-                              : const Icon(Icons.cleaning_services,
-                                  size: 16),
-                          label: const Text('清理缓存',
-                              style: TextStyle(fontSize: 13)),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 6),
-                  Text('缓存导致的"玄学失败"先清再试（flutter clean）',
-                      style: TextStyle(
-                          fontSize: 11, color: Colors.grey.shade600)),
-                ],
-              ),
-            ),
-          ),
-        ] else ...[
-          _buildProgressCard(r),
-        ],
-        if (r.lines.isNotEmpty && mine) ...[
-          const SizedBox(height: 12),
-          _buildLogCard(r),
-        ],
-      ],
+    return BuildPanel(
+      projectName: widget.projectName,
+      env: _env,
+      backend: _backend,
+      onStartBuild: _startBuild,
+      onBackendChanged: _switchBackend,
     );
   }
 
+  /// 开始构建。
+  ///
+  /// alpha.61：通知开关的提示移到了 BuildPanel（那是它的界面责任），
+  /// 这里只做真正的事——交给 BuildRunner。
   Future<void> _startBuild() async {
     final env = _env;
     if (env == null || BuildRunner.I.building) return;
-    if (!await BuildNotify.enabled) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text('通知已关闭：退到桌面后将看不到构建进度通知'
-            '（可在系统设置 → 应用通知中开启）'),
-        duration: Duration(seconds: 4),
-      ));
-    }
     await BuildRunner.I.start(widget.projectName, env, _backend);
     if (mounted) setState(() {});
   }
 
-  bool _cleaning = false;
-
-  /// 清理构建缓存（flutter clean）：BuildRunner.clean 统一两后端命令，
-  /// 结果 SnackBar 反馈。构建中按钮已禁用（方法内再拦一层）。
-  Future<void> _cleanCache() async {
+  /// 切换构建后端（写盘持久化，下次进来还是这个）。
+  Future<void> _switchBackend(BuildBackend b) async {
     final env = _env;
-    if (env == null || _cleaning) return;
-    setState(() => _cleaning = true);
-    final err =
-        await BuildRunner.I.clean(widget.projectName, env, _backend);
-    if (!mounted) return;
-    setState(() => _cleaning = false);
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(err ?? '已清理 build/ 与 .dart_tool（flutter clean）'),
-      duration: Duration(seconds: err == null ? 2 : 4),
-    ));
+    if (b == _backend || env == null) return;
+    setState(() => _backend = b);
+    await BackendPrefs.save(env, b);
   }
 
-  Widget _buildResultCard(BuildRunner r) {
-    final ok = r.status == BuildStatus.done;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  ok ? Icons.check_circle : Icons.error_outline,
-                  color: ok ? const Color(0xFF3DDC84) : const Color(0xFFFF7A7A),
-                  size: 18,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  ok ? '上次打包成功' : '上次打包未成功',
-                  style: TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                      color: ok ? const Color(0xFF3DDC84) : const Color(0xFFFF7A7A)),
-                ),
-              ],
-            ),
-            if (ok && r.apkGuest != null) ...[
-              const SizedBox(height: 10),
-              FilledButton.icon(
-                onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-                  builder: (_) => const BuildPage(),
-                )),
-                icon: const Icon(Icons.install_mobile, size: 18),
-                label: const Text('安装 / 查看详情'),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildProgressCard(BuildRunner r) {
-    final pct = r.prog.percent;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const SizedBox(
-                  width: 14,
-                  height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(r.prog.stage.label,
-                      style: const TextStyle(
-                          fontSize: 13, fontWeight: FontWeight.w600)),
-                ),
-                Text('$pct%',
-                    style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF4C8DFF))),
-              ],
-            ),
-            const SizedBox(height: 10),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: LinearProgressIndicator(
-                value: r.prog.progress,
-                minHeight: 8,
-                backgroundColor: Colors.white10,
-                valueColor:
-                    const AlwaysStoppedAnimation<Color>(Color(0xFF4C8DFF)),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Text('已用 ${BuildRunner.fmtDur(r.elapsedSec)}',
-                    style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
-                const SizedBox(width: 10),
-                Text('通知栏可见进度 · 退出页面构建继续',
-                    style: TextStyle(
-                        fontSize: 11,
-                        fontStyle: FontStyle.italic,
-                        color: Colors.grey.shade600)),
-                const Spacer(),
-                TextButton(
-                  onPressed: () => BuildRunner.I.cancel(),
-                  child: const Text('取消', style: TextStyle(fontSize: 12)),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildLogCard(BuildRunner r) {
-    final lines = r.lines.length > 30
-        ? r.lines.sublist(r.lines.length - 30)
-        : r.lines;
-    return Card(
-      color: const Color(0xFF0C0F13),
-      clipBehavior: Clip.antiAlias,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Text('最近日志（${r.lines.length} 行）',
-                    style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
-                const Spacer(),
-                TextButton.icon(
-                  onPressed: () => Navigator.of(context).push(MaterialPageRoute(
-                    builder: (_) => const BuildPage(),
-                  )),
-                  icon: const Icon(Icons.open_in_new, size: 14),
-                  label: const Text('完整日志', style: TextStyle(fontSize: 11)),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            for (final l in lines)
-              Text(l,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      fontSize: 11,
-                      fontFamily: 'monospace',
-                      height: 1.5,
-                      color: Color(0xFFD6DEE8))),
-          ],
-        ),
-      ),
-    );
-  }
 }

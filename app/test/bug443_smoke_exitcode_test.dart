@@ -1,7 +1,7 @@
 import 'dart:io';
 
-import 'package:flutter_on_android/toolchain/build_runner.dart';
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/build_runner.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Bug 443：我在 Bug 437 里写的 `smoke()` 退出码捕获是**错的**，

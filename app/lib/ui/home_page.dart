@@ -8,9 +8,12 @@ import '../env/env_installer.dart';
 import '../editor/editor_page.dart';
 import '../filemanager/file_browser_page.dart';
 import '../filemanager/fs_browser_bridge.dart';
+import '../mcp/remote_takeover_page.dart';
 import '../toolchain/build_page.dart';
 import '../project/project_page.dart';
 import '../toolchain/toolchain_page.dart';
+import 'about_info.dart';
+import 'about_page.dart';
 import 'terminal_page.dart';
 
 /// Step 7 主页：环境状态 + 工具入口宫格 + 工程列表（FusionApp 式卡片 + FAB 创建）。
@@ -173,7 +176,9 @@ class _HomePageState extends State<HomePage> {
     }
     return Scaffold(
       appBar: AppBar(
-        title: const SafeArea(child: Text('Flutter On Android')),
+        // alpha.61：应用更名 FOAIDE。走 AboutInfo 常量而非字面量——
+        // 名称在 Manifest / 主页标题 / 关于页三处出现，同源才不会改漏。
+        title: const SafeArea(child: Text(AboutInfo.appName)),
         actions: [
           IconButton(
             tooltip: '重新检测',
@@ -403,42 +408,32 @@ class _HomePageState extends State<HomePage> {
         const Text('关于',
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
+        // alpha.61：改成一张可点卡片，进入独立的「关于」页
+        // （作者 / 联系方式 / 引用的其它项目仓库 / 许可说明）。
+        // 旧版是设置页里写死 "v0.1.0-alpha.26" 的三行小卡片——版本号早已
+        // 过期，且第三方组件来源无处可查。数据源统一在 AboutInfo。
         Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.primaryContainer,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: const Icon(Icons.flutter_dash, size: 22),
-                    ),
-                    const SizedBox(width: 12),
-                    const Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('Flutter On Android',
-                            style: TextStyle(
-                                fontSize: 15, fontWeight: FontWeight.bold)),
-                        Text('v0.1.0-alpha.26 · 在 Android 上原生构建 APK',
-                            style: TextStyle(fontSize: 12)),
-                      ],
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                Text(
-                  '内置 Debian rootfs（proot 模拟 root）+ 本地 JDK / Android SDK / Flutter SDK，'
-                  '内置官方 Demo 模板，在设备上完成创建 → 编辑 → 构建 → 安装全流程。',
-                  style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
-                ),
-              ],
+          clipBehavior: Clip.antiAlias,
+          child: ListTile(
+            leading: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.primaryContainer,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Icon(Icons.info_outline, size: 22),
+            ),
+            title: const Text(AboutInfo.appName,
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+            subtitle: Text(
+              '${AboutInfo.version} · 作者 ${AboutInfo.author}\n'
+              '引用了 ${AboutInfo.components.length} 个第三方项目',
+              style: const TextStyle(fontSize: 12, height: 1.4),
+            ),
+            isThreeLine: true,
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const AboutPage()),
             ),
           ),
         ),
@@ -945,9 +940,10 @@ class _ActionCard extends StatelessWidget {
                 ),
               ),
             ] else ...[
-              const Text('环境就绪', style: TextStyle(fontWeight: FontWeight.bold)),
+              const Text('环境状态', style: TextStyle(fontWeight: FontWeight.bold)),
               const SizedBox(height: 4),
-              const Text('进入终端执行测试命令，或打开编辑器浏览/编辑项目文件。'),
+              const Text('环境已就绪：进入终端或编辑器开始工作；'
+                  '也可开启「远程接管」让 AI 直接帮你操作本机容器。'),
               const SizedBox(height: 12),
               LayoutBuilder(
                 builder: (context, constraints) => GridView.count(
@@ -996,6 +992,15 @@ class _ActionCard extends StatelessWidget {
                       onTap: () => Navigator.of(context).push(
                         MaterialPageRoute(
                             builder: (_) => const BuildPage()),
+                      ),
+                    ),
+                    // alpha.60：远程接管（MCP + cloudflared 隧道）
+                    _ActionTile(
+                      icon: Icons.hub,
+                      label: '远程接管',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                            builder: (_) => const RemoteTakeoverPage()),
                       ),
                     ),
                   ],

@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:flutter_on_android/toolchain/native_arm64.dart';
+import 'package:foaide/toolchain/native_arm64.dart';
 
 /// 构造体检脚本的一行输出（字段以 TAB 分隔，与容器内脚本保持一致）。
 String p(

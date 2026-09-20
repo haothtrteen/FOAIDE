@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Bug 441：Bug 439 把 heredoc 分隔符改成带引号的 `<<'FOAWRAP'` 后，

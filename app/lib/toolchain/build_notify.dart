@@ -20,6 +20,12 @@ class BuildNotify {
   /// 点击通知 → 回构建页的回调（FoaApp 启动时注册；原生 navigate 触发）。
   static void Function()? onNavigate;
 
+  /// 最近一次启动的前台任务归属（alpha.59 引入，alpha.60 扩展）：
+  /// 'build' = 构建页 / 'preview' = Web 预览控制台 / 'takeover' = 远程接管。
+  /// 原生侧只回发 navigate 信号（不带类别），点击跳转由 Dart 按此字段分流
+  /// ——默认构建页（冷启动兜底语义不变）。
+  static String lastRoute = 'build';
+
   static bool _hooked = false;
 
   /// 注册原生 → Dart 的反向调用（幂等，main.dart 启动时调一次）。

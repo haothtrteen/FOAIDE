@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Bug 446：真实 AOT 负载探针 —— 补上"能启动 ≠ 能编译"这个盲区。

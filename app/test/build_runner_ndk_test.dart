@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/toolchain/build_runner.dart';
+import 'package:foaide/toolchain/build_runner.dart';
 
 /// Bug 427 固化：sdkmanager SIGILL（exit 132）分诊识别。
 ///

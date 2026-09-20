@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/toolchain/build_runner.dart';
+import 'package:foaide/toolchain/build_runner.dart';
 
 /// Bug 424 固化：buildCommand 的 shell 变量 / Dart 插值转义边界。
 ///
@@ -67,6 +67,48 @@ void main() {
       );
       expect(cmd.contains('build apk --no-shrink --release'), isTrue);
       expect(cmd.contains('--target-platform=android-arm64'), isTrue);
+    });
+  });
+
+  group('BuildRunner · Built 后宽限收尾（alpha.58，真机 95% 卡住判读）', () {
+    // 真机实证（2026-09-19 22:06 截图）：日志已打印
+    // `✓ Built build/app/outputs/flutter-apk/app-release.apk (15.0MB)`
+    // ——Built 在 Gradle 打包+签名完成之后打印，构建本体已成功——
+    // 但 flutter 工具偶发 hang 不退出，running 恒真，UI 永远停在
+    // 「打包与签名 APK 95%」。修复：Built 命中后宽限 90s 强制按成功收尾。
+    test('builtMarker 与真实 flutter 输出对齐（Build 行前缀）', () {
+      // flutter 输出形如 `✓ Built build/app/outputs/flutter-apk/app-release.apk (15.0MB)`
+      expect('✓ ${BuildRunner.builtMarker}-apk/app-release.apk (15.0MB)',
+          contains(BuildRunner.builtMarker));
+    });
+
+    test('未命中 Built 行 → 永不强制收尾', () {
+      expect(
+        BuildRunner.builtGraceElapsed(builtAt: null, now: DateTime.now()),
+        isFalse,
+      );
+    });
+
+    test('命中 Built 行但未超宽限期 → 不收尾（给 flutter 留足收尾时间）', () {
+      final now = DateTime.now();
+      expect(
+        BuildRunner.builtGraceElapsed(
+            builtAt: now.subtract(const Duration(seconds: 89)), now: now),
+        isFalse,
+      );
+    });
+
+    test('命中 Built 行超过宽限期 → 强制按成功收尾', () {
+      final now = DateTime.now();
+      expect(
+        BuildRunner.builtGraceElapsed(
+            builtAt: now.subtract(const Duration(seconds: 91)), now: now),
+        isTrue,
+      );
+    });
+
+    test('宽限期常量合理（90s，覆盖慢设备收尾又不至于久等）', () {
+      expect(BuildRunner.builtGraceSec, 90);
     });
   });
 }

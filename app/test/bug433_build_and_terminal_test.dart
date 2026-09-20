@@ -20,8 +20,8 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/toolchain/build_runner.dart';
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/build_runner.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 
 void main() {
   group('Bug 433 ① · 构建命令必须在 pub get 之后再断言转发层', () {
@@ -122,8 +122,14 @@ void main() {
       // Bug 439：heredoc 分隔符已改为 <<'FOAWRAP'（带引号），body 是
       // **完全字面量**，因此里面的 $ 不再需要转义 —— 反而写 \$ 会留下
       // 字面反斜杠，把脚本写坏。这条测试随之反转。
-      expect(s.contains(r'm=$(dd if="$1"'),
-          isTrue, reason: r'外层变量必须是裸 $，否则 shell 收到 \$ 报语法错');
+      // Bug 449（alpha.55）：put() 加了真身感知——`real="$1"`、
+      // `dd if="$real"`（原位包装后 <f>.foa-real 才是真 ELF）。
+      // 断言目标从 if="$1" 跟进为 if="$real"，转义语义不变（裸 $）。
+      expect(s.contains(r'real="$1"; [ -f "$1.foa-real" ] && real="$1.foa-real"'),
+          isTrue, reason: 'Bug 449：put 必须先解析真身（.foa-real 优先）');
+      expect(s.contains(r'm=$(dd if="$real"'),
+          isTrue, reason: r'外层变量必须是裸 $，否则 shell 收到 \$ 报语法错；'
+              r'且 dd 读的必须是真身 $real 而不是包装位 $1');
       final f = QemuCompat.fill(s);
       expect(f.contains(r'd=$(dirname "$0")'), isTrue,
           reason: '带引号 heredoc 下应写裸美元符，写入后即为 dirname 调用形式');

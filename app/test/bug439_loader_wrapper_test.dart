@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Bug 439：转发脚本用 `-L / <bin>` 让 qemu 代劳找 ld.so，会让所有

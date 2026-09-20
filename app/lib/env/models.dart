@@ -3,6 +3,13 @@ class EnvInfo {
   final String filesDir;
   final String cacheDir;
   final String nativeLibraryDir;
+
+  /// 真实 Android 包名（applicationId），由原生侧 `packageName` 运行时返回。
+  ///
+  /// **不要在 Dart 里拼 `/data/data/<pkg>`**：applicationId 可被
+  /// applicationIdSuffix 改变（dev/prod 分身），拼出来的路径会指向另一个
+  /// App 的私有目录。需要宿主路径时一律取 [filesDir] / [externalDataDir]。
+  final String packageName;
   final String rootfsPath;
   final bool rootfsInstalled;
   // Step 4 文件浏览器宿主域根：外部 Android/data/<pkg>（无外部存储时为 null）
@@ -24,6 +31,7 @@ class EnvInfo {
     required this.filesDir,
     required this.cacheDir,
     required this.nativeLibraryDir,
+    this.packageName = '',
     required this.rootfsPath,
     required this.rootfsInstalled,
     this.externalDataDir,
@@ -40,6 +48,7 @@ class EnvInfo {
         filesDir: m['filesDir'] as String? ?? '',
         cacheDir: m['cacheDir'] as String? ?? '',
         nativeLibraryDir: m['nativeLibraryDir'] as String? ?? '',
+        packageName: m['packageName'] as String? ?? '',
         rootfsPath: m['rootfsPath'] as String? ?? '',
         rootfsInstalled: m['rootfsInstalled'] as bool? ?? false,
         externalDataDir: m['externalDataDir'] as String?,
@@ -206,3 +215,123 @@ class PtyPoll {
         error: m['error'] as String?,
       );
 }
+
+// ---------------- proroot 容器层（alpha.61） ----------------
+
+/// proroot 落位状态。
+///
+/// 特意保留 [missing] / [notElf] 这两个**可操作**的明细而不是一个 bool：
+/// 用户看到"缺 libproroot-bridge.so"才知道该去补哪个文件；
+/// 只告诉他"没装好"等于没说。
+class ProrootStatus {
+  final bool installed;
+
+  /// 落位目录（展示给用户，说明文件该放哪）。
+  final String dir;
+
+  /// 已就位的文件名。
+  final List<String> present;
+
+  /// 还缺的文件名。
+  final List<String> missing;
+
+  /// 存在但不是 ELF 的文件名（下载损坏/架构不对）。
+  final List<String> notElf;
+
+  /// 设备首选 ABI（proroot 只有 arm64-v8a）。
+  final String abi;
+
+  /// 系统 API level（proroot 要求 26+）。
+  final int api;
+
+  /// rootfs 是否就绪（没 rootfs 就无法冒烟测试）。
+  final bool rootfsReady;
+
+  const ProrootStatus({
+    this.installed = false,
+    this.dir = '',
+    this.present = const [],
+    this.missing = const [],
+    this.notElf = const [],
+    this.abi = '',
+    this.api = 0,
+    this.rootfsReady = false,
+  });
+
+  /// ABI 是否匹配（proroot 只提供 arm64-v8a）。
+  bool get abiOk => abi.startsWith('arm64');
+
+  /// API 是否达标。
+  bool get apiOk => api >= 26;
+
+  /// 能否开启 proroot：文件齐、ABI 对、API 够。
+  bool get usable => installed && abiOk && apiOk;
+
+  factory ProrootStatus.fromMap(Map<Object?, Object?> m) => ProrootStatus(
+        installed: m['installed'] == true,
+        dir: m['dir'] as String? ?? '',
+        present: _strList(m['present']),
+        missing: _strList(m['missing']),
+        notElf: _strList(m['notElf']),
+        abi: m['abi'] as String? ?? '',
+        api: (m['api'] as num?)?.toInt() ?? 0,
+        rootfsReady: m['rootfsReady'] == true,
+      );
+}
+
+/// proroot 导入结果。
+class ProrootInstallResult {
+  final bool ok;
+  final List<String> copied;
+  final List<String> missing;
+  final List<String> notElf;
+  final String? error;
+
+  const ProrootInstallResult({
+    required this.ok,
+    this.copied = const [],
+    this.missing = const [],
+    this.notElf = const [],
+    this.error,
+  });
+
+  factory ProrootInstallResult.fromMap(Map<Object?, Object?> m) =>
+      ProrootInstallResult(
+        ok: m['ok'] == true,
+        copied: _strList(m['copied']),
+        missing: _strList(m['missing']),
+        notElf: _strList(m['notElf']),
+        error: m['error'] as String?,
+      );
+}
+
+/// proroot 冒烟测试结果。
+class ProrootProbeResult {
+  final bool ok;
+  final int exitCode;
+  final String output;
+  final String cmd;
+  final String? error;
+
+  const ProrootProbeResult({
+    required this.ok,
+    this.exitCode = 0,
+    this.output = '',
+    this.cmd = '',
+    this.error,
+  });
+
+  factory ProrootProbeResult.fromMap(Map<Object?, Object?> m) =>
+      ProrootProbeResult(
+        ok: m['ok'] == true,
+        exitCode: (m['exitCode'] as num?)?.toInt() ?? 0,
+        output: m['output'] as String? ?? '',
+        cmd: m['cmd'] as String? ?? '',
+        error: m['error'] as String?,
+      );
+}
+
+/// 把 `List<Object?>` 稳妥转成 `List<String>`（原生侧可能给 List<dynamic>）。
+List<String> _strList(Object? v) => v is List
+    ? v.map((e) => e?.toString() ?? '').where((s) => s.isNotEmpty).toList()
+    : const [];

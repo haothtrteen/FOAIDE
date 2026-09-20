@@ -1,7 +1,7 @@
-name: flutter_on_android
-description: A Flutter IDE that runs natively on Android devices, with local Flutter SDK and on-device APK building.
+name: foaide
+description: FOAIDE - a Flutter IDE that runs natively on Android, with a local Flutter SDK, in-device container, Web hot-reload preview and on-device APK building.
 publish_to: 'none'
-version: 0.1.0-alpha.54+54
+version: 0.1.0-alpha.62+62
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -23,6 +23,10 @@ dependencies:
   dart_style: ^3.1.13
   url_launcher: ^6.3.2
   crypto: ^3.0.7
+
+  # alpha.58 Web 实时预览：App 内 WebView 直载 127.0.0.1:8090（免切系统
+  # 浏览器；官方团队插件，Android 侧无自定义原生代码，minSdk 21 即可）
+  webview_flutter: ^4.13.0
 
   # Bug 430 可交互终端：完整 VT100/xterm 仿真（vim/top 全屏渲染、
   # 256 色、光标定位、鼠标事件）。不用它就得自己写 ANSI 解释器，

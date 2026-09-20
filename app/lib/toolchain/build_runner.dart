@@ -53,6 +53,19 @@ class BuildRunner {
   DateTime? _startedAt;
   Timer? _timer;
 
+  /// `✓ Built build/app/outputs` 行的命中时刻（alpha.58）：
+  /// Built 打印在 Gradle 打包+签名**完成之后**——命中即构建本体已成功。
+  /// flutter 工具偶发 Built 后 hang 不退出（dart VM 收尾不退出），
+  /// 平台侧 running 恒真 → UI 永远停在「打包与签名 95%」骗用户。
+  /// 宽限 [builtGraceSec] 秒后仍不退出则按成功强制收尾。
+  DateTime? _builtAt;
+
+  /// Built 后宽限秒数（ flutter 收尾通常 <5s；90s 是极宽余量）。
+  static const int builtGraceSec = 90;
+
+  /// Built 行标记（flutter build 成功时打印 `✓ Built build/app/outputs/...`）。
+  static const String builtMarker = 'Built build/app/outputs';
+
   // ---- UI 钩子（页面 attach 时注入，dispose 置空；null = 构建在后台跑）----
   void Function()? onUiChanged;
   void Function()? onAutoScroll;
@@ -67,6 +80,17 @@ class BuildRunner {
 
   void _ui() => onUiChanged?.call();
   void _scroll() => onAutoScroll?.call();
+
+  /// Built 后宽限判定（纯函数，可单测）：
+  /// 命中 Built 行超过宽限期且会话仍在 building → 应强制按成功收尾。
+  static bool builtGraceElapsed({
+    required DateTime? builtAt,
+    required DateTime now,
+    int graceSec = builtGraceSec,
+  }) {
+    if (builtAt == null) return false;
+    return now.difference(builtAt).inSeconds > graceSec;
+  }
 
   /// 秒 → `mm:ss` / `h:mm:ss`（UI 层与通知共用）。
   static String fmtDur(int sec) {
@@ -93,9 +117,17 @@ class BuildRunner {
 
   // ============================ 启动构建 ============================
 
-  Future<void> start(String name, EnvInfo env, BuildBackend backend) async {
+  Future<void> start(
+    String name,
+    EnvInfo env,
+    BuildBackend backend, {
+    ContainerLayer layer = ContainerLayer.proot,
+  }) async {
     if (building) return; // 防重入（页面 UI 也不会同时给两个入口）
     final bare = backend == BuildBackend.termux;
+    // termux 裸原生根本不进容器，此时 layer 无意义（传 false 下去，
+    // 免得原生侧纠结"bare 和 proroot 同时为真怎么办"）
+    final proroot = !bare && layer == ContainerLayer.proroot;
     active = name;
     status = BuildStatus.building;
     lines.clear();
@@ -104,6 +136,7 @@ class BuildRunner {
     prog.reset();
     elapsedSec = 0;
     _startedAt = DateTime.now();
+    _builtAt = null;
     _lastNotifPct = -1;
     _lastNotifStage = '';
     hints.clear();
@@ -188,6 +221,15 @@ class BuildRunner {
       // 崩）。构建前写入最小 NDK 占位使插件判定"已装"直接跳过。
       final nErr = await ToolchainEnsure().ndkStub();
       if (nErr != null) lines.add('⚠ $nErr（不阻断构建）');
+
+      // Bug 449 附属修复（alpha.55，2026-09-19 真机实证）：NDK 空壳
+      // （见上 ndkStub）只有 source.properties，AOT 修通后第一次跑到
+      // gradle :app:stripReleaseDebugSymbols 时找不到 llvm-strip 直接
+      // 炸。构建前检测补位：Debian llvm symlink 进 NDK 期望路径
+      // （arm64 原生、不过 qemu、能剥任意架构 ELF）。llvm 不可用时
+      // 不阻断——留给 strip 阶段报错，避免网络问题卡死整个构建入口。
+      final sErr = await ToolchainEnsure().ndkStripTools();
+      if (sErr != null) lines.add('⚠ $sErr（不阻断构建）');
 
       // Bug 428 根因修复：flutter precache 会往 linux-arm64/ 写真 x64
       // gen_snapshot/impellerc，覆盖兼容层先前放的 qemu 转发脚本
@@ -279,7 +321,7 @@ class BuildRunner {
       envPart: envPart,
       aapt2Override: aapt2Override,
     );
-    final stream = await bridge.execStream(cmd, bare: bare);
+    final stream = await bridge.execStream(cmd, bare: bare, proroot: proroot);
     if (!stream.ok || stream.id <= 0) {
       status = BuildStatus.error;
       lines.add('✗ 启动失败：${stream.error ?? '未知错误'}');
@@ -290,6 +332,8 @@ class BuildRunner {
     _offset = 0;
 
     // 前台服务 + 常驻通知（alpha.31）：此后用户可自由退出页面/锁屏
+    // alpha.59：标记通知归属——点击跳构建页
+    BuildNotify.lastRoute = 'build';
     BuildNotify.start('构建中 · $name');
     BuildNotify.progress('正在启动构建…', 0);
 
@@ -509,9 +553,15 @@ exit 0
   /// 清理构建缓存（flutter clean，工作台打包配置卡的快捷操作）：
   /// 返回 null = 成功，否则返回错误文案。构建中拒绝（防清掉正在
   /// 使用的 build 目录）。
-  Future<String?> clean(String name, EnvInfo env, BuildBackend backend) async {
+  Future<String?> clean(
+    String name,
+    EnvInfo env,
+    BuildBackend backend, {
+    ContainerLayer layer = ContainerLayer.proot,
+  }) async {
     if (building) return '正在构建中，不能清理缓存';
     final bare = backend == BuildBackend.termux;
+    final proroot = !bare && layer == ContainerLayer.proroot;
     final projectsDir = bare ? '${env.rootfsPath}/root/projects' : _projectsDir;
     final flutterDir = bare ? TermuxPaths.flutterHome(env) : '/opt/flutter';
     final flutterCmd =
@@ -522,6 +572,7 @@ exit 0
       'FLUTTER_ALLOW_ROOT=true $flutterCmd clean',
       timeoutSec: 300,
       bare: bare,
+      proroot: proroot,
     );
     if (r.exitCode != 0) {
       final out = (r.stdout.isNotEmpty ? r.stdout : r.stderr).trim();
@@ -572,6 +623,15 @@ exit 0
     if (started != null) {
       elapsedSec = DateTime.now().difference(started).inSeconds;
     }
+    // alpha.58：Built 已命中（构建+签名本体完成）而 flutter 进程 hang
+    // 不退出 → 宽限到期后强制按成功收尾（产物路径从日志/文件系统确认）。
+    if (status == BuildStatus.building &&
+        builtGraceElapsed(builtAt: _builtAt, now: DateTime.now())) {
+      lines.add('ℹ flutter 工具 Built 后未退出（偶发 hang，已等待 '
+          '$builtGraceSec 秒）——按构建成功收尾');
+      await _finish(0);
+      return;
+    }
     if (!poll.running) {
       _timer?.cancel();
       await _finish(poll.exitCode);
@@ -594,6 +654,13 @@ exit 0
       lines.add(line);
       // 进度识别吃"清洗后"的行：ANSI 已去、\r 段已取末段
       prog.feed(line);
+      // alpha.58：Built = Gradle 打包+签名已完成（Built 打印在签名之后）。
+      // 立即提示，避免用户把"flutter 收尾 hang"误读成"卡在签名"。
+      if (_builtAt == null && line.contains(builtMarker)) {
+        _builtAt = DateTime.now();
+        lines.add('✓ Gradle 打包+签名完成，等待 flutter 工具收尾…'
+            '（若 ${builtGraceSec}s 内未自动结束将按成功收尾）');
+      }
       _feedErrorBreakdown(line);
     }
     if (lines.length > _maxLines) {

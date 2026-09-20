@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_on_android/toolchain/build_runner.dart';
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/build_runner.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 
 /// Bug 428 固化：x64 兼容层引擎转发脚本的覆写检测与分诊。
 ///

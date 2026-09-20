@@ -789,13 +789,22 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     );
   }
 
+  /// 把宿主真实路径换成人能认的路径标签。
+  ///
+  /// 包名从 [EnvInfo.packageName]（原生 `packageName`，运行时真值）取，
+  /// **不在这里拼 `/data/data/<pkg>` 字面量**——否则改 applicationId 或加
+  /// applicationIdSuffix 后，界面会显示一个根本不存在的路径，用户拿去
+  /// 粘贴必然扑空。包名取不到时才降级为占位符（不该发生）。
   String _envDirLabel(String real) {
+    final pkg = _env.packageName.isEmpty ? '<pkg>' : _env.packageName;
     final f = _env.filesDir;
-    if (real == f) return '/data/user/0/<pkg>';
+    if (real == f) return '/data/user/0/$pkg';
     final e = _env.externalDataDir;
-    if (e != null && real == e) return '/storage/emulated/0/Android/data/<pkg>';
+    if (e != null && real == e) {
+      return '/storage/emulated/0/Android/data/$pkg';
+    }
     if (e != null && real == '$e/projects') {
-      return '/storage/emulated/0/Android/data/<pkg>/projects';
+      return '/storage/emulated/0/Android/data/$pkg/projects';
     }
     return real;
   }

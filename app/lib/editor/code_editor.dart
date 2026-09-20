@@ -42,11 +42,16 @@ class CodeEditor extends StatefulWidget {
   /// 内容变化回调（父级用于 dirty 跟踪）。
   final ValueChanged<String> onContentChanged;
 
+  /// AI 助手入口（alpha.61）。为 null 时不显示状态栏的 AI 按钮——
+  /// 让"嵌在别处的小编辑器"可以选择不暴露该入口，不必为此改接口。
+  final VoidCallback? onAiAssist;
+
   const CodeEditor({
     super.key,
     required this.path,
     required this.initialContent,
     required this.onContentChanged,
+    this.onAiAssist,
   });
 
   @override
@@ -615,6 +620,25 @@ class CodeEditorState extends State<CodeEditor> {
               ),
               _fontButton(Icons.text_increase, '放大字号（双指捏合亦可）', 1),
               const SizedBox(width: 4),
+              // alpha.61：AI 按钮（用户要求放在字号那一栏）。
+              // 放这里而不是 AppBar：写代码时手就在这一行附近，
+              // 且不与"保存/运行"等高频按钮抢位置。
+              if (widget.onAiAssist != null) ...[
+                Tooltip(
+                  message: 'AI 助手：生成 / 补全 / 解释代码',
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(4),
+                    onTap: widget.onAiAssist,
+                    child: const Padding(
+                      padding:
+                          EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      child: Icon(Icons.auto_awesome,
+                          size: 16, color: Color(0xFF4C8DFF)),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+              ],
               Text(
                 _languageName,
                 style: const TextStyle(fontSize: 11, color: Colors.grey),

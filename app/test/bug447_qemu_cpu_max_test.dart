@@ -21,7 +21,7 @@
 // 附带修复：AOT_LOAD 探针找 app.dill 的 glob 只探两层，真机 dill 在
 // build/app/intermediates/flutter/release/（四层深）→ alpha.52 真机日志
 // `AOT_LOAD=skip(尚无 app.dill)` 实为探针盲区，改 find 深探。
-import 'package:flutter_on_android/toolchain/qemu_compat.dart';
+import 'package:foaide/toolchain/qemu_compat.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

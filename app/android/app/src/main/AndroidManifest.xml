@@ -9,8 +9,13 @@
 
     <application
         android:name="${applicationName}"
-        android:label="FlutterOnAndroid"
+        android:label="FOAIDE"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:icon="@mipmap/ic_launcher">
+        <!-- alpha.58 Web 预览：targetSdk 28 默认禁明文 HTTP，App 内 WebView
+             要加载 http://127.0.0.1:8090（容器开发服务器）——networkSecurityConfig
+             只放行 127.0.0.1/localhost，不开全局明文（其余域仍强制 HTTPS）。
+             浏览器进程不受本 App manifest 约束，系统浏览器路径不受影响。 -->
         <!-- proot 走 jniLibs 路径需要 so 落地为真实文件：AGP 9 起由
              build.gradle.kts 的 packaging.jniLibs.useLegacyPackaging = true 控制
              （等价于旧 Manifest 属性 extractNativeLibs="true"） -->
@@ -42,10 +47,14 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
-        <!-- Step 6：构建产物 APK 安装——FileProvider 授权 content:// 给系统安装器 -->
+        <!-- Step 6：构建产物 APK 安装——FileProvider 授权 content:// 给系统安装器。
+             authority 用 ${applicationId} 占位符（AGP 在合并清单时替换为真实包名），
+             与 MainActivity.fileProviderAuthority 同源——改包名时无需改这里。
+             历史教训：曾写死 "dev.foa.flutter_on_android.fileprovider"，与 Kotlin
+             侧各存一份，改包名漏改一处会在安装 APK 时抛 IllegalArgumentException。 -->
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="dev.foa.flutter_on_android.fileprovider"
+            android:authorities="${applicationId}.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data
