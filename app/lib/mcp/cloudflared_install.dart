@@ -64,7 +64,7 @@ class CloudflaredInstall {
   /// GitHub 系域名的连通性波动很大，多一个镜像就多一条活路。
   ///
   /// 本列表的每个源都在 2026-09-20 实测过 Range 可达性（206 + 正确字节数）：
-  /// ghfast / ghproxy.net / gh-proxy.com 均通，GitHub 直链作为兜底保留。
+  /// ghfast / gh-proxy.com / ghproxy.net 探测均通，GitHub 直链作为兜底保留。
   /// 曾尝试加入 `github.moeyy.xyz`，实测 DNS 无法解析，**故不纳入**——
   /// 宁可少一个源，也不要摆一个永远超时、白白拖慢竞速的假选项。
   ///
@@ -72,12 +72,28 @@ class CloudflaredInstall {
   /// 全通——说明失败是**特定网络下的可达性问题**。这类问题无法靠"换个源"
   /// 根治，只能：(a) 多留几条路，(b) 把每个源的具体失败原因暴露给用户
   /// （见 [diagnose]），让用户能判断是 DNS 还是超时。
+  ///
+  /// **⚠️ 排序依据（2026-09-20 完整下载实测，非仅探测）**：
+  ///
+  /// | 源 | 64KB 探测 | 完整下载 37,466,252B | 结论 |
+  /// |---|---|---|---|
+  /// | ghfast | ✅ 1.39s | ✅ 完整，sha256 正确 | **可靠** |
+  /// | gh-proxy.com | ✅ 0.77s | ✅ 完整，sha256 正确 | **可靠** |
+  /// | ghproxy.net | ✅ 1.28s | ❌ **截断**（9.3MB / 6.4MB 两次，均报正常状态码） | 降到最后 |
+  /// | github 直链 | 国内多不通 | — | 兜底 |
+  ///
+  /// **关键教训**：`ghproxy.net` 的 64KB 探测完全正常（206 + 65536B + 1.28s），
+  /// 但完整下载会中途断流。**探测通过 ≠ 能下完**——所以 [sha256] 校验
+  /// 不是锦上添花，是必需项。子集截断能骗过大小检查与探测，只有内容校验
+  /// 拦得住。
   static const List<MirrorSource> mirrors = [
     MirrorSource('ghfast', 'https://ghfast.top/https://github.com/'
         'cloudflare/cloudflared/releases/download/$version/$assetName'),
-    MirrorSource('ghproxy.net', 'https://ghproxy.net/https://github.com/'
-        'cloudflare/cloudflared/releases/download/$version/$assetName'),
     MirrorSource('gh-proxy.com', 'https://gh-proxy.com/https://github.com/'
+        'cloudflare/cloudflared/releases/download/$version/$assetName'),
+    // ghproxy.net 实测会截断，排在有验证的源之后（仍保留：不同网络下
+    // 表现可能不同，多一条路总比少一条好）
+    MirrorSource('ghproxy.net', 'https://ghproxy.net/https://github.com/'
         'cloudflare/cloudflared/releases/download/$version/$assetName'),
     MirrorSource('github', 'https://github.com/cloudflare/cloudflared/'
         'releases/download/$version/$assetName'),

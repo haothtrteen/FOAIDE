@@ -192,6 +192,21 @@ void main() {
       final src = File('lib/mcp/cloudflared_install.dart').readAsStringSync();
       expect(src.contains('static Future<String> diagnose()'), isTrue);
     });
+
+    test('ghfast 排在首位（唯一经完整下载 + sha256 双重复核的源）', () {
+      expect(CloudflaredInstall.mirrors.first.name, 'ghfast',
+          reason: '2026-09-20 实测：ghfast 与 gh-proxy.com 完整下载通过，'
+              'ghproxy.net 两次截断（9.3MB/6.4MB）。可靠的排前面。');
+    });
+
+    test('ghproxy.net 不得排在已验证可靠的源之前', () {
+      final names = CloudflaredInstall.mirrors.map((m) => m.name).toList();
+      final bad = names.indexOf('ghproxy.net');
+      final good = names.indexOf('gh-proxy.com');
+      expect(bad, greaterThan(good),
+          reason: 'ghproxy.net 实测会中途截断且返回正常状态码，'
+              '不该优先于已验证完整的 gh-proxy.com');
+    });
   });
 
   group('Bug 464 · 下载器保留失败原因', () {
