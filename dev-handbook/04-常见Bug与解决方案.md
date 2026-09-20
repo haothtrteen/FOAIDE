@@ -4654,6 +4654,362 @@ cd .. && flutter build apk --release --target-platform=android-arm64
 
 ---
 
+### Bug 464：顶栏与状态栏颜色仍不同步——Kotlin 兜底读错了"主题"（2026-09-20，alpha.63 修复）
+
+**症状**：Bug 457 修过一轮（浅色主题下浅色顶栏 + 深色状态栏），但用户仍报
+"顶栏与状态栏颜色不同步"。特点是**只在手动切主题后出现**，重启 App 反而正常。
+
+**原因**：Bug 457 的修复本身是对的，但漏了一个前提——Kotlin 兜底
+`applySystemBarColorsForTheme()` 读的是**系统**深色标志：
+
+```kotlin
+val night = (resources.configuration.uiMode and UI_MODE_NIGHT_MASK) == UI_MODE_NIGHT_YES
+```
+
+而 App 主题由 Dart `ThemeController` 独立控制。两者可以不一致：
+
+| 场景 | 系统 uiMode | App 主题 | Bug 457 修复后的结果 |
+|---|---|---|---|
+| 系统深色 + App 跟系统 | 深 | 深 | ✅ 正常 |
+| 系统深色 + **App 手动切浅色** | 深 | 浅 | ❌ 状态栏按深色画 |
+| 系统浅色 + **App 手动切深色** | 浅 | 深 | ❌ 状态栏按浅色画 |
+
+后者只在切换瞬间暴露：`ThemeController` 变了 → Dart 侧 `AnnotatedRegion`
+下发新 `systemOverlayStyle` → 但 Android 15+ 引擎**跳过**运行时设色
+（Bug 410 已实证）→ 系统栏停留在启动时按系统值设的那一版 → 割裂。
+
+**为什么 Bug 457 没发现**：它的验证是在"系统主题 = App 主题"的前提下做的
+（默认都是深色），恰好落在唯一正常的那一格。**测试覆盖的是最不容易出错的分支。**
+
+**解决**（`lib/main.dart` + `MainActivity.kt` + `lib/env/proot_bridge.dart`）：
+
+1. **新增 Dart→Kotlin 同步通道** `syncSystemBarTheme(dark: bool)`：
+   由 Dart 把**真实亮度**推给原生，原生据此设色——不再靠原生自己猜。
+2. **Kotlin 拆出带参函数** `applySystemBarColors(dark: Boolean)`：
+   `applySystemBarColorsForTheme()` 保留（冷启动 Dart 未就绪时的兜底，
+   此时读系统值是合理的），但主题切换走带参版本。
+3. **唯一推点**：`main.dart` 的 `MaterialApp.builder`——它每次主题变化都
+   重建，且此处已算出 `dark`。用 `addPostFrameCallback` 推，避免 build
+   期间触发平台调用。
+4. **失败静默**：`syncSystemBarTheme` 内部 catch 掉异常。系统栏设色是
+   纯装饰性操作，不该因个别 ROM 没实现而中断主题切换。
+
+**验证**：`test/bug464_theme_and_download_test.dart` 共 8 条——断言
+Kotlin 有 `syncSystemBarTheme` 分支、`applySystemBarColors(dark)` 签名、
+Dart/Kotlin 两侧颜色字面量同源（`0xFF101418` / `0xFFF5F7F8`）、
+冷启动兜底未丢。
+
+**教训**：**"兜底"必须在所有降级路径上都成立**。Bug 457 加 Kotlin 兜底时
+只考虑了"引擎不设色"，没考虑"原生读不到 App 的真实主题"——于是兜底本身
+成了新的错误来源。加兜底时要问一句：**它依据的信息从哪来，可靠吗？**
+
+**出现版本**：alpha.61 – alpha.62
+**修复版本**：alpha.63
+
+---
+
+### Bug 465：434 处硬编码颜色——主题切换只切了一半（2026-09-20，alpha.63 修复）
+
+**症状**：切到浅色主题后，部分控件的文字/底色对比度不对：警告框亮得刺眼、
+次要说明文字发灰到看不清。不是所有控件都有问题——**只有硬编码颜色的那些**。
+
+**原因**：全项目散落 434 处硬编码颜色，绝大多数是**按深色主题调的**：
+
+| 模式 | 处数 | 问题 |
+|---|---|---|
+| `Colors.grey.shade500` | 71 | 深色下偏亮、浅色下偏暗，两头不讨好 |
+| `Colors.grey.shade600` | 37 | 同上 |
+| `Color(0xFF3DDC84)` | 61 | 种子绿，两主题一致，**无害** |
+| `Color(0xFFFF7A7A)` | 57 | 深色下的红，浅底上对比度不足 |
+| `Color(0xFFFFB74D)` | 17 | 深色下的橙，浅底上对比度不足 |
+| `Colors.orange.shade50/200/800/900` | 6 | **最严重**：`shade50` 是近白底，深色主题下是一块刺眼亮橙 |
+
+`ThemeData` 只影响用 `Theme.of(context)` 取色的控件；硬编码的字面量**完全
+绕过主题**——这就是"部分控件不同步"的来源。
+
+**解决**（`lib/core/theme.dart` 新增语义色层）：
+
+```dart
+class FoaColors {
+  static FoaColors of(BuildContext context);
+  Color get muted;            // 次要文字（原 grey.shade500/600）
+  Color get success;          // 成功（种子绿）
+  Color get warning;          // 警告（浅色下压深）
+  Color get danger;           // 危险（浅色下压深）
+  Color get warningContainer; // 警告底（原 orange.shade50）
+  Color get warningBorder;
+  Color get codeBg;           // 日志/代码块底（原 black@25%）
+}
+```
+
+替换 108 处（`grey.shade500` 71 + `grey.shade600` 37），外加 proroot 卡片的
+全部橙色阶。**`Color(0xFF3DDC84)` 未动**——种子绿在两主题下都是设计意图，
+不属"不同步"。
+
+**批量替换踩的坑**：脚本插入 `import` 时用了 `'$rel'` 单引号字符串，
+heredoc 把 `${rel}` 展开成了空 → 生成 12 个 `import '$rel';`（非法 URI）。
+**教训：用 shell heredoc 生成 Dart 代码时，`$` 必须转义为 `\$`，或改用 Python
+的 f-string 拼接。** analyze 一次性报出来，修起来不难，但要是没跑 analyze
+就出包，会得到 12 个编译错误。
+
+**验证**：新增 2 条"清扫型"测试——遍历 `lib/`（排除 `theme.dart`），断言
+不再出现 `Colors.grey.shade500/600` 与 `Colors.orange.shade50/200`。
+这类测试防的是**回归**：以后谁再写硬编码，测试立刻红。
+
+**出现版本**：alpha.31 起逐步累积
+**修复版本**：alpha.63
+
+---
+
+### Bug 466：cloudflared 下载失败无法定位——失败原因在源头被吞掉（2026-09-20，alpha.63 修复）
+
+**症状**：用户反复报"cloudflared 下载不了"，但开发机上几个镜像全通，
+本地复现不了。UI 只给一句「所有镜像源探测失败（网络不通或超时）」。
+
+**原因**：`SdkDownloader._probe` 把所有异常一律吞成"不可用"：
+
+```dart
+} catch (_) {
+  return (m, null);   // ← DNS 失败、TLS 失败、超时、403，全部变成"null"
+}
+```
+
+于是 `pickFastest` 只能抛"全失败"，**用户和我们都拿不到任何线索**：
+是 DNS 没解析？TLS 被中断？还是超时？三者处置方式完全不同。
+
+**根因之外，还查出两件实事**：
+
+**(a) 镜像会截断，且返回 200/206 不报错。**
+实测 `ghproxy.net` 完整下载 37,466,252B 的文件，**两次都中途断流**：
+
+| 次 | 收到字节 | 结果 |
+|---|---|---|
+| 1 | 9,376,643 | 恰好一个分片大小 |
+| 2 | 6,399,787 | 与上次不同 |
+
+两次 HTTP 状态码均正常，**截断点还不一样**——说明是该镜像系统性丢连接，
+不是固定的尺寸问题。`cmp` 比对确认内容不完整：
+
+```
+cmp: EOF on /tmp/cf-test2 after byte 9376643
+```
+
+对照：`ghfast.top` 同一文件连测两次，都是完整 37,466,252B、
+`sha256 = 3d97437c…faa3` 稳定一致。**所以镜像清单里 ghfast 排第一是对的。**
+
+**这就是"下载失败"最可能的真身**——不是连不上，是**下到一半断了还被当成成功**。
+
+**(b) 此前 cloudflared 没有内容校验**，只比字节数。截断时字节数不符能拦住，
+但"字节数对、内容坏"（镜像错误页、CDN 半截缓存）会一路装到容器里，
+直到 `--version` 跑不起来才报——报的还是"架构不匹配"，误导性极强。
+
+**解决**（`lib/toolchain/sdk_downloader.dart` + `lib/mcp/cloudflared_install.dart`）：
+
+1. **`MirrorProbe` 留证**：新增类型记录每个镜像的 `ok` / `elapsed` / `error`，
+   区分 `SocketException`（DNS/网络）、`HandshakeException`（TLS）、
+   `TimeoutException`（超时）、`HTTP xxx`（状态码）。`diagnose()` 返回逐源明细。
+2. **cloudflared 加 SHA-256 校验**：在落位**之前**校验内容，值经
+   ghfast 与 ghproxy.net 两镜像交叉下载比对。
+3. **错误文案带诊断**：下载失败时自动跑一次逐源探测并附在错误里。
+4. **UI 加「下载源诊断」按钮**：一键展示每个源的具体状态，可复制。
+   并告诉用户怎么读（`Failed host lookup` → DNS；`超时` → 换网络）。
+5. **镜像源 3 → 4**：补 `gh-proxy.com`。
+
+**为什么不能靠"再加一个镜像"解决**：开发机上三源全通，说明失败是**用户网络的
+点对点可达性问题**。这类问题无法靠堆镜像根治，只能 (a) 多留几条路，
+(b) 把原因暴露给用户，让他能判断该换 DNS 还是换网络。
+
+**验证**：新增 7 条契约测试，含一条**真跑 DNS 失败**的用例——
+`diagnose` 传入不存在的主机，断言返回 `ok=false` 且 `error` 非空
+（旧实现下这里会是 `null`，测不出来）。
+
+**出现版本**：alpha.60 起
+**修复版本**：alpha.63（下载与诊断），镜像侧断流问题非本项目可控
+
+---
+
+### Bug 467：proroot 只能手动导入——补一键从 GitHub 拉取（2026-09-20，alpha.63 新增）
+
+**症状**（需求，非缺陷）：proroot 卡片只有「导入」按钮，走系统目录选择器。
+用户得自己去 GitHub 翻 release、下载、解压成一目录、再选目录——四步手工操作。
+
+**约束（决定了实现方式）**：
+
+1. **专有许可**："Proprietary. Free to use in your projects. **Redistribution
+   of modified binaries is not permitted.**" → 可以**运行时原样下载**到用户
+   设备（free to use），但不能改写/重打包/随 APK 分发。
+2. **GitHub API 有速率限制**：`api.github.com` 匿名每小时 60 次、按 IP 计。
+   手机常走共享出口 IP，随时可能 403（实测已被限流）。
+3. **5 个 .so 必须同目录**：启动器按 `/proc/self/exe` 的 dirname 找另外 4 个。
+
+**解决**（新增 `lib/mcp/proroot_download.dart`）：
+
+- **走 `raw.githubusercontent.com`**，绕开 API 限速。raw 域不计数。
+- **钉死文件清单**：5 个文件的名字/字节数/SHA-256 全写死在
+  `ProrootOption.soAssets`。不动态发现——proroot 源码未公开，动态发现意味着
+  "上游推什么就装什么"，无法审计变化。钉死后上游一改，校验就失败并明确报错。
+- **逐个 sha256 校验**：值取自 2026-09-20 实测，**并与 GitHub contents API
+  返回的 git blob sha1 交叉验证一致**（`git hash-object` 比对，5 个全中）。
+- **暂存目录在 rootfs 内**（`${rootfsPath}/opt/proroot-dl`）：与最终落位
+  同卷，且容器能 `chmod`（宿主 filesDir 没有可执行位）。
+- **复用原生落位**：新增 Kotlin 方法 `prorootInstallFromDir`，内部直接调
+  原有的 `prorootInstall(srcDirPath)`——"导入"与"下载"两条路最终汇到同一段
+  落位逻辑，行为不会分叉。
+- **失败保留暂存**：校验失败时**不清**暂存目录，保留证据供排查。成功才清。
+
+**为什么保留「导入」按钮**：一键下载对"什么都没准备"的用户省事；选择器对
+"已自己下好文件"的用户更灵活（比如想用测试版）。两条路并存，不互相替代。
+
+**验证**：新增 6 条契约测试——资产清单与 `ProrootOption.soFiles` 同名同数、
+URL 走 raw 不走 api、每文件多镜像、Kotlin 复用 `prorootInstall`、
+暂存目录在 rootfs 内。
+
+**出现版本**：alpha.61（仅有手动导入）
+**修复版本**：alpha.63（新增一键下载）
+
+---
+
+### Bug 468（元）：Bug 440 的模板门禁在一轮里抓到我两次（2026-09-20，alpha.63）
+
+**现象**：本轮改动 Kotlin `MainActivity.kt` 后跑测试，
+`proroot_integration_test.dart` 的「平台模板双写（Bug 440 门禁）」
+**两次**报「模板与生成目录逐字节一致」失败——两次都是我只改了构建目录、
+忘了 `cp` 回 `platform/android/MainActivity.kt`。
+
+**为什么这是"好事"**：Bug 440 的教训是"`platform/` 模板不是构建输入——
+它落后了不会报错，只会让新工程脚手架缺功能（269 行 PTY 代码一个月没进过
+构建目录）"。这条门禁**精确地**在每次将要漂移时拦住了我。它抓到我两次，
+说明它有效，而不是说明它碍事。
+
+**流程教训**：改 `android/.../MainActivity.kt` 后，**必须**同步模板。
+建议直接跑：
+
+```bash
+cp android/app/src/main/kotlin/dev/foa/flutter_on_android/MainActivity.kt \
+   platform/android/MainActivity.kt
+```
+
+然后 `flutter test`——失败即说明忘了同步（门禁会告诉你）。
+
+**一个改进建议（未实施）**：可以加个 `tools/sync_platform.sh` 或在
+`check_env.sh` 里加一行 diff 检查，把"记得同步"从人的自觉变成脚本的职责。
+本轮未做，记在这里备选。
+
+**出现版本**：—（流程类）
+**修复版本**：—
+
+---
+
+### Bug 469：release 构建 49 分钟后 daemon 静默消失——三个 JVM 的堆预算相加就已等于 cgroup 上限（2026-09-20，alpha.63 修复）
+
+**症状**：
+
+```
+FAILURE: Build failed with an exception.
+* What went wrong:
+Gradle build daemon disappeared unexpectedly (it may have been killed or may have crashed)
+Running Gradle task 'assembleRelease'...  2950.0s
+Gradle task assembleRelease failed with exit code 1
+```
+
+跑了 **49 分钟**（2950s，远超 alpha.62 的 17-18 分钟基线）才死，
+死在 **dex/R8 阶段**（无任何 `*.dex` 中间产物落盘）。
+
+**这是第三版堆配置踩的同一个坑**，前三版全部靠"估算"定值：
+
+| 版本 | 配置 | 依据 | 结果 |
+|---|---|---|---|
+| v1 | gradle 1.5g + kotlin 1g | 按 5.8GB 小机器 | alpha.62 后期不够 |
+| v2 | gradle 6g + kotlin 3g | 按 123GB 大机器 | 必超顶，OOM |
+| v3 | gradle 4g + kotlin 2g | "留 0.5g 余量" | **仍 OOM** |
+| v4 | gradle 2.5g + kotlin 1.5g | **实测 Σ 所有 daemon** | 通过 |
+
+**根因**：前三版都只算了 **gradle daemon 一个 JVM**，漏掉了
+**Kotlin 编译器 daemon 其实同时有两个进程**：
+
+```
+PID 243614  KotlinCompileDaemon  -Xmx4g   编译器 2.2.21   RSS 1186MB
+PID 276445  KotlinCompileDaemon  -Xmx2g   编译器 2.4.0    RSS 1115MB
+PID 242983  GradleDaemon         -Xmx4g                RSS  976MB
+```
+
+v3 配置下 `4g + 2g = 6g` 只是"看得见的部分"，实际 Σ 堆上限
+`4 + 2 + 2 = 8g`，**正好等于 cgroup 上限 8GiB**，再叠加
+元空间(1g) + 线程栈 + 原生缓冲 + 页缓存，必然溢出。
+
+**现场证据（不靠估算，靠 cgroup 计数器）**：
+
+```bash
+$ cat /sys/fs/cgroup/memory.max        # 8589934592   = 8 GiB
+$ cat /sys/fs/cgroup/memory.peak       # 8590462976   ← 超了 528KB
+$ cat /sys/fs/cgroup/memory.events
+oom 1
+oom_kill 1        ← 铁证：不是 JVM 堆耗尽，是 cgroup OOM killer
+```
+
+峰值**超出上限仅 528,384 字节（0.5MB）**——精确贴顶后被杀。
+
+**为什么日志"什么都没有"**：OOM killer 是 SIGKILL，进程来不及
+flush 日志、来不及抛异常、`-XX:+HeapDumpOnOutOfMemoryError` 也
+不会触发（那只管 JVM 自身堆溢出，不管被外部杀）。daemon 日志最后
+一条只是常规心跳 `Finished periodic daemon health check.`
+——**误以为"构建卡住了"是错的，其实是被静默处决**。
+
+**判据修正（推翻 v2 版写的结论）**：
+
+> v2 写：「`free -m` 有大量 available 却仍报 daemon disappeared → 是 JVM 自身堆耗尽」
+
+**这条是错的，必须作废。** 本机 `free -m` 显示 available 101GB
+（宿主 126GB），但 cgroup 只给 8GiB——**`free` 看的是宿主，cgroup 看的是配额**，
+两者可以差 15 倍。正确判据只有一个：
+
+```bash
+cat /sys/fs/cgroup/memory.events   # oom_kill 计数器，唯一可信来源
+```
+
+**解决**：
+
+```properties
+org.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m -XX:+HeapDumpOnOutOfMemoryError
+kotlin.daemon.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m
+org.gradle.workers.max=2
+org.gradle.parallel=false
+```
+
+定值公式修订为：
+
+```
+Σ(所有 daemon 的 -Xmx) + 1.5g(元空间/线程/原生) + 0.5g(页缓存) < cgroup 上限
+        ↑ 注意是 Σ 全部，不是只算 gradle 那一个
+```
+
+本沙箱：`2.5 + 1.5 + 1.5 + 0.5 = 6g < 8GiB`，留 2g 真实余量。
+
+另加 `org.gradle.workers.max=2` 限制并发 worker 进程数
+（每个 worker 都可能膨胀），`org.gradle.parallel=false` 关掉并行工程构建。
+
+**构建前必须先清残留 daemon**（否则旧 daemon 带着旧 -Xmx 继续占内存）：
+
+```bash
+cd android && ./gradlew --stop
+pkill -f KotlinCompileDaemon; pkill -f GradleDaemon
+cat /sys/fs/cgroup/memory.current    # 确认降到 ~3GiB 再开工
+```
+
+**验证**：清理后 cgroup 占用从 5.6GiB → 3.0GiB，重新构建通过。
+
+**通用教训**：内存问题**不要估算，要读计数器**。JVM 是预留式的，
+`-Xmx` 决定它"敢涨到哪"，与当前 RSS 无关——所以
+「现在还有空闲」永远不能推导出「待会儿不会 OOM」。
+另外，**别只盯着你启动的那个进程**：工具链会自动拉起子 daemon
+（Kotlin 编译器、AAPT2、R8 worker），它们各自吃内存，加起来可能
+比你以为的主进程还大。`ps aux --sort=-%mem | head` 是最快的真相来源。
+
+**出现版本**：v0.1.0-alpha.62 / 63 构建过程
+**修复版本**：v0.1.0-alpha.63
+
+---
+
 
 ```
 ### Bug XXX · <一句话描述症状>
