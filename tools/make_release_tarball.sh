@@ -128,8 +128,13 @@ while IFS= read -r p; do
   #    `./app/android/build` 命中 `./app/android/build.gradle.kts`
   #    —— 两个都是**应当入库**的源码文件，于是门禁报了根本不存在的"排除失效"。
   #    正确判据：条目 == 该路径本身，或 以 该路径 + "/" 开头（即它的子内容）。
-  if printf '%s\n' "$LISTING" | grep -qxF "$p" || \
-     printf '%s\n' "$LISTING" | grep -qF "$p/"; then
+  # ⚠️ 用 here-string（`<<<`）**不要**用管道。
+  #    `grep -q` 一找到匹配就立刻退出并关闭管道，写端的 printf 会收到
+  #    SIGPIPE → 退出 141；而脚本开头是 `set -o pipefail`，于是**整个管道
+  #    返回非零** —— 明明"找到了"，却被判成"没找到"。
+  #    表现是**间歇性**的：取决于 printf 是否已写完（小清单碰巧通过，
+  #    大清单必挂）。实测：84MB 包的 rootfs 校验时有时无就是这个原因。
+  if grep -qxF "$p" <<< "$LISTING" || grep -qF "$p/" <<< "$LISTING"; then
     echo "❌ 排除失效: $p 仍在包里" >&2
     BAD=1
   fi
@@ -141,7 +146,7 @@ echo "✅ 排除规则全部生效"
 if [ "$SLIM" -eq 0 ]; then
   MISSING=0
   for f in './app/assets/rootfs/debian-minbase-arm64.tar.gz' './app/assets/tools/proot-arm64'; do
-    if ! printf '%s\n' "$LISTING" | grep -qxF "$f"; then
+    if ! grep -qxF "$f" <<< "$LISTING"; then
       echo "❌ 关键资产缺失: $f（rootfs 无公共下载源，丢了就建不起来）" >&2
       MISSING=1
     fi
