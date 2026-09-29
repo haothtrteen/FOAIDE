@@ -320,17 +320,12 @@ class BuildRunner {
     String name,
     EnvInfo env,
     BuildBackend backend, {
-    ContainerLayer layer = ContainerLayer.proot,
-
     /// 构建类型（alpha.93）。debug 档不走 AOT，是设备端唯一能显著
     /// 提速的档位——详见 [BuildFlavor] 的文档注释。
     BuildFlavor flavor = BuildFlavor.release,
   }) async {
     if (building) return; // 防重入（页面 UI 也不会同时给两个入口）
     final bare = backend == BuildBackend.termux;
-    // termux 裸原生根本不进容器，此时 layer 无意义（传 false 下去，
-    // 免得原生侧纠结"bare 和 proroot 同时为真怎么办"）
-    final proroot = !bare && layer == ContainerLayer.proroot;
     active = name;
     status = BuildStatus.building;
     lines.clear();
@@ -627,7 +622,7 @@ class BuildRunner {
           : QemuCompat.engineDir,
       sdkHome: bare ? TermuxPaths.sdkHome(env) : QemuCompat.sdkHome,
     );
-    final stream = await bridge.execStream(cmd, bare: bare, proroot: proroot);
+    final stream = await bridge.execStream(cmd, bare: bare);
     if (!stream.ok || stream.id <= 0) {
       status = BuildStatus.error;
       lines.add('✗ 启动失败：${stream.error ?? '未知错误'}');
@@ -968,12 +963,10 @@ test -x /opt/flutter/bin/flutter || {
   Future<String?> clean(
     String name,
     EnvInfo env,
-    BuildBackend backend, {
-    ContainerLayer layer = ContainerLayer.proot,
-  }) async {
+    BuildBackend backend,
+  ) async {
     if (building) return '正在构建中，不能清理缓存';
     final bare = backend == BuildBackend.termux;
-    final proroot = !bare && layer == ContainerLayer.proroot;
     final projectsDir = bare ? '${env.rootfsPath}/root/projects' : _projectsDir;
     final flutterDir = bare ? TermuxPaths.flutterHome(env) : '/opt/flutter';
     final flutterCmd =
@@ -984,7 +977,6 @@ test -x /opt/flutter/bin/flutter || {
       'FLUTTER_ALLOW_ROOT=true $flutterCmd clean',
       timeoutSec: 300,
       bare: bare,
-      proroot: proroot,
     );
     if (r.exitCode != 0) {
       final out = (r.stdout.isNotEmpty ? r.stdout : r.stderr).trim();

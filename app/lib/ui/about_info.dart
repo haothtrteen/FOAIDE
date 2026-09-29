@@ -5,8 +5,6 @@
 /// 这些都是"不写测试就一定会复发"的类型。
 library;
 
-import '../toolchain/proroot_option.dart';
-
 /// 作者信息与第三方组件清单。
 class AboutInfo {
   const AboutInfo._();
@@ -96,22 +94,6 @@ class AboutInfo {
       repoUrl: 'https://github.com/flutter/flutter',
       usage: '本应用自身的开发框架（Flutter SDK 及 Dart 运行时），'
           '同时也会下载进容器供你构建自己的项目。',
-    ),
-    AboutComponent(
-      name: 'proroot',
-      // ⚠️ **不要写死版本号**，直接引用唯一真源。
-      // 曾经写死 'v1.2.8'：Bug 471 把钉的版本换成 v1.2.5 之后，这里没跟着改，
-      // About 页就一直向用户展示一个**已经不用了的**版本号。
-      // 这类"同一事实存两份"的地方迟早打架（Bug 474 的参数名 cmd/command
-      // 是同一个病），所以这里改成引用常量。
-      version: ProrootOption.pinnedVersion,
-      license: 'Proprietary',
-      repoUrl: 'https://github.com/coderredlab/proroot',
-      usage: '可选的容器层加速：用 LD_PRELOAD + 二进制补丁替代 proot 的 '
-          'ptrace 路径翻译，省掉每次系统调用的两次上下文切换。'
-          '**默认关闭**，需用户在工具链页自行导入二进制并跑冒烟测试后启用；'
-          '本项目不代为分发（上游许可禁止分发修改过的二进制）。'
-          '注意它只优化容器层，对 QEMU 指令翻译与 dart/gradle 计算无改善。',
     ),
   ];
 }

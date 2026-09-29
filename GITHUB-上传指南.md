@@ -21,7 +21,8 @@ git count-objects -vH | grep size-pack   # 实际会推上去的体积
 | 跟踪文件数 | 409 |
 | `.git` 体积 | ~4.2 MB（`size-pack`） |
 | 分支 | `main` |
-| 门禁 | `flutter analyze lib/` 0 issue；`flutter test` **1781** 全过 |
+| 门禁 | `flutter analyze lib/` 0 issue；`flutter test` **1691** 全过 |
+| 出包验证 | `flutter build apk --debug` 成功，136 MB，APK 内 proroot 0 处 |
 
 > 这些数字是在**解包后的干净副本**上实测的，不是估的。
 
@@ -258,13 +259,14 @@ debootstrap 自建配方然后 `exit 1`。
 |---|---|
 | **合并为单仓库** | 原先 `app/` 与 `dev-handbook/` 各有一个嵌套 `.git`；现合并成一个，历史前缀已用 `git-filter-repo` 重写 |
 | **alpha.63 → alpha.98 压缩提交** | 152 处未提交改动合成一个提交（避免把反复试错的碎片带上线） |
-| **补缺失文档** | `PROROOT-许可与分发决策.md` 此前被 README 引用但不存在 |
+| **移除 proroot** | 可选容器层从未投入使用 → 代码 / UI / 原生通道 / 脚本 / 测试 / 文档全部删除（含 `PROROOT-许可与分发决策.md`，相关引用已一并改口径）。门禁 1781 → **1691** |
 | **补齐开源要件** | LICENSE（AGPL-3.0）、LICENSE-COMMERCIAL、CLA、CONTRIBUTING、SECURITY |
 | **README 重写** | 从"内部变更日志"改为"对外门面"（架构图 / 快速开始 / 功能 / 许可在前，更新日志在后） |
 | **.gitignore 定稿** | 明确区分源码与未跟踪资产；挡住 rootfs / proot / local-maven / jniLibs / 凭据 |
 | **清理残留** | 删除 `settings.gradle.kts.orig`、空文件 `st`、`android/.gradle/` |
 | **打包脚本化** | `tools/make_release_tarball.sh` + `tools/package-excludes.txt`，含回读复核与逐条排除校验；配 `app/test/package_excludes_test.dart`（7 条） |
-| **手册第十九章** | Bug 638/639 收尾 + 打包踩的三个静默错误 |
+| **`.trae/` 不入库** | 3 个 SKILL.md（156K）是本机编辑器备忘 → 删除 + `.gitignore` + `git filter-repo` 从历史抹掉 |
+| **手册第十九章** | Bug 638/639 收尾 + 打包踩的三个静默错误 + 19.6 移除 proroot + 19.7 沙箱 Gradle TLS 握手失败怎么绕 |
 | **安全扫描** | 无密钥、无 token、无内网地址、无个人路径（详见下文） |
 
 ### 两个交付包的区别

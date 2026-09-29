@@ -224,8 +224,8 @@ class _OnboardingPageState extends State<OnboardingPage>
   /// 引导页如果不先写好，"装完跳过去"的用户会被那个对话框迎面拦住，
   /// 刚建立起来的"一切就绪"感白费。
   ///
-  /// 选 proot 而不是 termux：proroot 是专有软件要用户自备二进制，
-  /// termux 后端是实验性的。默认值要和 `ContainerPrefs` 一致。
+  /// 选 proot 而不是 termux：termux 后端是实验性的。
+  /// 默认值要和 `BackendPrefs` 一致（proot）。
   Future<void> _ensureBackendPref(EnvState env) async {
     final e = env.info;
     if (e == null) return;

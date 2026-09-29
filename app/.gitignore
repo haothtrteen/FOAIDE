@@ -50,12 +50,6 @@ assets/rootfs/*.tar.*
 assets/rootfs/*.tgz
 # jniLibs 中的 proot（由 setup_android.sh 从 assets 生成，不重复入库）
 android/app/src/main/jniLibs/arm64-v8a/libproot.so
-# jniLibs 中的 proroot 五件套（**已停止内置**，alpha.69）。
-# 上游许可（Proprietary）禁止再分发二进制，故不再随 APK 打包，
-# 也不再提供下载入口（tools/verify_apk.sh 第 4/4 项强制检查 APK 内无 proroot）。
-# 保留本通配规则是为了兜住**用户自行导入**落到这里的文件，避免误入库；
-# 用户导入步骤见 PROROOT-许可与分发决策.md 的方案 A。
-android/app/src/main/jniLibs/arm64-v8a/libproroot*.so
 !assets/tools/.gitkeep
 !assets/rootfs/.gitkeep
 

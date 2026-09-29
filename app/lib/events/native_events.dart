@@ -41,7 +41,7 @@ import '../toolchain/build_notify.dart';
 ///
 /// 本通道上**正向**（Dart → Native）方法名目前有：
 /// `fileList` / `fileRead` / `fileWrite` / `fileMkdir` / `fileRename` /
-/// `fileDelete` / `pickInstallFile` / `prorootImport` / `notificationsEnabled` /
+/// `fileDelete` / `pickInstallFile` / `notificationsEnabled` /
 /// `notifyStart` / `notifyProgress` / `notifyStop` / `takeNavigate` /
 /// `openNotificationSettings` / `fsWatchStart` / `fsWatchStop` / …
 ///
@@ -89,7 +89,7 @@ class NativeEvents {
   /// 任何运行时错误——所以它的维护紧迫性低于 [_reverseMethods]。
   static const Set<String> _forwardMethods = {
     'fileList', 'fileRead', 'fileWrite', 'fileMkdir', 'fileRename', 'fileDelete',
-    'pickInstallFile', 'prorootImport', 'notificationsEnabled',
+    'pickInstallFile', 'notificationsEnabled',
     'notifyStart', 'notifyProgress', 'notifyStop', 'takeNavigate',
     'openNotificationSettings', 'fsWatchStart', 'fsWatchStop',
   };

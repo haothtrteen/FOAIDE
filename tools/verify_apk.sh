@@ -8,8 +8,10 @@
 #   1. ABI       必须是 arm64-v8a 且仅有它（多 ABI 会让体积翻倍）
 #   2. targetSdk 必须是 28（W^X 绕过策略的刻意选择，见构建流程 §2.3）
 #   3. 签名      apksigner verify 必须通过
-#   4. 合规      APK 内不得含 proroot 的任何 .so（上游许可禁止再分发，
-#                见 THIRD-PARTY-NOTICES.md「不代分发二进制的原因」）
+#   4. 合规      APK 内不得含 proroot 的任何 .so。
+#                proroot 已于 alpha.98 整体移除，这一项现在是**防御性
+#                兜底**——防的是有人把旧的 jniLibs / 打包脚本捡回来。
+#                判据是「lib/ 下有没有 proroot 的 .so」，见下面的长注释。
 #   5. 图标      APK 内必须带上 alpha.69 的新图标（传统 ic_launcher.png +
 #                adaptive icon 的 foreground）。这一项防的是「忘记跑
 #                `dart run flutter_launcher_icons` 就出包」——那种情况下
@@ -134,9 +136,9 @@ echo
 echo "【4/5】合规：proroot 不得入包"
 HITS="$(unzip -l "$APK" 2>/dev/null | grep -i proroot || true)"
 if [[ -z "$HITS" ]]; then
-  pass "APK 内无 proroot（符合上游许可，见 THIRD-PARTY-NOTICES.md）"
+  pass "APK 内无 proroot（alpha.98 起已整体移除，此项为防御性兜底）"
 else
-  fail "APK 内发现 proroot，违反「不代分发」口径："
+  fail "APK 内发现 proroot —— 它已于 alpha.98 移除，不该出现在包里："
   echo "$HITS" | sed 's/^/     /'
 fi
 
@@ -160,15 +162,21 @@ echo "【5/5】App 图标已应用"
 # so 文件名不做混淆，且 "proroot" 这个串没有被哪条路径意外覆盖。
 # 换成人名/短串做合规检查就得小心了。
 #
-# ⚠️ 这条"碰巧"在 alpha.72 被实测确认过一次，别把它扩大成全文 grep：
-# `classes.dex` 与 `libapp.so` 里**必然**存在 "proroot" 字样 ——
-#   1. Kotlin 侧有一整块 proroot 后端（Pr0otBridge.getPr0otStatus /
-#      prorootInstall / libproroot.so 这些方法名与 so 名全是明文字符串），
+# ⚠️ 别把它扩大成全文 grep。这条在 alpha.72 被实测确认过一次：
+# 当时 `classes.dex` 与 `libapp.so` 里**必然**存在 "proroot" 字样 ——
+#   1. Kotlin 侧有一整块 proroot 后端（prorootStatus / prorootInstall /
+#      libproroot.so 这些方法名与 so 名全是明文字符串），
 #      它只是**不随包分发**，不是"代码里不能提它"；
 #   2. 工具链页的「选后端」对话框文案要如实告诉用户"proroot 是专有软件、
 #      需自备二进制"，这段说明文字也会落进 AOT 字符串表。
 # 所以判据只能是「`lib/` 下有没有 proroot 的 .so」，而**不是**"包内有没有
 # 出现 proroot 这个词" —— 后者会把一个正确构建判成违规。
+#
+# 📌 alpha.98 更新：proroot 已整体移除，上述两条"必然出现"的来源
+# 现在都**不存在了**（实测 debug 包 `unzip -l | grep -i proroot` = 0）。
+# 但这条检查**仍然留着**，判据也不放宽 —— 它现在是纯防御：
+# 万一有人把旧的 jniLibs 或打包脚本捡回来，这一项会立刻变红。
+# **判据按最坏情况定，不按当前情况定。**
 LISTING="$(unzip -l "$APK" 2>/dev/null || true)"
 if [[ -z "$AAPT2" ]]; then
   skip "未找到 aapt2，无法验证图标（release 包资源名已混淆，必须靠 aapt2）"

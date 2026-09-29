@@ -100,7 +100,6 @@ flutter build apk --release --target-platform=android-arm64   # 6. 出包
 |---|---|
 | `app/` | Flutter + Android 工程（含完整 git 历史） |
 | `dev-handbook/` | **开发手册 01–07**：环境、构建、测试、Bug 库、许可证、发布、原生化 |
-| `.trae/skills/` | 3 个构建相关 skill（出包工序、产物验证、体积优化，1900+ 行） |
 | `docs/` | 技术方案评估（AVF、box64、Web 预览预热、保活等） |
 | `tools/` | 交付脚本：打包、出包、验证、模板同步 |
 | `构建流程.md` | **从零到出包的完整步骤** |
@@ -151,7 +150,29 @@ flutter build apk --release --target-platform=android-arm64   # 6. 出包
 | ABI | arm64-v8a |
 | targetSdk | 28 |
 | 默认构建档 | **debug**（alpha.94 起，可手动切 release） |
-| analyze / test | 7 条基线（均在 `third_party/`）/ 1774 项通过 |
+| analyze / test | 7 条基线（均在 `third_party/`）/ 1691 项通过 |
+
+### alpha.98（收尾）：移除 proroot + 打包工具链
+
+| 项 | 说明 |
+|---|---|
+| **proroot 整体移除** | 可选容器层（LD_PRELOAD 加速）自 alpha.69 起已停用下载，实际从未投入使用。本轮把代码、UI 开关、原生通道、脚本子命令、测试、文档**全部删掉**：`lib/toolchain/proroot_option.dart`、`lib/mcp/proroot_download.dart`、3 个专属测试、`ContainerLayer` 枚举、Kotlin 侧 `proroot*` 方法与通道、THIRD-PARTY-NOTICES 整节。门禁 1781 → **1691**（-90）。 |
+| **`.trae/` 不再入库** | 3 个 SKILL.md（156K）是本机编辑器的备忘，对外部贡献者无意义 → 从仓库删除并加 `.gitignore`；再用 `git filter-repo` 从全部历史里抹掉（仓库未推过远端，重写零副作用）。 |
+| **打包工具链** | `tools/make_release_tarball.sh` + `tools/package-excludes.txt`，含回读复核与逐条排除校验；配 7 条回归测试。 |
+| **手册第十九章** | Bug 638/639 收尾 + 打包踩的三个静默错误 + **19.6 移除 proroot** + **19.7 沙箱 Gradle TLS 握手失败怎么绕**。 |
+
+**验证（都是实测数字，不是"应该能过"）**：
+
+| 项 | 结果 |
+| --- | --- |
+| `flutter analyze lib/` | No issues found |
+| `flutter test` | **1691 项全过** |
+| `tools/sync_platform.sh` | 两份 `MainActivity.kt` 逐字节一致 |
+| `grep -ci proroot`（全仓 lib/Kotlin/脚本/文档） | **0** |
+| 真机出包 | `flutter build apk --debug` 成功，136MB；APK 内 proroot **0 处**，`libproot.so` 保留 |
+
+> 相关历史（alpha.61~69 的 proroot 许可与分发决策）仍保留在
+> `dev-handbook/04-常见Bug与解决方案.md` 里，作为开发记录不删。
 
 ### alpha.98（本轮）：Bug 638 老写法进构建前置 + Bug 639 模板漂移门禁
 
@@ -452,101 +473,3 @@ alpha.93 起「版本」区提供容器内 git 的 status / add / commit / log�
 诚实边界：**预取只覆盖 arm64**；**Git 不做 SSH、不解决冲突**（分叉只报错指路）；
 **导入只认带私钥的 keystore**（`.pem`/`.cer` 上传证书签不了 APK）；
 签名库口令**明文存**（gradle 的 `key.properties` 本身就要明文，UI 上明说不假装加密）。
-
-> ⛔ **proroot 二进制已从本仓库与 APK 中完全移除（alpha.69，方案 A）**。
-> 上游许可（Proprietary）禁止再分发修改过的二进制，此前 alpha.66~68
-> 打包进 `jniLibs/arm64-v8a/` 的五件套属于超出口径，**已全部删除**，
-> 「一键下载」入口同时下架。决策全文与落地清单见
-> [PROROOT-许可与分发决策.md](PROROOT-许可与分发决策.md)。
->
-> 保留的是**原生侧的集成改造**（6 个 `PROROOT_*` 环境变量、runtime 库
-> 落位到 `filesDir`、`-b <host>:<guest>` 参数形式、从 `nativeLibraryDir`
-> 直接 exec）与 **UI 卡片**。若你持有合法副本，仍可通过卡片上的
-> 「从本地导入」落位使用 —— 参考实现见作者开源 App
-> [andClaw](https://github.com/coderredlab/andClaw) 的 `proroot/ProrootManager.kt`。
->
-> ⚠️ `isKnownUnusable()` 仍为 `true`（继续劝退）：proroot 省的是容器层的
-> ptrace 开销，而 FOA 构建慢的大头是 **QEMU x64 指令翻译** —— 它改善不了。
->
-> 附带地，alpha.69 起 `tools/fetch_assets.sh` 的 `proroot` 子命令会
-> **固定报错返回 1**，且 `all` 分支刻意不调用它；`flutter test` 里有
-> 多条门禁盯着这些清单不被"顺手加回来"。
-
-> 本轮（alpha.65）修复：
-> ① **proroot 冒烟测试失败（Bug 471）** —— 曾误判为"上游版本钉错"
-> （跟着 `main` 拿到要求 glibc 2.38 的 v1.2.8，而本机 rootfs 是 2.36）。
-> 当时修复：钉到 **v1.2.5**、`upstreamRef` 从 `main` 改为钉 tag ——
-> **这一步本身没错，但根因判断是错的**，详见上方 471e 说明；
-> ② **下载器不建父目录（Bug 471b）** —— "终端 `wget` 能装、UI 装不上"
-> 的真因，下载器现在自己保证父目录存在；
-> ③ **终端手工隧道 502（Bug 473）** —— 隧道通但 8977 上没人听，
-> 新增 `tools/foa-sh-mcp.sh`（纯 shell 终端版 MCP 服务）补齐；
-> ④ **该脚本自身四个"语法全过、实测全错"的坑（Bug 474）** ——
-> `--serve-one` 分流位置、`command` 参数名两端不一致、正则截断转义引号、
-> `index()` 下标偏移；四个坑表征全是"响应为空"，只能逐层实测剥开。
-> 现已**真发请求**验证（健康检查 / 完整协议序列 / 文件读写 / 黑名单 /
-> 并发 5-5、连发 20-20），并把四条各写一条断言钉进单测；
-> ⑤「远程接管」改名「远程协助」，并点明与「AI 接管」的分工；
-> ⑥ 下载器并发兜底竞态（`PathNotFoundException`）；
-> ⑦ gradle 读写路径不对称（`.gradle.kts` 工程保存失败）；
-> ⑧ **About 页的 proroot 版本停在 v1.2.8（Bug 476）** —— 换版本时漏改，
-> 现已改为引用 `ProrootOption.pinnedVersion` 唯一真源并加测试钉住。
-> 这个是**出包后逐字节核对产物**才发现的——685 项测试全绿时它依然隐形。
->
-> 🔴 **真机反馈推翻了 ① 的结论（Bug 471c）**：alpha.65 用钉死的 v1.2.5
-> 做冒烟测试，**仍然崩**——
-> ```
-> proroot-ldso: no offset table for glibc 2.36 — patches skipped
-> [proroot] SIGSEGV ... [proroot] child exited with code 139
-> ```
-> 我此前把 `no offset table` 判为"无害警告、真正致命的是 `reloc: unresolved`"，
-> **这个判断是错的**：linker 没为目标 glibc 准备内部结构体偏移表，
-> 补丁全部跳过 → 运行期取到垃圾数据 → 解引用崩溃。
-> **更新版本也不行**（要 glibc 2.38，失败得更早）。可获得的版本只有
-> v1.2.3~v1.2.8 四档，**穷举已做完，两个方向都堵死**。
->
-> 🔴🔴 **真机判别实验又推翻了 471c 的根因（Bug 471d）**：471c 说"出路是
-> 换 rootfs"，我**从没验证过这句话**。2026-09-21 补做了实验 ——
->
-> **升级 rootfs 救不了。** 换上 Debian 13 / glibc 2.41 后报错**逐字相同**：
-> ```
-> libproroot.so: version `LIBC' not found (required by ./libproroot.so)
-> ```
-> 真正的根因（自写 ELF 解析器直读 `.dynamic` 拿到硬证据）：**`libproroot.so`
-> 的 `DT_NEEDED` 写的是开发名 `libc.so` / `libdl.so`**，而同批其余 4 个库
-> 都规规矩矩写 `libc.so.6`。这两个名字在任何运行时系统上都不是可加载的 ELF
-> ——`libdl.so` 自 glibc 2.34 起已不再提供，`libc.so` 永远是 `libc6-dev`
-> 带的 GNU ld script。**这与 glibc 版本无关，是上游构建产物的缺陷。**
->
-> 顺带**推翻了我上一轮的一个猜测**：我曾推测"minbase 精简 rootfs 没装
-> `libc6-dev`"，真机 `dpkg -l` 实测**是装了的**。问题不是"缺文件"，
-> 而是"这个文件本来就不是 ELF"。
->
-> **当前状态：proroot 在 Debian 12/13 上均不可用，且已确认我方无解**
-> （许可禁止修改二进制，只能等上游重新构建）。
-> 这不影响 alpha.65 作为**可用包**发布（proroot 是默认关闭的实验特性，
-> 未启用时构建链路完全不受影响）——但它**不能**当作"已可用的加速选项"。
-> 已做的处置：新增 `isKnownUnusable()` 门禁（真机结论优先于符号表推断）、
-> UI 开关改为**硬拦**、原生侧识别**三种**失败形态（加载失败排在最先）、
-> 风险清单前三条重写，并**显式堵掉"升级 rootfs / 换个版本"两条错误引导**。
->
-> 详细变更见 `dev-handbook/04-常见Bug与解决方案.md` 的 Bug 464–476
-> （**471c** 是第一次推翻，**471d** 是判别实验与最终根因）。
-
----
-
-## ⚠️ 已知待决事项：proroot 分发
-
-`dist/` 下 alpha.66/67 的 APK **打进了 proroot 五件套**，因此
-`tools/verify_apk.sh` 的第 4/4 项（"proroot 不得入包"）会判红。
-
-- **这不是"proroot 坏了"**，而是 `Bug 471f` 改造 ①（五件套进 `jniLibs`）
-  与早期立下的"不代分发"门禁**没同步**；
-- 上游措辞是"not permitted to redistribute **modified** binaries"，
-  **字面没禁止原样再分发，但也没给出授权** —— 两种解读都不能推断；
-- 我方行为是**原样下载 + sha256 校验、零修改**，能证"没改"，
-  **不能证"可以发"**。
-
-三条可选路径与建议 → **[PROROOT-许可与分发决策.md](PROROOT-许可与分发决策.md)**
-
-在决策落地前：**本地自用/真机冒烟测试可继续装，不要对外分发。**

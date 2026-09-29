@@ -17,70 +17,14 @@ class ProotBridge {
   }
 
   Future<ProotResult> exec(String command,
-      {int timeoutSec = 180, bool bare = false, bool proroot = false}) async {
+      {int timeoutSec = 180, bool bare = false}) async {
     final raw = await _channel.invokeMethod('exec', {
       'command': command,
       'timeoutSec': timeoutSec,
       // bare=true：**不经 proot**，宿主 /system/bin/sh 直跑（Termux 裸原生后端）
       'bare': bare,
-      // proroot=true：容器层换成 proroot（LD_PRELOAD 路径翻译，
-      // 免掉 proot 每次系统调用的两次上下文切换）。
-      // 与 bare 互斥——bare 根本不进容器，此时该参数被原生侧忽略。
-      'proroot': proroot,
     });
     return ProotResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
-  }
-
-  // ---------------- proroot 容器层（alpha.61） ----------------
-
-  /// 查询 proroot 落位状态（缺哪些文件、abi、api、rootfs 是否就绪）。
-  Future<ProrootStatus> prorootStatus() async {
-    final raw = await _channel.invokeMethod('prorootStatus');
-    return ProrootStatus.fromMap((raw as Map<Object?, Object?>?) ?? {});
-  }
-
-  /// 打开系统目录选择器导入 proroot 的 5 个 .so（用户选目录，原生递归拷贝）。
-  /// 返回 null 表示用户取消。
-  Future<ProrootInstallResult?> prorootImport() async {
-    final raw = await _channel.invokeMethod('prorootImport');
-    final m = (raw as Map<Object?, Object?>?) ?? {};
-    if (m['ok'] == false && (m['error'] as String? ?? '').contains('已取消')) {
-      return null;
-    }
-    return ProrootInstallResult.fromMap(m);
-  }
-
-  /// 清空 proroot 落位目录，返回删除的文件数。
-  Future<int> prorootRemove() async {
-    final raw = await _channel.invokeMethod('prorootRemove');
-    final m = (raw as Map<Object?, Object?>?) ?? {};
-    return (m['removed'] as num?)?.toInt() ?? 0;
-  }
-
-  /// Bug 464：从**已知路径**安装 proroot（供一键下载用）。
-  ///
-  /// 与 [prorootImport] 的区别：那个走系统目录选择器（用户选）、
-  /// 这个直接吃 Dart 侧刚下载好的暂存目录路径。落位逻辑完全复用
-  /// 原生 `prorootInstall(srcDirPath)`——递归找同名文件、拷进 jniLibs
-  /// 等价的私有目录、setExecutable、验 ELF 魔数。
-  ///
-  /// [stagingDirPath] 必须是原生可读的**宿主路径**（下载落点见
-  /// `ProrootDownload`）。
-  Future<ProrootInstallResult> prorootInstallFromDir(
-      String stagingDirPath) async {
-    final raw = await _channel.invokeMethod(
-        'prorootInstallFromDir', {'path': stagingDirPath});
-    return ProrootInstallResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
-  }
-
-  /// 冒烟测试：在容器里真跑一次 proroot。
-  ///
-  /// 之所以必须有这一步：proroot 官方要求 Ubuntu arm64 rootfs，
-  /// 本项目用 Debian 12 bookworm——**未验证组合**。文件在不在、
-  /// 是不是 ELF 都判断不了能不能跑，只能真跑。
-  Future<ProrootProbeResult> prorootProbe() async {
-    final raw = await _channel.invokeMethod('prorootProbe');
-    return ProrootProbeResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }
 
   // ---------------- Bug 464 · 主题 → 系统栏同步 ----------------
@@ -113,12 +57,11 @@ class ProotBridge {
   /// 启动流式命令（输出合并单流，超时默认 2h），返回任务 id。
   /// bare=true：Termux 裸原生模式，命令里的路径必须是**宿主路径**。
   Future<ExecStreamStart> execStream(String command,
-      {int timeoutSec = 7200, bool bare = false, bool proroot = false}) async {
+      {int timeoutSec = 7200, bool bare = false}) async {
     final raw = await _channel.invokeMethod('execStream', {
       'command': command,
       'timeoutSec': timeoutSec,
       'bare': bare,
-      'proroot': proroot,
     });
     return ExecStreamStart.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }

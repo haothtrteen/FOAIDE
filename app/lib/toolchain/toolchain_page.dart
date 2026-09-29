@@ -8,7 +8,6 @@ import 'artifact_prefetch.dart';
 import 'jdk_installer.dart';
 import 'local_install_picker.dart';
 import 'native_arm64.dart';
-import 'proroot_option.dart';
 import 'qemu_compat.dart';
 import 'diag_page.dart';
 import 'sdk_downloader.dart';
@@ -169,9 +168,6 @@ class _ToolchainPageState extends State<ToolchainPage> {
   // ---- 后端切换（proot 容器 / termux 裸原生）----
   BuildBackend? _backend; // null = 未选择（首次进入会弹询问）
 
-  /// 容器层（proot / proroot）。null = 尚未加载完。
-  /// 与 _backend 正交：termux 裸原生不进容器，此时该项无意义。
-  ContainerLayer? _layer;
   // ---- Termux 裸原生 ----
   TermuxPhase _termuxPhase = TermuxPhase.idle;
   String _termuxInfo = '';
@@ -193,8 +189,6 @@ class _ToolchainPageState extends State<ToolchainPage> {
     try {
       final env = await _bridge.envInfo();
       final b = await BackendPrefs.load(env);
-      final l = await ContainerPrefs.load(env);
-      if (mounted) setState(() => _layer = l);
       if (!mounted) return;
       setState(() => _backend = b);
       if (b == null) {
@@ -219,15 +213,6 @@ class _ToolchainPageState extends State<ToolchainPage> {
     try {
       final env = await _bridge.envInfo();
       await BackendPrefs.save(env, b);
-    } catch (_) {}
-  }
-
-  /// 切换容器层（proot ↔ proroot），写盘持久化。
-  Future<void> _setLayer(ContainerLayer l) async {
-    setState(() => _layer = l);
-    try {
-      final env = await _bridge.envInfo();
-      await ContainerPrefs.save(env, l);
     } catch (_) {}
   }
 
@@ -1610,26 +1595,6 @@ class _ToolchainPageState extends State<ToolchainPage> {
                   const _PrefetchCard(),
                   const SizedBox(height: 12),
                   _AvfCard(env: _env),
-                  const SizedBox(height: 12),
-                  // 容器层加速（proroot）：alpha.61 引入，alpha.70 移到这里。
-                  //
-                  // **为什么在最后**：alpha.61~69 它紧跟在「x64 兼容层」后面，
-                  // 理由是"两者都作用于容器层"。但那个位置传达了一个错误暗示——
-                  // 读者会把它当成"和 QEMU 平级的必经步骤"，而它实际是**可选优化**：
-                  // 默认关闭、要用户自备二进制、上游许可禁止我们代为分发。
-                  // 用户反馈"容易被误判优先级"，就是这条暗示的后果。
-                  // 放到分支末尾 = 视觉上表达"该装的都装完了、还想再快一点再看这个"。
-                  //
-                  // ⚠️ 不要再往上移。位置本身就是它的"优先级声明"。
-                  // 注：仅 proot 后端显示——termux 后端不经容器层，
-                  // 没有可优化的对象，显示出来只会让人困惑。
-                  ProrootCard(
-                    enabled: _layer == ContainerLayer.proroot,
-                    onChanged: _layer == null
-                        ? null
-                        : (v) => _setLayer(
-                            v ? ContainerLayer.proroot : ContainerLayer.proot),
-                  ),
                 ],
                 // 故障诊断（alpha.59 引入，alpha.60 更名）：两种后端通用——
                 // 命令走 proot 容器普通通道，只读探测，不与构建/预览抢

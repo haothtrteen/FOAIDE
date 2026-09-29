@@ -109,8 +109,7 @@ void main() {
     });
 
     test('Kotlin 侧确实存在这两个反向方法的 invoke 点（源码扫描）', () {
-      // 项目惯例：Kotlin 零测试，用源码扫描代替
-      //（同 proroot_integration_test.dart:219-231）。
+      // 项目惯例：Kotlin 零测试，用源码扫描代替。
       // 守的是"Dart 侧等一个永远不会来的事件"这种哑巴亏。
       final kt = src('android/app/src/main/kotlin/dev/foa/'
           'flutter_on_android/MainActivity.kt');

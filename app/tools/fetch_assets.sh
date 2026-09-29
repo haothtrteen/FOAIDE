@@ -6,7 +6,6 @@
 #   ./tools/fetch_assets.sh            # proot + rootfs
 #   ./tools/fetch_assets.sh proot      # 只准备 proot + loader
 #   ./tools/fetch_assets.sh rootfs     # 只准备 rootfs
-#   ./tools/fetch_assets.sh proroot    # ⛔ 已停用（alpha.69），固定报错返回
 #
 # 说明:
 #   - proot 从 Termux 官方 apt 仓库拉 .deb 并解出两个文件:
@@ -18,12 +17,6 @@
 # 许可证注意:
 #   - proot 是 GPL-2.0，分发时必须在 THIRD-PARTY-NOTICES 附源码链接
 #   - rootfs 为 Debian 自由软件集合（DFSG），体积大，一律不进 git
-#   - proroot 的 libproroot*.so 为 **Proprietary**（上游 THIRD_PARTY_LICENSES.md
-#     明确「Redistribution of modified binaries is not permitted」）。
-#     **alpha.69 起本仓库不再分发这五个文件**：既不随 APK 打包，也不提供
-#     下载入口。fetch_proroot() 保留但固定报"已停用"。
-#     背景与三个候选方案的取舍见 PROROOT-许可与分发决策.md（方案 A 已落地）；
-#     门禁是 tools/verify_apk.sh 第 4/5 项（APK 内不得含 proroot）。
 # ============================================================
 set -euo pipefail
 
@@ -95,127 +88,6 @@ fetch_proot() {
 }
 
 # ============================================================
-# proroot 五件套（Bug 471e 改造①，2026-09-21）
-#
-# 与 proot 的区别：**直接部署进 jniLibs/arm64-v8a/**，不是 assets/tools/。
-#
-# 为什么必须走 jniLibs：libproroot.so 的 PT_INTERP 是
-# /system/bin/linker64，它是 **Android 原生 launcher**，必须从
-# nativeLibraryDir 直接 exec。而 nativeLibraryDir 的内容只来自 APK 的
-# lib/<abi>/ 目录 —— 也就是 jniLibs 打包进去的那几个。
-#
-# 好消息：五件套**原名就是 lib*.so**，全部符合 Android 的 native lib
-# 命名规则，直接放进去即可，**不需要像 proot 那样改名**。
-#
-# 版本来源只有一个真源：lib/toolchain/proroot_option.dart 的
-# pinnedVersion / soAssets（含 size + sha256）。这里从该文件解析出来，
-# 避免"两处各写一个版本号"（那正是 Bug 476 的成因）。
-PROROOT_JNILIB_DIR="$APP_DIR/android/app/src/main/jniLibs/arm64-v8a"
-
-# 从 Dart 常量解析钉死的版本与五个文件名+sha256
-proroot_pin() {
-  local dart="$APP_DIR/lib/toolchain/proroot_option.dart"
-  [[ -f "$dart" ]] || { echo "❌ 找不到 $dart"; exit 1; }
-  PROROOT_VERSION="$(sed -n "s/.*static const String pinnedVersion = '\([^']*\)'.*/\1/p" "$dart" | head -1)"
-  [[ -n "$PROROOT_VERSION" ]] || { echo "❌ 无法从 proroot_option.dart 解析 pinnedVersion"; exit 1; }
-}
-
-fetch_proroot() {
-  # ─────────────────────────────────────────────────────────────
-  # ⛔ alpha.69 起停用（方案 A 落地）。
-  #
-  # 上游许可是 Proprietary，明确
-  # "Redistribution of modified binaries is not permitted"，
-  # 我们不代分发二进制，故五件套已从 APK 移除
-  # （tools/verify_apk.sh 第 4/5 项强制检查 APK 内不得含 proroot）。
-  #
-  # 这里**刻意保留函数并显式报错**，而不是静默什么都不做：
-  #   - 旧文档 / 旧习惯里仍可能出现 `fetch_assets.sh proroot`，
-  #     给一句明确的"已停用"远比什么都没有有用；
-  #   - 若将来许可口径变化，删掉下面这个 if 块即可恢复原逻辑。
-  #
-  # 用 `return 1` 而非 `exit 1`：不毒化 all 流程的其余部分
-  # （proot / rootfs 仍应正常准备）。
-  # ─────────────────────────────────────────────────────────────
-  echo "❌ proroot 五件套自 alpha.69 起不再内置，也不再自动下载。"
-  echo "   原因：上游许可（Proprietary）禁止再分发二进制，故已从 APK 移除。"
-  echo "   如你持有合法副本，可自行导入（App 内「从本地导入」，或手工放到"
-  echo "   $PROROOT_JNILIB_DIR）。"
-  echo "   详见仓库根目录 PROROOT-许可与分发决策.md 的方案 A。"
-  return 1
-}
-
-fetch_proroot_legacy() {
-  local dart="$APP_DIR/lib/toolchain/proroot_option.dart"
-  proroot_pin
-  mkdir -p "$PROROOT_JNILIB_DIR" "$TMP/proroot"
-
-  echo "ℹ️  proroot 钉死版本：$PROROOT_VERSION（唯一真源：proroot_option.dart）"
-
-  # 文件名与 sha256 同样从 Dart 解析（name: 'x', sha256: 'y' 交替出现）
-  local names shas
-  names="$(sed -n "s/.*name: '\(libproroot[^']*\.so\)'.*/\1/p" "$dart")"
-  shas="$(sed -n "s/^ *'\([0-9a-f]\{64\}\)',*$/\1/p" "$dart")"
-  local -a NAME_ARR SHA_ARR
-  mapfile -t NAME_ARR <<<"$names"
-  mapfile -t SHA_ARR  <<<"$shas"
-
-  if [[ ${#NAME_ARR[@]} -ne 5 || ${#SHA_ARR[@]} -ne 5 ]]; then
-    echo "❌ 解析出的条目数不对：文件名 ${#NAME_ARR[@]} 个、sha256 ${#SHA_ARR[@]} 个（应为 5）"
-    echo "   请检查 proroot_option.dart 的 soAssets 结构是否被改动。"
-    exit 1
-  fi
-
-  local ok=0 skip=0 fail=0
-  for i in "${!NAME_ARR[@]}"; do
-    local name="${NAME_ARR[$i]}" want="${SHA_ARR[$i]}"
-    local dst="$PROROOT_JNILIB_DIR/$name"
-    local url="https://raw.githubusercontent.com/coderredlab/proroot/$PROROOT_VERSION/arm64-v8a/$name"
-
-    # 已存在且哈希正确 → 跳过（可重复执行）
-    if [[ -f "$dst" ]] && [[ "$(sha256sum "$dst" | cut -d' ' -f1)" == "$want" ]]; then
-      echo "   ✓ $name 已就位（哈希一致）"
-      skip=$((skip+1)); continue
-    fi
-
-    echo "↓ 下载 $name ($PROROOT_VERSION) ..."
-    local got=0
-    # 国内镜像优先，raw 直链兜底（与 Dart 侧 mirrorsFor 同思路）
-    for prefix in "https://gh-proxy.com/" "https://ghfast.top/" ""; do
-      if curl -fsSL --retry 2 -o "$TMP/proroot/$name" "${prefix}${url}" 2>/dev/null; then
-        got=1; break
-      fi
-    done
-    if [[ $got -ne 1 ]]; then
-      echo "   ❌ $name 下载失败（三个源都不通）"; fail=$((fail+1)); continue
-    fi
-
-    local actual
-    actual="$(sha256sum "$TMP/proroot/$name" | cut -d' ' -f1)"
-    if [[ "$actual" != "$want" ]]; then
-      echo "   ❌ $name 哈希不符！"
-      echo "      期望 $want"
-      echo "      实际 $actual"
-      echo "      → 上游可能已重发版本，或下载被劫持。**不要使用这个文件。**"
-      fail=$((fail+1)); continue
-    fi
-    cp "$TMP/proroot/$name" "$dst"
-    chmod 755 "$dst"
-    echo "   ✅ $name 校验通过"
-    ok=$((ok+1))
-  done
-
-  echo ""
-  if [[ $fail -gt 0 ]]; then
-    echo "❌ proroot 部署有 $fail 个失败（成功 $ok / 跳过 $skip）"
-    echo "   提示：沙箱/CI 若无外网，可在有网机器上跑本脚本后把"
-    echo "   android/app/src/main/jniLibs/arm64-v8a/ 一并提交。"
-    exit 1
-  fi
-  echo "✅ proroot 五件套就位（$PROROOT_JNILIB_DIR）"
-  ls -la "$PROROOT_JNILIB_DIR" | grep libproroot || true
-}
-
 # 真机友好重打包（Bug 209）：
 #   Android 应用沙箱不允许 mknod()（/dev 节点）与部分机型的 link()（硬链接），
 #   tar 解压会大量报错甚至整体回滚。打包时：
@@ -406,9 +278,6 @@ EOF
 case "${1:-all}" in
   proot)   fetch_proot ;;
   rootfs)  fetch_rootfs ;;
-  proroot) fetch_proroot ;;          # alpha.69 起固定报"已停用"并返回 1
-  # ⚠️ 关键：all/默认 分支**刻意不含 fetch_proroot**。
-  # 不加参数跑时必须不会把 proroot 五件套灌回来（那正是本次要杜绝的）。
   all|*)   fetch_proot; fetch_rootfs ;;
 esac
 

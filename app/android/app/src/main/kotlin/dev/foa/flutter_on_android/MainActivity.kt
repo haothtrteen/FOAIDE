@@ -66,8 +66,6 @@ class MainActivity : FlutterActivity() {
         const val ASSET_LIBTALLOC = "flutter_assets/assets/tools/libtalloc.so.2"
         const val ASSET_LIBSHMEM = "flutter_assets/assets/tools/libandroid-shmem.so"
         const val LIB_PROOT = "libproot.so" // jniLibs 分发名
-        /** proroot 启动器在 jniLibs 里的分发名（install 时解压到 nativeLibraryDir）。 */
-        const val LIB_PROROOT = "libproroot.so"
         // Step 5 项目工作区迁移：外部存储下用户可见的项目目录名
         // （/storage/emulated/0/Android/data/<pkg>/projects，文件管理器/USB 可见）；
         // 构建位置仍是容器 /root/projects（= filesDir，可执行，W^X 安全）。
@@ -79,52 +77,6 @@ class MainActivity : FlutterActivity() {
         const val NATIVE_GEN_SNAPSHOT_REL = "opt/foa-native/gen_snapshot"
         val NATIVE_BIONIC_BINDS = listOf("/system", "/apex", "/linkerconfig")
 
-        // ---------------- proroot（容器层替代，alpha.61 接入） ----------------
-        // proroot 用 LD_PRELOAD + 二进制补丁替代 proot 的 ptrace 路径翻译，
-        // 省掉每次系统调用的两次上下文切换。**它只优化容器层**：
-        // QEMU 指令翻译与 dart/gradle 计算不受影响。
-        //
-        // ⚠️ 2026-09-21 修正（Bug 471e）：**必须走 jniLibs + nativeLibraryDir。**
-        //
-        // 这里原来写着"放 filesDir/proroot/ 而不是 jniLibs"，理由是
-        // "5 个 .so 里只有 libproroot.so 是启动器、其余是运行时组件，
-        // 混在 jniLibs 里反而要靠 rename 绕过"。**那个理由不成立**：
-        // proot 要 rename 是因为它下载来的文件名是 `proot-arm64`（不匹配
-        // `lib*.so`，Android 会直接忽略不打包）；而 proroot 五件套
-        // **原名就是 `lib*.so`**，全部匹配规则，**一个都不用改名**。
-        //
-        // 真正的问题是：`libproroot.so` 的 `PT_INTERP` 指向
-        // `/system/bin/linker64`，它是 **Android 原生 launcher**，
-        // 由 bionic 加载 —— 这种二进制**必须从 nativeLibraryDir 直接 exec**，
-        // 不能经 glibc 的 `ld-linux` 拉起（那正是 Bug 471 全部假报错的来源）。
-        //
-        // 因此双路径（与 proot 的 findProot 同一套形状）：
-        //   · 优先 nativeLibraryDir/libproroot.so（jniLibs 打包，推荐）
-        //   · 兜底 filesDir/proroot/libproroot.so（「导入 proroot」/ 一键下载）
-        // 注意兜底路径是"手工放置"的，能否直接 exec 取决于文件系统挂载参数
-        // （noexec）；实测以 jniLibs 路径为准。
-        const val PROROOT_DIR = "proroot"
-
-        /** proroot 私有临时目录名（filesDir 下；README 要求可写目录）。 */
-        const val PROROOT_TMP_NAME = "tmp"
-
-        /** guest 侧默认执行体（探针与命令都经 /bin/sh）。 */
-        const val PROROOT_GUEST_SH = "/bin/sh"
-
-        /**
-         * guest 侧 runtime 库的落位路径（rootfs 内）。
-         * 取自作者 andClaw 的 `GUEST_HOOK_LIB_PATH` 常量。
-         */
-        const val PROROOT_GUEST_LIB_REL = "root/.proroot/libproroot-runtime.so"
-
-        /** proroot 需要的 5 个 .so（缺一不可，顺序即加载顺序）。 */
-        val PROROOT_SO_FILES = listOf(
-            "libproroot.so",
-            "libproroot-runtime.so",
-            "libproroot-linker.so",
-            "libproroot-bridge.so",
-            "libproroot-stub-loader.so",
-        )
     }
 
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -140,9 +92,6 @@ class MainActivity : FlutterActivity() {
     private var pendingExportResult: MethodChannel.Result? = null
     private var pendingExportSource: File? = null
     private val exportRequestCode = 0x2003
-    // alpha.61 proroot 导入：目录选择器挂起结果
-    private var pendingProrootResult: MethodChannel.Result? = null
-    private val prorootRequestCode = 0x2004
 
     // alpha.31 构建前台服务：Dart 通道引用（原生 → Dart 反向 invoke：点通知回构建页）
     private var dartChannel: MethodChannel? = null
@@ -181,31 +130,14 @@ class MainActivity : FlutterActivity() {
                             val command = call.argument<String>("command") ?: ""
                             val timeoutSec = (call.argument<Number>("timeoutSec") ?: 180).toLong()
                             val bare = call.argument<Boolean>("bare") == true
-                            val proroot = call.argument<Boolean>("proroot") == true
-                            result.success(exec(command, timeoutSec, bare, proroot))
+                            result.success(exec(command, timeoutSec, bare))
                         }
                         // ---- Step 6 构建：流式执行（长任务，轮询增量输出 + 可取消）----
                         "execStream" -> {
                             val command = call.argument<String>("command") ?: ""
                             val timeoutSec = (call.argument<Number>("timeoutSec") ?: 7200).toLong()
                             val bare = call.argument<Boolean>("bare") == true
-                            val proroot = call.argument<Boolean>("proroot") == true
-                            result.success(execStream(command, timeoutSec, bare, proroot))
-                        }
-                        // ---- proroot 容器层（alpha.61）----
-                        // 四件套：查状态 / 从 SAF 导入 / 清空 / 冒烟测试。
-                        // 冒烟测试必须真跑——proroot 要求 Ubuntu arm64，
-                        // 而本项目用 Debian，属未验证组合，光看文件在不在
-                        // 判断不了能不能用。
-                        "prorootStatus" -> result.success(prorootStatus())
-                        "prorootRemove" -> result.success(prorootRemove())
-                        "prorootProbe" -> result.success(prorootProbe())
-                        // Bug 464：一键下载后从**已知路径**安装（不走文件选择器）。
-                        // Dart 侧已把 5 个 .so 下载到暂存目录，这里复用
-                        // prorootInstall() 的落位逻辑（递归找/拷贝/验 ELF）。
-                        "prorootInstallFromDir" -> {
-                            val p = call.argument<String>("path") ?: ""
-                            result.success(prorootInstall(p))
+                            result.success(execStream(command, timeoutSec, bare))
                         }
                         // ---- Bug 464 · 主题 → 系统栏同步 ----
                         // Dart 侧 ThemeController 切主题后主动推送，原生按
@@ -217,27 +149,6 @@ class MainActivity : FlutterActivity() {
                             val dark = call.argument<Boolean>("dark") == true
                             applySystemBarColors(dark)
                             result.success(true)
-                        }
-                        "prorootImport" -> {
-                            // 走系统目录选择器，用户选一个含 .so 的目录。
-                            // 原生侧不能自己开 Activity 并等结果（会阻塞
-                            // 这个后台线程），所以像 pickInstallFile 那样
-                            // 挂起 result、主线程起 Activity。
-                            pendingProrootResult = result
-                            runOnUiThread {
-                                try {
-                                    val intent = android.content.Intent(
-                                        android.content.Intent.ACTION_OPEN_DOCUMENT_TREE
-                                    )
-                                    intent.addFlags(
-                                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                                    )
-                                    startActivityForResult(intent, prorootRequestCode)
-                                } catch (e: Exception) {
-                                    pendingProrootResult = null
-                                    result.success(fail(-500, "无法打开目录选择器：${e.message}"))
-                                }
-                            }
                         }
                         "execStreamPoll" -> {
                             val id = (call.argument<Number>("id") ?: -1L).toLong()
@@ -721,40 +632,6 @@ class MainActivity : FlutterActivity() {
             }
             return
         }
-        // alpha.61 proroot 导入：用户选了一个**目录**（ACTION_OPEN_DOCUMENT_TREE
-        // 返回的是 tree URI，不是文件），先把整个目录递归拷到应用私有的
-        // 临时区，再交给 prorootInstall 按文件名认领。
-        if (requestCode == prorootRequestCode) {
-            val r = pendingProrootResult
-            pendingProrootResult = null
-            if (resultCode != RESULT_OK || data?.data == null) {
-                r?.success(mapOf("ok" to false, "error" to "已取消选择"))
-                return
-            }
-            val treeUri = data.data!!
-            executor.execute {
-                try {
-                    val stage = File(filesDir, "proroot-import")
-                    stage.deleteRecursively()
-                    stage.mkdirs()
-                    val n = copyTree(treeUri, stage)
-                    if (n == 0) {
-                        r?.success(
-                            mapOf(
-                                "ok" to false,
-                                "error" to "所选目录里没有可读取的文件",
-                            ),
-                        )
-                        return@execute
-                    }
-                    r?.success(prorootInstall(stage.absolutePath))
-                    stage.deleteRecursively()
-                } catch (e: Exception) {
-                    r?.success(mapOf("ok" to false, "error" to "导入失败: ${e.message}"))
-                }
-            }
-            return
-        }
         super.onActivityResult(requestCode, resultCode, data)
     }
 
@@ -763,7 +640,7 @@ class MainActivity : FlutterActivity() {
      *
      * ACTION_OPEN_DOCUMENT_TREE 只给一个 tree URI，里面有什么得自己走
      * DocumentsContract 遍历——不能像普通文件那样 openInputStream 一次搞定。
-     * 拷贝而不是原地读：SAF 的 URI 在子进程里不可读（proroot 只能读真实
+     * 拷贝而不是原地读：SAF 的 URI 在子进程里不可读（容器只能读真实
      * 文件路径），与 Step 3/4 的处理方式一致。
      */
     private fun copyTree(treeUri: Uri, dest: File): Int {
@@ -1031,15 +908,10 @@ class MainActivity : FlutterActivity() {
      * 构建 proot 命令（Step 1 定稿；Step 6 流式执行复用）。
      * proot/rootfs 未就绪时返回 ProotCmd(null, error)。
      *
-     * **`error` 这个字段同时装两种形状的失败 map**，这是故意的、也是有代价的：
-     * - `buildProotCmd()` 走 [fail]（键 `exitCode`/`stdout`/`stderr`）；
-     * - `buildProrootCmd()` 走 [prorootFail]（键 `ok`/`error`）。
-     *
-     * 两条路径的 Dart 侧消费者是同一个方法，靠调用方自己知道该读哪个键——
-     * `exec`/`execStream` 的 `ProotResult.fromMap` 读 `stderr`，而
-     * `prorootProbe()` 的 `ProrootProbeResult.fromMap` 读 `error`。
-     * 混用不会编译报错，只会让错误文案在桥上**静默消失**，UI 退化成
-     * "操作失败了"这种没法排查的兜底文案。改这两个方法时务必对照 Dart 侧。
+     * `error` 的形状是 [fail]（键 `exitCode`/`stdout`/`stderr`），
+     * Dart 侧 `ProotResult.fromMap` 读 `stderr`。
+     * 改这两个方法时务必对照 Dart 侧，否则错误文案会在桥上**静默消失**，
+     * UI 退化成"操作失败了"这种没法排查的兜底文案。
      */
     private data class ProotCmd(
         val cmd: List<String>?,
@@ -1131,583 +1003,32 @@ class MainActivity : FlutterActivity() {
         return if (extra.isEmpty()) base else "$base:$extra"
     }
 
-    // ==================== proroot（容器层替代） ====================
-
-    /** proroot 落位目录（filesDir/proroot，兜底路径）。 */
-    private fun prorootDir(): File = File(filesDir, PROROOT_DIR)
-
-    /**
-     * proroot 启动器定位：**nativeLibraryDir 优先，filesDir 兜底**。
-     *
-     * 与 [findProot] 同一套形状。为什么 nativeLibraryDir 必须先试：
-     * `libproroot.so` 的 `PT_INTERP` 是 `/system/bin/linker64`，它是
-     * Android 原生 launcher，必须从 nativeLibraryDir **直接 exec**。
-     *
-     * @param requireExec 为 true 时只有"可执行"的文件才算命中
-     *   （构建 argv 必须如此；仅做状态展示时可以放宽）。
-     */
-    private fun findProrootLauncher(requireExec: Boolean = true): File? {
-        val fromLibs = File(applicationInfo.nativeLibraryDir, LIB_PROROOT)
-        if (fromLibs.isFile && (!requireExec || fromLibs.canExecute())) return fromLibs
-        val fromFiles = File(prorootDir(), LIB_PROROOT)
-        if (fromFiles.isFile && (!requireExec || fromFiles.canExecute())) return fromFiles
-        return null
-    }
-
-    /**
-     * proroot **运行时库**所在目录（给 `PROROOT_*_PATH` 用）。
-     *
-     * 取"启动器所在的那个目录"——proroot 官方 README 说它会从
-     * `/proc/self/exe` 的 dirname 自动发现四个组件，所以只要启动器和
-     * 组件同目录即可。但作者实现里仍显式给了路径变量（更稳），我们照做。
-     *
-     * ⚠️ **不要把这个目录直接喂给 guest 侧的 linker** —— nativeLibraryDir
-     * 受 SELinux 保护，rootfs 内的 linker 访问不到。需要 guest 侧访问的
-     * 那个库（`libproroot-runtime.so`）必须另复制到 filesDir 与 rootfs 内
-     * （见 [syncProrootRuntimeLib]）。
-     */
-    private fun prorootLibDir(): File =
-        findProrootLauncher(requireExec = false)?.parentFile ?: prorootDir()
-
-    /**
-     * proroot 五件套的可选目录，**按优先级**：nativeLibraryDir 优先、
-     * filesDir/proroot 兜底（与 [findProot] 同一套双路径策略）。
-     */
-    private fun prorootDirs(): List<File> =
-        listOf(File(applicationInfo.nativeLibraryDir), prorootDir())
-
-    /**
-     * 逐个文件在两个目录里找（**逐文件**而非整目录二选一 —— 允许
-     * "jniLibs 里有一半、用户又手工补了另一半"这种混合状态）。
-     */
-    private fun resolveProrootFile(name: String): File? =
-        prorootDirs().map { File(it, name) }.firstOrNull { it.isFile }
-
-    /**
-     * 已落位的 proroot .so（按 [PROROOT_SO_FILES] 顺序）。
-     * 不检查"数量够不够"，而是返回实际存在的列表——由调用方判断完整性，
-     * 这样报错能说清**缺哪几个**，而不是笼统的"没装好"。
-     */
-    private fun prorootPresent(): List<File> =
-        PROROOT_SO_FILES.mapNotNull { resolveProrootFile(it) }
-
-    private fun prorootMissing(): List<String> =
-        PROROOT_SO_FILES.filter { resolveProrootFile(it) == null }
-
-    /** 文件是否是可执行的 ELF（魔数 0x7F 'E' 'L' 'F'）。 */
-    private fun isElf(f: File): Boolean {
-        return try {
-            f.inputStream().use { ins ->
-                val h = ByteArray(4)
-                if (ins.read(h) != 4) return false
-                h[0] == 0x7F.toByte() && h[1] == 'E'.code.toByte() &&
-                    h[2] == 'L'.code.toByte() && h[3] == 'F'.code.toByte()
-            }
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    /**
-     * proroot 就绪状态（供 UI 决定开关能不能开）。
-     *
-     * 返回 map 而不是布尔：UI 要能显示"缺 3 个文件""有 1 个不是 ELF"
-     * 这类可操作的信息，只给一个 false 用户没法自己修。
-     */
-    private fun prorootStatus(): Map<String, Any?> {
-        val present = prorootPresent()
-        val missing = prorootMissing()
-        val notElf = present.filter { !isElf(it) }.map { it.name }
-        // launcher 是否可直接 exec —— 这是 UI 最该显示的一条：
-        // 文件都在但启动器不可执行时，开关必须拦住（Bug 471 的核心修复点）。
-        val launcher = findProrootLauncher(requireExec = false)
-        return mapOf(
-            "ok" to true,
-            "installed" to missing.isEmpty(),
-            "dir" to prorootDir().absolutePath,
-            "libDir" to prorootLibDir().absolutePath,
-            "launcher" to launcher?.absolutePath,
-            "launcherExecutable" to (launcher?.canExecute() ?: false),
-            "launcherFromJniLibs" to
-                (launcher?.parentFile?.absolutePath == applicationInfo.nativeLibraryDir),
-            "present" to present.map { it.name },
-            "missing" to missing,
-            "notElf" to notElf,
-            "abi" to (android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"),
-            "api" to android.os.Build.VERSION.SDK_INT,
-            "rootfsReady" to File(File(filesDir, ROOTFS_REL), "bin/sh").exists(),
-        )
-    }
-
-    /**
-     * 从 SAF 导入的临时目录把 proroot 的 .so 搬进 filesDir/proroot/。
-     *
-     * 为什么不让用户直接拷到 filesDir：Android 11+ 的
-     * /data/data/<pkg> 对文件管理器不可见，用户**没有别的办法**把文件
-     * 放进去。所以走"用户选文件 → 原生拷进来"，与 Step 3 的
-     * 本地安装兜底同一套路。
-     *
-     * 拷完立刻验 ELF 魔数：用户很可能误选了 zip 或 arm64-v8a 之外的构建，
-     * 提前说清比等他打开开关再报 exec format error 好得多。
-     */
-    private fun prorootInstall(srcDirPath: String): Map<String, Any?> {
-        val src = File(srcDirPath)
-        if (!src.isDirectory) return prorootFail(-400, "导入路径不存在：$srcDirPath")
-        val dir = prorootDir().apply { mkdirs() }
-        val copied = mutableListOf<String>()
-        for (name in PROROOT_SO_FILES) {
-            // 递归找同名文件：用户解压后往往多一层目录（proroot-x.y/libproroot.so）
-            val hit = src.walkTopDown().firstOrNull { it.isFile && it.name == name }
-                ?: continue
-            val dst = File(dir, name)
-            hit.copyTo(dst, overwrite = true)
-            dst.setExecutable(true, false)
-            copied.add(name)
-        }
-        val missing = prorootMissing()
-        val bad = prorootPresent().filter { !isElf(it) }.map { it.name }
-        // "error" 在失败时是 String、成功时是 null，所以整个 map 的类型参数必须
-        // 是 Any?。写成 Map<String, Any> 会被 Kotlin 拒绝（Map<String, Any?>
-        // 不能赋给 Map<String, Any>——`in` 位置逆变，值可读作 Any 就要求非空）。
-        return mapOf<String, Any?>(
-            "ok" to (missing.isEmpty() && bad.isEmpty()),
-            "copied" to copied,
-            "missing" to missing,
-            "notElf" to bad,
-            "error" to when {
-                copied.isEmpty() -> "没有在所选目录里找到任何 proroot 文件（${PROROOT_SO_FILES.joinToString()}）"
-                bad.isNotEmpty() -> "以下文件不是可执行的 arm64 ELF，可能是下载损坏或架构不对：${bad.joinToString()}"
-                missing.isNotEmpty() -> "还缺 ${missing.size} 个文件：${missing.joinToString()}"
-                else -> null
-            },
-        )
-    }
-
-    /**
-     * proroot 相关的失败返回。
-     *
-     * **不要用 [fail]**：那个是给 exec/execStream 用的，键名是
-     * `exitCode`/`stdout`/`stderr`，而 Dart 侧 `ProrootInstallResult` /
-     * `ProrootProbeResult` 读的是 `error`。混用会让错误信息在桥上凭空消失，
-     * UI 只能显示"操作失败了"这种没有信息量的兜底文案。
-     */
-    private fun prorootFail(code: Int, message: String): Map<String, Any?> =
-        mapOf("ok" to false, "error" to message, "exitCode" to code)
-
-    /**
-     * 清空 proroot 落位目录（用户想换一个版本/彻底退出时用）。
-     */
-    private fun prorootRemove(): Map<String, Any?> {
-        val dir = prorootDir()
-        val n = if (dir.isDirectory) dir.listFiles()?.size ?: 0 else 0
-        dir.deleteRecursively()
-        return mapOf("ok" to true, "removed" to n)
-    }
-
-    /**
-     * **冒烟测试**：在容器里真的跑一次 proroot。
-     *
-     * 这一步是整个接入的关键——光看"文件在不在"判断不了能不能用，必须真跑。
-     * 测试命令 `uname -a` 只依赖普通系统调用，能过就说明容器层立起来了。
-     *
-     * ⚠️ 2026-09-21 定案：当前失败**不是** rootfs 造成的，而是**加载方式**。
-     *    `libproroot.so` 的 `PT_INTERP` 是 `/system/bin/linker64`，它是
-     *    Android 原生 launcher，须从 `nativeLibraryDir` **直接 exec**；
-     *    本 App 目前是从 filesDir 经 glibc 的 ld-linux 拉起，方式不对。
-     *    正确做法见 [buildProrootCmd] / [applyProrootEnv] 的注释。
-     *
-     * 超时给 25 秒：起不来的情况通常是 linker 直接失败（毫秒级），
-     * 给太久只会让用户干等。
-     */
-    private fun prorootProbe(): Map<String, Any?> {
-        val rootfs = File(filesDir, ROOTFS_REL)
-        if (!File(rootfs, "bin/sh").exists()) {
-            return prorootFail(-403, "rootfs 未安装：请先回主页初始化环境")
-        }
-        val built = buildProrootCmd("uname -a; echo FOA_PROBE_OK")
-        if (built.cmd == null) {
-            // 注意这里**不能** `return built.error!!`：buildProrootCmd 的失败
-            // 结果和 exec 系列的 fail() 是同一套形状（stdout/stderr），
-            // 而 Dart 侧读的是 "error"。直接透传会让错误文案消失。
-            return prorootFail(-402, built.error?.get("error") as? String ?: "proroot 命令构造失败")
-        }
-        // 改造 ④：guest 侧要用的 runtime 库必须先落到 SELinux 可访问的位置，
-        // 否则 rootfs 内的 linker 加载不到它。幂等，失败不阻断（计入输出便于诊断）。
-        val synced = try {
-            syncProrootRuntimeLib()
-        } catch (e: Exception) {
-            listOf("sync-failed: ${e.message}")
-        }
-        return try {
-            val pb = ProcessBuilder(built.cmd)
-            applyProrootEnv(pb)
-            pb.redirectErrorStream(true)
-            val proc = pb.start()
-            val outBuf = StringBuilder()
-            val reader = proc.inputStream.bufferedReader(Charsets.UTF_8)
-            val buf = CharArray(4096)
-            // 边读边判超时：proroot 挂死时 waitFor 会一直等，必须先读后等
-            val deadline = System.currentTimeMillis() + 25_000
-            while (System.currentTimeMillis() < deadline) {
-                if (reader.ready()) {
-                    val n = reader.read(buf)
-                    if (n > 0) outBuf.append(buf, 0, n)
-                } else if (!proc.isAlive) {
-                    // 进程已退出，把剩余读完
-                    try {
-                        val rest = reader.readText()
-                        outBuf.append(rest)
-                    } catch (_: Exception) { }
-                    break
-                } else {
-                    Thread.sleep(50)
-                }
-            }
-            val finished = !proc.isAlive
-            if (!finished) proc.destroyForcibly()
-            val out = outBuf.toString()
-            // Bug 471：失败文案按**证据分诊**，不再给一句通用猜测。
-            //
-            // ⚠️⚠️ 2026-09-21 最终定案：**这些报错的成因是我们自己用错了
-            //     加载器**，不是上游二进制有缺陷。
-            //
-            // 决定性证据（对五件套自写 ELF 解析器实测）：
-            //   libproroot.so 的 PT_INTERP = `/system/bin/linker64`
-            //   —— 即 Android bionic 链接器，它是一个 **Android 原生
-            //      launcher**，必须从 nativeLibraryDir **直接 exec**。
-            //   我们却拿 glibc 的 `ld-linux-aarch64.so.1` 去加载它，
-            //   加载器本身就错了，于是下面这些输出全是**我们自己造出来的**：
-            //
-            //   用错加载器时会看到（历史上被误判为"上游写错"）：
-            //     libproroot.so: error while loading shared libraries:
-            //         libdl.so: cannot open shared object file
-            //     libproroot.so: version `LIBC' not found (required by …)
-            //   真相：在 **Android bionic** 下 `libc.so` / `libdl.so` 都是
-            //   **真实存在的运行时库**（/system/lib64/libc.so、libdl.so），
-            //   不是 glibc 语境的 ld script / 已并入名。上游依赖名没写错，
-            //   是**我们拿 glibc 规则去审 Android 二进制**。
-            //
-            //   作者自己开源的 App（coderredlab/andClaw，ProrootManager.kt）
-            //   给出了正确做法，见下面 prorootInvocation 的注释。
-            //
-            // 因此分诊的**解读**统一改为"加载方式不对"：
-            //   devNameNeeded          → 用错加载器（应 nativeLibraryDir 直接 exec）
-            //   glibcMismatch          → 缺少 PROROOT_* 环境变量 / 库路径没喂对
-            //   linkerPatchSkipped /   → 同上；另外 rootfs 也不在官方
-            //   crashed                  验证环境内（但**不是**卡点）
-            //
-            // ⚠️ **不要**再引导用户"升级 rootfs 试试"—— rootfs 不是当前卡点；
-            //    也**不要**说"上游需重新构建"—— 上游没坏。
-            //
-            // ⚠️ 原生侧**不重复版本常量**（避免两处各说各话），只说结论，
-            //    具体数字由 Dart 侧（ProrootOption）统一给出。
-            val devNameNeeded = out.contains("libdl.so: cannot open") ||
-                out.contains("version `LIBC' not found") ||
-                out.contains("libc.so: invalid ELF header")
-            val glibcMismatch = out.contains("reloc: unresolved")
-            val linkerPatchSkipped = out.contains("no offset table")
-            val crashed = out.contains("SIGSEGV") || out.contains("code 139")
-            mapOf<String, Any?>(
-                "ok" to (finished && out.contains("FOA_PROBE_OK")),
-                "exitCode" to (if (finished) proc.exitValue() else -999),
-                "output" to out.take(4000),
-                "cmd" to built.cmd.joinToString(" "),
-                "launcher" to built.cmd.first(),
-                "syncedRuntimeLib" to synced,
-                "error" to if (!finished) {
-                    "proroot 启动超时（25 秒未返回）。" +
-                        "proroot 是 Android 原生 launcher（`PT_INTERP` 指向 " +
-                        "`/system/bin/linker64`），须从 `nativeLibraryDir` " +
-                        "直接 exec；本 App 尚未接通该集成方式。"
-                } else if (!out.contains("FOA_PROBE_OK")) {
-                    if (devNameNeeded) {
-                        // 用错加载器：拿 glibc 的 ld-linux 去加载一个
-                        // PT_INTERP=/system/bin/linker64 的 Android launcher。
-                        // 报错（libdl.so / version 'LIBC'）是我们自己造成的，
-                        // 不是上游缺陷 —— 实测结论见上面的块注释。
-                        "proroot 加载失败（见下输出中的 `libdl.so` / " +
-                            "`version 'LIBC'`）。" +
-                            "**这不是上游二进制的问题**：`libproroot.so` 的 " +
-                            "`PT_INTERP` 指向 `/system/bin/linker64`，它是一个 " +
-                            "**Android 原生 launcher**，必须从 `nativeLibraryDir` " +
-                            "**直接 exec**，而不是用 glibc 的 " +
-                            "`ld-linux-aarch64.so.1` 去加载。" +
-                            "本 App 目前还没接通这套集成方式，所以现在启用会失败。" +
-                            "**rootfs 不是卡点** —— 参考作者开源实现（andClaw）" +
-                            "已确认正确做法：jniLibs 打包 + 6 个 `PROROOT_*` " +
-                            "环境变量 + SELinux 路径处理 + " +
-                            "`-b <host>:<guest>` 参数形式。"
-                    } else if (glibcMismatch) {
-                        // 加载方式不对的下游症状：库路径 / 环境变量没喂对，
-                        // 运行期重定位解析不了。
-                        "proroot 启动后重定位失败（见下输出中的 `reloc: unresolved`）。" +
-                            "文件本身是完好的（哈希已校验）。" +
-                            "**这不是版本错配**：`libproroot.so` 是 Android 原生 " +
-                            "launcher（`PT_INTERP` = `/system/bin/linker64`），" +
-                            "需要从 `nativeLibraryDir` 直接 exec，并把 " +
-                            "`PROROOT_LIB_PATH` / `PROROOT_LINKER_PATH` / " +
-                            "`PROROOT_TRAMPOLINE_PATH` / `PROROOT_ROOTFS` / " +
-                            "`PROROOT_GUEST_EXE` / `PROROOT_TMP_DIR` 六个环境变量" +
-                            "喂给运行时库。本 App 还没做到这一点，所以换个版本也一样。"
-                    } else if (linkerPatchSkipped || crashed) {
-                        // 根因还是"加载方式不对"。
-                        // **不要**引导"换个版本"或"升级 rootfs"——两条都不是解药，
-                        // 缺的是 nativeLibraryDir 直接 exec 这套集成方式。
-                        "proroot 已崩溃（见下输出中的 `no offset table` 与 SIGSEGV）。" +
-                            "linker 没有为本机环境准备内部结构体偏移表，补丁全部跳过，" +
-                            "运行期取到错误布局后解引用崩溃。" +
-                            "**这与版本高低无关**，也**不是**上游缺陷 —— 根因是" +
-                            "`libproroot.so` 必须从 `nativeLibraryDir` **直接 exec**" +
-                            "（它是 `PT_INTERP` 指向 `/system/bin/linker64` 的 " +
-                            "Android 原生 launcher），本 App 尚未接通该方式。" +
-                            "rootfs 也**不必**先换 —— 先接通集成方式再实测。"
-                    } else {
-                        "proroot 进程退出了但没跑通命令，输出见下。"
-                    }
-                } else null,
-            )
-        } catch (e: Exception) {
-            mapOf<String, Any?>(
-                "ok" to false,
-                "error" to "启动 proroot 失败：${e.message}",
-                "cmd" to built.cmd.joinToString(" "),
-            )
-        }
-    }
-
-    /**
-     * proroot 进程需要的环境（改造 ③，2026-09-21 接通）。
-     *
-     * 两个来源交叉验证：
-     *  · **官方 README** 点名要求 `PROROOT_TMP_DIR`（Android app 进程里必须
-     *    指向应用私有可写目录）；
-     *  · **作者开源实现**（andClaw `ProrootManager.kt:711-717`）另设了
-     *    `LIB_PATH` / `LINKER_PATH` / `TRAMPOLINE_PATH` / `ROOTFS` / `GUEST_EXE`。
-     *
-     * 关于后五个：README 说启动器会从 `/proc/self/exe` 的 dirname **自动发现**
-     * 组件，所以同目录时理论上不必显式设。但作者既然显式设了，我们就跟着设 ——
-     * **显式路径比依赖自动发现更稳**，且成本为零。
-     *
-     * ⚠️ **不给 guest 侧喂前五个变量里的路径** —— 这些路径指向
-     * nativeLibraryDir，受 SELinux 保护，rootfs 内的 linker 访问不到。
-     * guest 侧要用的那个库由 [syncProrootRuntimeLib] 复制到可访问位置。
-     * 这五个变量是给 **launcher 自己**（宿主侧进程）读的，不跨 SELinux 边界。
-     */
-    private fun applyProrootEnv(pb: ProcessBuilder) {
-        val env = pb.environment()
-        val libDir = prorootLibDir()
-        val rootfs = File(filesDir, ROOTFS_REL)
-        val tmpDir = File(filesDir, PROROOT_TMP_NAME).apply { mkdirs() }
-
-        // proroot 的运行时组件在同目录，靠自身 rpath + 这里兜底
-        env["LD_LIBRARY_PATH"] = libDir.absolutePath + ":" + libraryPath()
-
-        // 临时目录重定向到应用私有可写目录
-        env["TMPDIR"] = tmpDir.absolutePath
-        env["TERM"] = "dumb"
-        // PROOT_TMP_DIR 无害且同名字段广为人知，两个都留
-        env["PROOT_TMP_DIR"] = tmpDir.absolutePath
-
-        // —— 六个 PROROOT_*（改造 ③ 的核心）——
-        env["PROROOT_TMP_DIR"] = tmpDir.absolutePath
-        env["PROROOT_ROOTFS"] = rootfs.absolutePath
-        // guest 侧要执行的东西：探针/命令都经 /bin/sh，故指向它
-        env["PROROOT_GUEST_EXE"] = PROROOT_GUEST_SH
-        // 三个组件路径（用 resolveProrootFile 保证与 launcher 同一目录）
-        resolveProrootFile("libproroot-runtime.so")?.let {
-            env["PROROOT_LIB_PATH"] = it.absolutePath
-        }
-        resolveProrootFile("libproroot-linker.so")?.let {
-            env["PROROOT_LINKER_PATH"] = it.absolutePath
-        }
-        resolveProrootFile("libproroot-stub-loader.so")?.let {
-            env["PROROOT_TRAMPOLINE_PATH"] = it.absolutePath
-        }
-        // 诊断开关（作者实现里也用；出问题时日志能落到指定文件）
-        env["PROROOT_LOG_APPEND"] = File(tmpDir, "proroot.log").absolutePath
-    }
-
-    /**
-     * 改造 ④ —— SELinux：把 guest 侧需要的 runtime 库放到**可访问**的位置。
-     *
-     * 问题：`libproroot-runtime.so` 是要被 rootfs 内的 linker 以 LD_PRELOAD
-     * 加载的，但它和 launcher 一起放在 `nativeLibraryDir` 时，
-     * **SELinux 会拒绝 guest 侧访问**（nativeLibraryDir 的标签是
-     * `apk_data_file` 一类，rootfs 里跑的进程取不到）。
-     *
-     * 作者做法（andClaw `ProrootManager.kt:143-152`）双份：
-     *   ① `filesDir/libproroot-runtime.so` —— 宿主侧 LD_PRELOAD 用
-     *   ② `rootfs/root/.proroot/libproroot-runtime.so` —— guest 侧用
-     *
-     * 本函数幂等：每次启动 proroot 前调用，源文件比目标新才复制。
-     *
-     * @return 复制/更新过的目标路径（供诊断输出）
-     */
-    private fun syncProrootRuntimeLib(): List<String> {
-        val src = resolveProrootFile("libproroot-runtime.so")
-        val rootfs = File(filesDir, ROOTFS_REL)
-        // rootfs 未就绪时只做宿主侧那份（避免无谓地 mkdir 出半截目录）
-        val rootfsReady = File(rootfs, "bin/sh").exists()
-        if (src == null) return emptyList()
-
-        val targets = mutableListOf<File>()
-        // ① filesDir（宿主侧）
-        targets.add(File(filesDir, "libproroot-runtime.so"))
-        // ② rootfs 内（guest 侧；路径取自作者的 GUEST_HOOK_LIB_PATH）
-        if (rootfsReady) targets.add(File(rootfs, PROROOT_GUEST_LIB_REL))
-
-        val done = mutableListOf<String>()
-        for (dst in targets) {
-            // 幂等：目标存在、且不小于源文件（时间戳不可靠时用大小兜底）就跳过
-            if (dst.isFile && dst.length() == src.length()) continue
-            dst.parentFile?.mkdirs()
-            src.copyTo(dst, overwrite = true)
-            dst.setReadable(true, false)
-            done.add(dst.absolutePath)
-        }
-        return done
-    }
-
-    /**
-     * 构建 proroot 命令。
-     *
-     * ⚠️ 2026-09-21 修正：下面这段**旧描述是错的**，保留作对照。
-     *    旧文写"proroot 不需要显式 -b /dev 等（bridge 组件自动处理关键挂载）"，
-     *    并给了 `libproroot.so -r <rootfs> -0 --link2symlink -w /root …`。
-     *    作者开源实现（andClaw，ProrootManager.kt:581-592）给的是**相反**的写法：
-     *
-     *      libproroot.so -r <rootfs>
-     *        -b /dev:/dev  -b /proc:/proc  -b /sys:/sys
-     *        -b /dev/urandom:/dev/random
-     *        -b <cacheDir>/shm:/dev/shm
-     *        -w /root --link2symlink /bin/sh -c '<command>'
-     *
-     *    两点关键差异：
-     *    ① `-b` 是 **host:guest** 形式（`/dev:/dev`），不是单路径；
-     *       proot 用单路径，proroot 用冒号对 —— 抄错了就是挂载错位。
-     *    ② proroot 分支**不带 `-0`**（`-0` 是 proot 分支的事）。
-     *
-     *    最根本的还有一条：`libproroot.so` 的 `PT_INTERP` 是
-     *    `/system/bin/linker64`，它是 **Android 原生 launcher**，
-     *    必须从 `nativeLibraryDir` **直接 exec**（改造 ②，已实施）——
-     *    这就是 Bug 471 全部报错的真正来源。
-     *
-     * 与 proot 路径一致的部分仍然复用：resolv.conf 幂等修正、foa-env.sh
-     * 加载、"原生 gen_snapshot 落位就挂 bionic 目录"。
-     */
-    private fun buildProrootCmd(command: String): ProotCmd {
-        val missing = prorootMissing()
-        if (missing.isNotEmpty()) {
-            return ProotCmd(
-                null,
-                prorootFail(
-                    -404,
-                    "proroot 未就绪：缺少 ${missing.size} 个文件（${missing.joinToString()}）。\n" +
-                        "请在「工具链」页用「导入 proroot」把这 ${PROROOT_SO_FILES.size} 个 .so 放进应用。",
-                ),
-            )
-        }
-        val launcher = findProrootLauncher()
-            ?: return ProotCmd(
-                null,
-                prorootFail(
-                    -404,
-                    "proroot 启动器不可用：既不在 nativeLibraryDir" +
-                        "（jniLibs 未打包 ${LIB_PROROOT}）也不在 " +
-                        "${prorootDir().absolutePath}。" +
-                        "请用「导入 proroot」放入 ${PROROOT_SO_FILES.size} 个 .so，" +
-                        "或重新构建 APK（tools/fetch_assets.sh proroot）。",
-                ),
-            )
-        val rootfs = File(filesDir, ROOTFS_REL)
-        if (!File(rootfs, "bin/sh").exists()) {
-            return ProotCmd(null, prorootFail(-403, "rootfs 未安装：请回到主页点击「初始化环境」。"))
-        }
-
-        // 与 proot 完全同款的两段注入（原因见 buildProotCmd 注释）
-        val boot = "if ! grep -qE '^nameserver (223\\.5\\.5\\.5|119\\.29\\.29\\.29|8\\.8\\.8\\.8|114\\.114\\.114\\.114|1\\.1\\.1\\.1)' /etc/resolv.conf 2>/dev/null; then printf 'nameserver 223.5.5.5\\nnameserver 119.29.29.29\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf; fi; [ -f /etc/profile.d/foa-env.sh ] && . /etc/profile.d/foa-env.sh; "
-
-        // ⚠️ argv 与 proot **不一样**，两处关键差异（照抄作者 andClaw
-        //    ProrootManager.kt:581-592 的实测写法）：
-        //    ① `-b` 用 **host:guest** 冒号对形式（proot 用单路径）；
-        //    ② **不带 `-0`** —— `-0` 是 proot 分支的参数，proroot 分支没有。
-        //    另外 `/dev/shm` 要绑到一个**应用可写**目录（cacheDir/shm），
-        //    不能绑宿主 /dev/shm（权限不足）。
-        val shmDir = File(cacheDir, "shm").apply { mkdirs() }
-        val argv = mutableListOf(
-            launcher.absolutePath,
-            "-r", rootfs.absolutePath,
-            "-b", "/dev:/dev",
-            "-b", "/proc:/proc",
-            "-b", "/sys:/sys",
-            "-b", "/dev/urandom:/dev/random",
-            "-b", "${shmDir.absolutePath}:/dev/shm",
-            "-w", "/root",
-            "--link2symlink",
-        )
-        // 原生 bionic gen_snapshot 落位时才挂 Android 运行时目录
-        // （原因同 proot：bionic 二进制的 INTERP 指向 /system/bin/linker64）
-        if (File(rootfs, NATIVE_GEN_SNAPSHOT_REL).exists()) {
-            for (p in NATIVE_BIONIC_BINDS) {
-                if (File(p).exists()) {
-                    // ⚠️ proroot 是 host:guest 形式；这里源与目标同路径
-                    argv.add("-b")
-                    argv.add("$p:$p")
-                }
-            }
-        }
-        argv.addAll(
-            listOf(
-                "/usr/bin/env", "-i",
-                "HOME=/root", "TERM=dumb",
-                "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin",
-                "/bin/sh", "-c", boot + command,
-            )
-        )
-        return ProotCmd(argv, null)
-    }
-
     private fun exec(
         command: String,
         timeoutSec: Long,
         bare: Boolean = false,
-        proroot: Boolean = false,
     ): Map<String, Any?> {
         val start = System.currentTimeMillis()
         if (bare) return execBare(command, timeoutSec)
-        val built = if (proroot) buildProrootCmd(command) else buildProotCmd(command)
-        // 走 proot 路径时 error 是 fail() 形状（Dart 侧读 stderr），
-        // 走 proroot 路径时是 prorootFail() 形状（Dart 侧读 error）——
-        // 两侧消费者确实不同（见 ProotCmd 注释），所以这里原样透传。
+        val built = buildProotCmd(command)
         if (built.cmd == null) return built.error ?: fail(-500, "命令构造失败（无错误详情）")
 
         return try {
             val pb = ProcessBuilder(built.cmd)
-            if (proroot) {
-                // proroot 不是 ptrace，不需要 PROOT_LOADER / libtalloc /
-                // libandroid-shmem 那一套（它靠 LD_PRELOAD 做路径翻译）。
-                // 改造 ④：guest 侧 runtime 库要先落到 SELinux 可访问位置
-                // （幂等；失败不阻断，交给 proroot 自己报错更有信息量）。
-                try {
-                    syncProrootRuntimeLib()
-                } catch (_: Exception) { }
-                applyProrootEnv(pb)
-            } else {
-                // Termux 构建的 proot 默认 loader 路径指向 com.termux 包，
-                // 用 PROOT_LOADER 重定向到本应用私有目录（实测有效）。
-                findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
-                // Bug 210：proot 的 DT_NEEDED 含 libtalloc.so.2 / libandroid-shmem.so，
-                // Android 系统目录没有这两个库 → 注入 LD_LIBRARY_PATH 让 linker
-                // 到 filesDir/tools 找（对主二进制的依赖查找同样生效）。
-                // 若落位了 bionic 原生产物，还会追加 Android 运行时库目录（见 libraryPath）。
-                pb.environment()["LD_LIBRARY_PATH"] = libraryPath()
-                // Bug 211：Termux 版 proot 编译时把临时目录硬编码为
-                // /data/data/com.termux/files/usr/tmp/，其他应用无写权限 →
-                // proot error: can't create glue rootfs。PROOT_TMP_DIR 重定向到
-                // 本应用私有可写目录（proot 官方推荐做法，日志也这么提示）。
-                val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
-                pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
-            }
+            // Termux 构建的 proot 默认 loader 路径指向 com.termux 包，
+            // 用 PROOT_LOADER 重定向到本应用私有目录（实测有效）。
+            findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
+            // Bug 210：proot 的 DT_NEEDED 含 libtalloc.so.2 / libandroid-shmem.so，
+            // Android 系统目录没有这两个库 → 注入 LD_LIBRARY_PATH 让 linker
+            // 到 filesDir/tools 找（对主二进制的依赖查找同样生效）。
+            // 若落位了 bionic 原生产物，还会追加 Android 运行时库目录（见 libraryPath）。
+            pb.environment()["LD_LIBRARY_PATH"] = libraryPath()
+            // Bug 211：Termux 版 proot 编译时把临时目录硬编码为
+            // /data/data/com.termux/files/usr/tmp/，其他应用无写权限 →
+            // proot error: can't create glue rootfs。PROOT_TMP_DIR 重定向到
+            // 本应用私有可写目录（proot 官方推荐做法，日志也这么提示）。
+            val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
+            pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
             val proc = pb.start()
             // 双线程读流，防止管道缓冲区满导致死锁
             // 注意：submit 的 lambda 在 Callable/Runnable 重载间有歧义（Kotlin 2.4 报
@@ -1830,7 +1151,6 @@ class MainActivity : FlutterActivity() {
         command: String,
         timeoutSec: Long,
         bare: Boolean = false,
-        proroot: Boolean = false,
     ): Map<String, Any?> {
         if (bare) {
             // Termux 裸原生模式：同样走流式通道，但不套 proot
@@ -1867,21 +1187,14 @@ class MainActivity : FlutterActivity() {
                 fail(-500, "启动 bare 命令失败: ${e.message}")
             }
         }
-        val built = if (proroot) buildProrootCmd(command) else buildProotCmd(command)
-        // 走 proot 路径时 error 是 fail() 形状（Dart 侧读 stderr），
-        // 走 proroot 路径时是 prorootFail() 形状（Dart 侧读 error）——
-        // 两侧消费者确实不同（见 ProotCmd 注释），所以这里原样透传。
+        val built = buildProotCmd(command)
         if (built.cmd == null) return built.error ?: fail(-500, "命令构造失败（无错误详情）")
         return try {
             val pb = ProcessBuilder(built.cmd)
-            if (proroot) {
-                applyProrootEnv(pb)
-            } else {
-                findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
-                pb.environment()["LD_LIBRARY_PATH"] = libraryPath()
-                val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
-                pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
-            }
+            findLoader()?.let { pb.environment()["PROOT_LOADER"] = it.absolutePath }
+            pb.environment()["LD_LIBRARY_PATH"] = libraryPath()
+            val tmpDir = File(filesDir, "tmp").apply { mkdirs() }
+            pb.environment()["PROOT_TMP_DIR"] = tmpDir.absolutePath
             pb.redirectErrorStream(true) // 合并：gradle/flutter 多线程输出交错，单流保时序
             val proc = pb.start()
             val id = streamSeq.incrementAndGet()

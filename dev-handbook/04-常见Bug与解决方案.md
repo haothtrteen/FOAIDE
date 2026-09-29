@@ -11658,3 +11658,86 @@ if [[ -n "${ROOTFS_URL:-}" ]]; then ... else
 > **③ 区分"可再生"和"丢了就没了"。**
 > 打包时这是唯一的分类标准。产物 2.8GB 全可删；
 > 75MB 的 rootfs 反而是最不该删的那个。
+
+### 19.6 移除 proroot：一个"从未投入使用"的抽象该怎么拆（2026-09-30）
+
+**决策依据**（四条同时成立才敢删）：默认关闭、上游 `libproroot.so` 是
+**Proprietary**、alpha.69 起下载入口已停用（`fetch_proroot` 固定报错返回 1）、
+Debian 12/13 上实测不可用（Bug 471 系列）。**从未投入使用**是决定性的一条。
+
+**删除清单（实测）**：
+
+| 类别 | 内容 | 量 |
+| --- | --- | --- |
+| 整文件删除 | `proroot_option.dart` / `proroot_download.dart` / 3 个专属测试 / 许可决策文档 | 6 个 |
+| lib 引用点 | toolchain_page / about_info / termux_backend / build_runner / proot_bridge / models / native_events / theme / onboarding | 9 个 |
+| 原生 | 两份 `MainActivity.kt`（含 5 个 MethodChannel handler + `onActivityResult` 分支） | 约 1500 行 |
+| 脚本 | `fetch_assets.sh`（437→305 行）/ `setup_android.sh` | 2 个 |
+| 文档 | README 两节 / `THIRD-PARTY-NOTICES.md` 整节 / `.gitignore` | 3 处 |
+| 测试 | `about_info_test` / `bug464_...` / `native_events_test` 中的相关用例 | 3 个 |
+
+**关键洞察：抽象是跟着需求来的，需求没了抽象就该消失。**
+`BuildBackend`（proot/termux，决定"在不在容器里"）与 `ContainerLayer`
+（proot/proroot，决定"进容器用哪套路径翻译"）是**正交**的两个维度 ——
+后者只为 proroot 存在。删掉 proroot 后 `ContainerLayer` 只剩一个枚举值，
+`ContainerPrefs`（`foa-container.json`）也就没有持久化意义了，**连同删掉**。
+如果只删二进制、留着枚举，那份代码会变成"永远走 else 分支"的死路。
+
+**连带死亡代码（不删会报错）**：Kotlin 的 `isElf`、Dart 的 `_strList`
+只被 proroot 路径使用，留着直接触发 `unused_element`。
+**删大块功能时，最后一轮要专门跑一遍"谁还在用你"的反向搜索。**
+
+**踩坑 ①：改函数签名别只替换参数行。**
+`build_runner.dart` 的 `clean()` 把 `ContainerLayer layer = ...,` 删掉后
+残留了 `})`，编译报 6 个 error（`Expected to find ')'` / `missing_function_body`）。
+正确做法是把整段签名 `replaced` 成 `) async {`。
+
+**踩坑 ②：改 shell 脚本别用跨行贪婪正则。**
+`fetch_assets.sh` 用 `(?!#\s+- )[^\n]*\n)*` 这类模式删块，结果把文件
+**从 437 行截断到 19 行**。`git checkout --` 还原后改用**逐行锚点切片**
+（`find`/`index` 定位 `fetch_proot(`、`case` 等锚点再切），
+改完用 `wc -l` + `bash -n` 双验。
+
+**验证（全绿）**：
+- `flutter analyze lib/` → No issues found
+- `flutter test` → **1691 全过**（原 1781，减 90）
+- `sync_platform.sh` → 两份 `MainActivity.kt` 一致
+- Kotlin 括号平衡 `{ 377 / } 377`，`grep -ci proroot` = 0
+- **真机构建**：`flutter build apk --debug` 成功出包 136MB，
+  APK 内 `unzip -l | grep -i proroot` = **0 处**，`libproot.so` 保留
+
+### 19.7 沙箱构建：Gradle `Remote host terminated the handshake` 怎么绕（2026-09-30）
+
+**现象**：`flutter build apk` 挂在依赖解析，报
+`Could not resolve io.flutter:arm64_v8a_debug:...` →
+`The server may not support the client's requested TLS protocol versions` →
+`Remote host terminated the handshake`。
+
+**第一个要排除的误判：这不是代码错误。**
+判据是**错误全部发生在依赖解析阶段，压根没进 Kotlin 编译**。
+刚删完 1500 行 Kotlin 时看到 BUILD FAILED 很容易往代码上想，先看错误位置。
+
+**定位网络**：
+```bash
+curl https://repo.maven.apache.org/maven2/ → (35) SSL_ERROR_SYSCALL  # 被掐
+curl https://dl.google.com/dl/android/     → (35) SSL_ERROR_SYSCALL  # 被掐
+curl https://maven.aliyun.com/repository/  → 404（说明能连通）
+```
+
+**坑：换国内镜像救不了这个 artifact。**
+阿里云的 `google` / `central` 镜像里**没有** `io.flutter:*`
+（Flutter engine 不在 Maven Central 分发），实测 404。
+
+**解法：把 Gradle 缓存里已有的 aar 摊进 `android/local-maven/`**
+（`settings.gradle.kts` 已把它挂成兜底仓库，配 `PREFER_SETTINGS`）。
+`local-maven/README.md` 里的命令原本只摊了 **release** 两个：
+
+```bash
+for art in arm64_v8a_release flutter_embedding_release; do ... done
+```
+
+**构建 debug 变体时会缺 debug 两个** → 必须把
+`arm64_v8a_debug` / `flutter_embedding_debug` 也摊进去。
+注意 debug 的 engine jar 是 **180MB**（release 只有 42MB），
+该目录被 `.gitignore` 和打包排除清单双向排除，**不会进仓库也不会进交付包**。
+摊完后 `flutter build apk --debug --target-platform=android-arm64` 一次通过。

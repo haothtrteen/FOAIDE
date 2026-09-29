@@ -49,57 +49,6 @@
   要求运行环境 glibc 2.36+ 与 GLIBCXX_3.4.30+——本项目 rootfs 正是 Debian 12 bookworm，
   满足；minbase 缺省没有 `libstdc++6`，落位流程会自动 apt 补上。
 
-## 可选启用（不代分发）
-
-| 组件 | 版本 | 许可证 | 状态 | 来源 |
-|---|---|---|---|---|
-| proroot（proot 的闭源替代，容器层加速） | v1.2.5 | **Proprietary**：_"Proprietary. Free to use in your projects. Redistribution of modified binaries is not permitted."_ | **不再随包**（alpha.69 起，见下）：五件套 `.so` 已从 APK 移除，「一键下载」入口同时下架。仅保留「从本地导入」——用户自行取得合法副本后落位到 `filesDir`；默认关闭 | https://github.com/coderredlab/proroot |
-
-> **版本号订正（alpha.69）**：此处此前写 `v1.2.8`，与代码里实际钉死的
-> `ProrootOption.pinnedVersion = 'v1.2.5'` 不符（`soAssets` 的五条
-> sha256 也是按 v1.2.5 的产物算的）。以代码为准 —— 现已同步为 `v1.2.5`。
-> 这个不一致本身不造成合规问题（两种情况都不分发二进制），但它会让
-> "钉死版本与校验和"这条论证失去可复核性，故一并订正。
-
-**不代分发二进制的原因**（完整论证见 `dev-handbook/05-许可证合规.md`）：
-上游许可明确写"Redistribution of modified binaries is not permitted",
-且 proroot 的 `.so` 是**打过补丁的**（这正是它绕过 ptrace 的手段），
-因此包含在本项目 APK 里再分发属于"分发修改过的二进制"，**不被许可允许**。
-故实现为：用户自己从上游取 → 通过系统目录选择器导入到 App 私有目录 →
-本 App 只负责调用。许可本身允许最终用户使用——限制的是我们代为分发。
-
-**alpha.69：口径收紧为「方案 A —— 完全不提供二进制」**：
-
-决策全文见仓库根目录 `PROROOT-许可与分发决策.md`。要点：
-
-1. **五件套 `.so` 从 APK 移除**（此前 alpha.63~68 曾打包进
-   `jniLibs/arm64-v8a/`）。移除后 `unzip -l` 查不到任何 proroot 条目，
-   `tools/verify_apk.sh` 的第 4 项由"必然判红"变为"必然通过"。
-2. **「一键下载」入口下架**。此前的口径（下文 alpha.63 段）认为
-   "运行时在用户设备上获取"不构成再分发——法律定性本身未被推翻，
-   但**判断依据太依赖解释**：一旦上游认为"提供直链引导下载"也算代分发，
-   争辩成本远高于收益，而该功能的实际用户极少。故主动收口。
-3. **只保留「从本地导入」**。用户若持有合法副本，可按文档放入
-   `filesDir`（或手工放回 `jniLibs/arm64-v8a/`），App 侧的集成改造
-   （`PROROOT_*` 环境变量、runtime 库复制、`-b host:guest` 参数形式、
-   从 `nativeLibraryDir` 直接 exec）**全部保留未回退**，
-   原生侧仍是完整可用的一条路径。
-4. **加了三道防复活闸**，避免将来有人"顺手"把二进制加回来：
-   `ProrootOption.soFiles` / `soAssets` 置空（有单测盯着）、
-   `tools/fetch_assets.sh` 的 `fetch_proroot` 改为固定报错返回 1
-   且 `all` 分支刻意不调用它、`tools/setup_android.sh` 删除自动补拉。
-
-**alpha.63「一键下载」的历史合规口径**（已随 alpha.69 下架，留档备查）：
-
-当时的论证是——运行时在用户设备上获取、按字节原样下载不做任何修改、
-钉死版本与校验和使"传递的就是上游那一份"可被验证，故不改变"不代分发"
-的法律定性。这三条本身仍站得住，**下架的理由是风险收益比**，不是推翻它。
-
-另需注意（技术判断，非合规判断）：源码未公开（无法自审自修）、
-官方要求 Ubuntu arm64 rootfs 而本项目是 Debian bookworm（未验证组合）、
-且它只优化容器层**对 QEMU 指令翻译零改善**，不构成真正的构建提速。
-所以默认不启用，并在卡片上如实说明。
-
 ## 通用说明
 
 - GPL-2.0 组件（proot）以**独立进程**方式调用，与本项目代码不构成静态/动态链接；

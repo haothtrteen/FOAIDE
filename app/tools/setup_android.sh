@@ -7,7 +7,6 @@
 #   2. 用 platform/android/ 下的定制文件覆盖 MainActivity / Manifest
 #   3. 自动把 targetSdk 改为 28（W^X 限制，详见 SETUP_ANDROID.md）
 #   4. 把 proot 放入 jniLibs（lib*.so，必须走 nativeLibraryDir）
-#      ⚠️ proroot 五件套自 alpha.69 起不再内置（上游许可禁止再分发）
 #
 # android/ 目录首次生成后纳入 git；本脚本只需运行一次。
 # ============================================================
@@ -85,19 +84,6 @@ else
   echo "   ⚠️ assets/tools/proot-arm64 不存在，先运行 ./tools/fetch_assets.sh proot 再重跑本脚本"
 fi
 
-# proroot 五件套（Bug 471e）**alpha.69 起不再内置**。
-#
-# 原因：上游许可是 Proprietary，禁止再分发二进制，故五件套已从 APK 移除
-# （tools/verify_apk.sh 第 4/5 项会检查 APK 内不得含 proroot）。
-#
-# 这里**刻意不再自动补拉** —— 原逻辑是"检测缺失就调 fetch_assets.sh proroot"，
-# 那会把不该分发的二进制灌回 jniLibs/ 并随 APK 打包。
-# 注意本块**不能 exit 1**：proroot 缺失在新方案下是**正常状态**，
-# 不该阻断任何人搭环境（proot 路径完全不受影响）。
-#
-# 用户如持有合法副本，可自行导入：App 内卡片「从本地导入」，
-# 或手工放到 $JNILIB_DIR。详见 PROROOT-许可与分发决策.md 方案 A。
-echo "   ℹ️  proroot 五件套不再内置打包（方案 A：用户自行导入）；proot 路径不受影响。"
 
 echo ""
 echo "✅ android 壳就绪。下一步："

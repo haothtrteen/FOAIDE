@@ -4,20 +4,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:foaide/core/theme.dart';
 import 'package:foaide/mcp/cloudflared_install.dart';
-import 'package:foaide/mcp/proroot_download.dart';
-import 'package:foaide/toolchain/proroot_option.dart';
 import 'package:foaide/toolchain/sdk_downloader.dart';
 
-/// Bug 464：四件事一起修——
+/// Bug 464：三件事一起修——
 /// ① 顶栏与状态栏颜色不同步（Android 15+ 上 Dart 侧设色失效，
 ///    而 Kotlin 兜底读的是**系统**主题，与 App 主题可不一致）；
 /// ② 部分 UI 控件硬编码颜色，切主题后对比度错误；
-/// ③ cloudflared 下载失败无法定位（失败原因在 `_probe` 里被吞掉）；
-/// ④ proroot 只能手动导入，缺一键从 GitHub 拉取。
+/// ③ cloudflared 下载失败无法定位（失败原因在 `_probe` 里被吞掉）。
 ///
-/// 这组测试守的是**契约**：颜色必须同源、下载源必须 arm64 且带校验、
-/// proroot 的 5 个文件清单必须与上游一致。单测验不了真机渲染，
-/// 但能拦住"改了 Dart 忘了同步 Kotlin / 忘了同步模板"这类高复发失误。
+/// （原本还有第 ④ 条「proroot 一键拉取」，已随 proroot 功能整体移除而删除。）
+///
+/// 这组测试守的是**契约**：颜色必须同源、下载源必须 arm64 且带校验。
+/// 单测验不了真机渲染，但能拦住"改了 Dart 忘了同步 Kotlin / 忘了同步模板"
+/// 这类高复发失误。
 void main() {
   // ---------------- ① 主题 → 系统栏同步 ----------------
 
@@ -234,93 +233,6 @@ void main() {
       expect(probes.first.ok, isFalse);
       expect(probes.first.error, isNotNull,
           reason: '原地实现里 catch(_) 把原因吞了，只剩"全部失败"');
-    });
-  });
-
-  // ---------------- ④ proroot 一键拉取 ----------------
-
-  group('Bug 464 · proroot 一键拉取契约', () {
-    test('资产清单已清空（alpha.69 方案 A：不代分发，两条清单必须一致）', () {
-      // 原断言是"恰好 5 个且与 soFiles 同名"。上游许可禁止再分发后
-      // 五件套已从 APK 移除，两条清单都应为空 **且仍然一致** ——
-      // "一致"这个不变式保留下来，防止将来只改一处。
-      expect(ProrootOption.soAssets, isEmpty);
-      final fromAssets = ProrootOption.soAssets.map((e) => e.name).toSet();
-      final fromOption = ProrootOption.soFiles.toSet();
-      expect(fromAssets, equals(fromOption),
-          reason: '两边不一致会导致"下载了但落位说缺文件"');
-      expect(fromOption, isEmpty, reason: '不应再有内置二进制');
-    });
-
-    test('每个资产都有正字节数与合法 sha256（钉死内容）', () {
-      for (final a in ProrootOption.soAssets) {
-        expect(a.size, greaterThan(0), reason: '${a.name} 尺寸为占位值');
-        expect(RegExp(r'^[0-9a-f]{64}$').hasMatch(a.sha256), isTrue,
-            reason: '${a.name} 的 sha256 非法');
-      }
-    });
-
-    test('不再提供下载入口（不代分发的直接体现）', () {
-      // alpha.69：清单为空 → 没有任何可下载的资产。
-      // 这条替代了原本"每个文件都配了多个镜像"的断言 ——
-      // 那个不变式在不再分发的前提下已无意义。
-      expect(ProrootOption.soAssets, isEmpty);
-      expect(ProrootOption.totalBytes, 0);
-    });
-
-    test('下载地址走 raw 域名（避开 GitHub API 的速率限制）', () {
-      final url = ProrootOption.rawUrl('libproroot.so');
-      expect(url.contains('raw.githubusercontent.com'), isTrue);
-      expect(url.contains('api.github.com'), isFalse,
-          reason: 'api.github.com 有匿名限速，手机共享出口 IP 极易 403');
-      expect(url.contains('arm64-v8a'), isTrue);
-      expect(url.endsWith('libproroot.so'), isTrue);
-    });
-
-    test('每个文件都配了多个镜像（国内可达性波动大）', () {
-      // × 空清单下本循环不执行；保留它是因为 `mirrorsFor` 仍在
-      // （将来许可口径变化时复原用），这里守住"每个镜像的 URL
-      // 文件名与资产名一致"这个不变式仍然有意义。
-      for (final a in ProrootOption.soAssets) {
-        final ms = ProrootOption.mirrorsFor(a.name);
-        expect(ms.length, greaterThanOrEqualTo(3),
-            reason: '${a.name} 的镜像太少');
-        for (final m in ms) {
-          expect(m.url.endsWith(a.name), isTrue,
-              reason: '${m.name} 的 URL 文件名对不上');
-        }
-      }
-    });
-
-    test('UI 不再暴露「一键下载」入口（点了必然失败的按钮不该留）', () {
-      final card = File('lib/toolchain/proroot_option.dart').readAsStringSync();
-      // _download() 方法体保留（便于许可口径变化时复原），
-      // 但它**不能有按钮绑定** —— 否则用户会点到一个必然失败的按钮
-      // （fetchAll 因 isKnownUnusable() 在首个网络请求前就抛异常）。
-      expect(card.contains('onPressed: _busy ? null : _download'), isFalse,
-          reason: '一键下载按钮已下架，不应再有绑定');
-      expect(card.contains("label: Text(\n                      installed"),
-          isFalse,
-          reason: '按钮 label 里的 installed ? 三元是原按钮的指纹');
-      // 但方法本体要留着（与"Java 层逻辑与卡片暂时保留"同一原则）
-      expect(card.contains('Future<void> _download() async'), isTrue,
-          reason: '方法体应保留以备许可口径变化，只是不暴露入口');
-    });
-
-    test('Kotlin 侧注册了 prorootInstallFromDir（复用落位逻辑）', () {
-      final kt = File(
-        'android/app/src/main/kotlin/dev/foa/flutter_on_android/MainActivity.kt',
-      ).readAsStringSync();
-      expect(kt.contains('"prorootInstallFromDir" ->'), isTrue);
-      // 必须复用 prorootInstall，而不是另写一套落位
-      expect(kt.contains('result.success(prorootInstall(p))'), isTrue,
-          reason: '另写一套会让"导入"与"下载"两条路的落位行为分叉');
-    });
-
-    test('暂存目录在 rootfs 内（宿主 filesDir 没有可执行位）', () {
-      expect(ProrootDownload.stagingRelDir.startsWith('opt/'), isTrue,
-          reason: '必须在 rootfs 内，容器才能 chmod');
-      expect(ProrootDownload.stagingRelDir.contains('..'), isFalse);
     });
   });
 }
