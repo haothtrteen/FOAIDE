@@ -19,12 +19,19 @@ Flutter 的 Gradle 插件会往仓库列表注入 `download.flutter.io` /
 
 ## 怎么用
 
-里面的 `io/flutter/{arm64_v8a_release,flutter_embedding_release}/<版本>/`
-是从**本机 Gradle 缓存**摊出来的：
+里面的 `io/flutter/{arm64_v8a_release,flutter_embedding_release,
+arm64_v8a_debug,flutter_embedding_debug}/<版本>/` 是从**本机 Gradle 缓存**
+摊出来的。**四个都要摊**：
+
+- 只摊 release 两个 → `flutter build apk --release` 能过，
+  但 `--debug` 会挂在 `Could not resolve io.flutter:arm64_v8a_debug`
+  （alpha.98 实测踩到，详见 `dev-handbook/04` 19.7）；
+- debug 的 engine jar 是 **180MB**（release 只有 42MB），磁盘要留够。
 
 ```bash
 M2=android/local-maven
-for art in arm64_v8a_release flutter_embedding_release; do
+for art in arm64_v8a_release flutter_embedding_release \
+           arm64_v8a_debug flutter_embedding_debug; do
   ver=1.0.0-06a2e2a110089dff50fe635cffd2a61e1b24fbcd   # 换 Flutter/engine 版本时改这里
   mkdir -p "$M2/io/flutter/$art/$ver"
   find /root/.gradle/caches/modules-2/files-2.1/io.flutter/$art/$ver \
