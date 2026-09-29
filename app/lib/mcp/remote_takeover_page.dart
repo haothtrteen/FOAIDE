@@ -8,7 +8,7 @@ import 'mcp_server.dart';
 import 'tunnel_service.dart';
 import '../core/theme.dart';
 
-/// 远程接管页（alpha.60）。
+/// 远程协助页（alpha.60）。
 ///
 /// 做三件事（对应用户原始需求）：
 /// 1. **内置一个可远程执行命令的 MCP 服务** —— 跑在 App 进程内
@@ -74,7 +74,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
             '开启后，任何拿到【隧道地址 + 令牌】的人都能以本应用的身份，\n'
             '在这台手机的容器内执行任意命令、读写你的项目文件。\n\n'
             '请注意：\n'
-            '· 这是「远程接管」的设计目的，不是漏洞；\n'
+            '· 这是「远程协助」的设计目的，不是漏洞；\n'
             '· 破坏范围限于容器内——Android 宿主文件与系统不受影响；\n'
             '· 会话 30 分钟后自动停止，你也可以随时手动停止；\n'
             '· 所有远程操作都会显示在本页的「远程操作记录」中。\n\n'
@@ -223,7 +223,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('远程接管')),
+      appBar: AppBar(title: const Text('远程协助')),
       body: Column(
         children: [
           Expanded(
@@ -280,33 +280,62 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
 
   /// 顶部安全警告（常驻，不可关闭——这是本功能的性质决定的）。
   Widget _riskCard() {
+    final c = FoaColors.of(context);
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
-      color: const Color(0xFF3A2416),
+      color: c.warningContainer,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: c.warningBorder),
+      ),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.shield_outlined,
-                color: Color(0xFFFFA000), size: 20),
+            Icon(Icons.shield_outlined, color: c.warning, size: 20),
             const SizedBox(width: 10),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text('这是「交出去」的能力',
-                      style: TextStyle(
-                          fontWeight: FontWeight.w600, fontSize: 13)),
+                      style:
+                          TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
                   const SizedBox(height: 4),
                   Text(
                     '开启后可让远程 AI 在这台手机的容器内执行命令、改你的代码。'
                     '破坏范围限于容器（看不到 Android 系统与相册），'
                     '但仍请只对你信任的对象开启，并在用完后立即停止。',
-                    style: TextStyle(
-                        fontSize: 12,
-                        height: 1.45,
-                        color: Colors.orange.shade100),
+                    style:
+                        TextStyle(fontSize: 12, height: 1.45, color: c.warning),
+                  ),
+                  const SizedBox(height: 10),
+                  // Bug 470：用户实测反馈「远程协助 / AI 接管」两个概念分不清，
+                  // 在这里点明分工，避免走错入口（两者的作用域完全不同）。
+                  Container(
+                    padding: const EdgeInsets.all(9),
+                    decoration: BoxDecoration(
+                      color: c.warningBorder.withValues(alpha: 0.28),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(Icons.lightbulb_outline,
+                            size: 15, color: c.warning),
+                        const SizedBox(width: 7),
+                        Expanded(
+                          child: Text(
+                            '只想开发、调试某一个项目？那用不上这里——'
+                            '请回到该项目的「AI 接管」，作用范围仅限那个工程。'
+                            '本页是**整台设备**级别的通道。',
+                            style: TextStyle(
+                                fontSize: 11.5, height: 1.45, color: c.warning),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ),
@@ -320,11 +349,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
   Widget _statusCard() {
     final st = t.status;
     final (icon, color, text) = switch (st) {
-      TunnelStatus.idle => (
-          Icons.cloud_off,
-          Colors.grey,
-          '未开启'
-        ),
+      TunnelStatus.idle => (Icons.cloud_off, Colors.grey, '未开启'),
       TunnelStatus.installing => (
           Icons.downloading,
           const Color(0xFF64B5F6),
@@ -394,8 +419,8 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
             if (t.error != null) ...[
               const SizedBox(height: 6),
               Text('错误：${t.error}',
-                  style: const TextStyle(
-                      fontSize: 12, color: Color(0xFFCF6679))),
+                  style:
+                      const TextStyle(fontSize: 12, color: Color(0xFFCF6679))),
             ],
             const SizedBox(height: 10),
             Wrap(
@@ -407,7 +432,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                   FilledButton.icon(
                     onPressed: _busy ? null : _start,
                     icon: const Icon(Icons.play_circle_outline),
-                    label: Text(st == TunnelStatus.error ? '重新开启' : '开启远程接管'),
+                    label: Text(st == TunnelStatus.error ? '重新开启' : '开启远程协助'),
                   ),
                 if (t.busy || running) ...[
                   OutlinedButton.icon(
@@ -461,7 +486,9 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                       '项目路径与注意事项——AI 无需自己摸索环境。'
                   : '隧道就绪后这里会生成一段可直接粘贴给 AI 的接入说明。',
               style: TextStyle(
-                  fontSize: 12, color: FoaColors.of(context).muted, height: 1.4),
+                  fontSize: 12,
+                  color: FoaColors.of(context).muted,
+                  height: 1.4),
             ),
             const SizedBox(height: 10),
             Wrap(
@@ -469,8 +496,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
               runSpacing: 8,
               children: [
                 FilledButton.icon(
-                  onPressed:
-                      ready ? () => _copy(_handoff(), '完整接入说明') : null,
+                  onPressed: ready ? () => _copy(_handoff(), '完整接入说明') : null,
                   icon: const Icon(Icons.assignment_ind, size: 18),
                   label: const Text('复制完整接入说明'),
                 ),
@@ -499,7 +525,9 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
               '· 令牌每次开启都会轮换，停止后立即失效。\n'
               '· 「地址+令牌」组合等同于这台机器的钥匙，请勿发到公开场合。',
               style: TextStyle(
-                  fontSize: 11, color: FoaColors.of(context).muted, height: 1.4),
+                  fontSize: 11,
+                  color: FoaColors.of(context).muted,
+                  height: 1.4),
             ),
           ],
         ),
@@ -550,8 +578,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
                               ),
                               TextSpan(
                                 text: tool.description.split('。').first,
-                                style: TextStyle(
-                                    color: Colors.grey.shade400),
+                                style: TextStyle(color: Colors.grey.shade400),
                               ),
                             ],
                           ),
@@ -567,7 +594,9 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
               '④ 容器内看不到 Android 宿主的文件与相册；'
               '⑤ AI 无法直接触发 APK 构建（会抢锁并阻塞你，需你自己操作）。',
               style: TextStyle(
-                  fontSize: 11, color: FoaColors.of(context).muted, height: 1.5),
+                  fontSize: 11,
+                  color: FoaColors.of(context).muted,
+                  height: 1.5),
             ),
           ],
         ),
@@ -638,8 +667,7 @@ class _RemoteTakeoverPageState extends State<RemoteTakeoverPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('隧道日志',
-                style: TextStyle(fontWeight: FontWeight.w600)),
+            const Text('隧道日志', style: TextStyle(fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
             Container(
               height: 220,

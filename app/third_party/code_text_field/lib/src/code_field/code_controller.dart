@@ -161,7 +161,24 @@ class CodeController extends TextEditingController {
   set value(TextEditingValue newValue) {
     final loc = _insertedLoc(text, newValue.text);
 
-    if (loc != null) {
+    // ⚠️ FOA patch (alpha.91)：`loc` 可能越界，必须先夹。
+    //
+    // `_insertedLoc` 用「新文本比旧文本长 1 → 判定为插入了一个字符」这个
+    // 启发式来触发自动闭合括号等 modifier。但它比较的是**控制器里的旧文本**
+    // 与**传进来的新文本**，而 `CodeEditorState.reset()` 这类"整体替换"
+    // 操作（`_controller.value = TextEditingValue(text: 整份新内容, ...)`）
+    // 也会满足"长度差 1"这个条件——此时 `selection` 还是**替换前**的旧值，
+    // 于是拿它去索引**新**文本就越界：
+    //
+    //   RangeError (index): Invalid value: Not in inclusive range 0..28: -1
+    //
+    // 实测触发路径：编辑器里 29 字符的文件被外部改成 28 字符 → 自动同步
+    // 调 reset → 崩在 `newValue.text[loc]`。它不是 Flutter 断言，是
+    // Dart 的 RangeError，会直接把当前这轮重建炸掉。
+    //
+    // 夹一下就好：越界时跳过 modifier 逻辑（整体替换本来也不该触发
+    // "插入一个字符"的语义），直接 `super.value = newValue`。
+    if (loc != null && loc >= 0 && loc < newValue.text.length) {
       final char = newValue.text[loc];
       final modifier = _modifierMap[char];
       final val = modifier?.updateString(super.text, selection, params);

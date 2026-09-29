@@ -221,9 +221,8 @@ class McpServer {
     if (token.isEmpty) return false; // 未启动 → 一律拒绝
     final h = authHeader?.trim();
     if (h != null && h.isNotEmpty) {
-      final v = h.toLowerCase().startsWith('bearer ')
-          ? h.substring(7).trim()
-          : h;
+      final v =
+          h.toLowerCase().startsWith('bearer ') ? h.substring(7).trim() : h;
       if (_constEq(v, token)) return true;
     }
     final a = altHeader?.trim();
@@ -365,8 +364,8 @@ class McpServer {
       case 'resources/read':
         final uri = params['uri'] as String? ?? '';
         if (uri != 'foa://guide') {
-          return McpResponse(200,
-              _rpcError(id, -32602, 'unknown resource: $uri'));
+          return McpResponse(
+              200, _rpcError(id, -32602, 'unknown resource: $uri'));
         }
         return McpResponse(200, {
           'jsonrpc': '2.0',
@@ -389,8 +388,8 @@ class McpServer {
         return _callTool(id, name, args, host, guardLk);
 
       default:
-        return McpResponse(200,
-            _rpcError(id, -32601, 'method not found: $method'));
+        return McpResponse(
+            200, _rpcError(id, -32601, 'method not found: $method'));
     }
   }
 
@@ -514,7 +513,10 @@ class McpServer {
 
         default:
           return McpResponse(
-              200, _toolErr(id, '未知工具：$name（可用：'
+              200,
+              _toolErr(
+                  id,
+                  '未知工具：$name（可用：'
                   '${kTools.map((t) => t.name).join(', ')}）'));
       }
     } catch (e) {

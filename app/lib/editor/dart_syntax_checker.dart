@@ -127,8 +127,7 @@ List<SyntaxIssue> checkDartSyntax(String src) {
   return issues;
 }
 
-bool _isIdentChar(String c) =>
-    RegExp(r'[A-Za-z0-9_]').hasMatch(c);
+bool _isIdentChar(String c) => RegExp(r'[A-Za-z0-9_]').hasMatch(c);
 
 String _pairOf(String ch) => switch (ch) {
       '(' => ')',

@@ -163,7 +163,8 @@ class TunnelService {
     _log('  说明：公网可访问，任何拿到令牌的人都可操作本机容器——用完即停。');
     _ui();
 
-    final cmd = startCommand(bin: CloudflaredInstall.binPath, port: McpServer.port);
+    final cmd =
+        startCommand(bin: CloudflaredInstall.binPath, port: McpServer.port);
     final stream = await bridge.execStream(cmd);
     if (!stream.ok || stream.id <= 0) {
       status = TunnelStatus.error;
@@ -322,23 +323,47 @@ Debian arm64 容器里，已装 Flutter SDK。请通过 MCP 连接并帮我处�
 - 名称：$projectName
 - 容器内路径：$projectRoot
 
-【你可以做什么】
-- foa_info：查看设备/环境信息（建议先调）
-- foa_diag：一键拿到 8 项环境诊断报告
-- read_file / write_file / list_dir：读写项目文件
-- list_projects：列出所有项目
-- run_command：在容器内执行 shell 命令
+【可用工具】
+foa_info、foa_diag、read_file / write_file / list_dir、
+list_projects、run_command。
 
 【必须注意】
 1. 这是真实用户的手机，请勿执行破坏性命令（rm -rf、mkfs、格式化等）。
 2. flutter 命令经 QEMU 转发层执行，**比 PC 慢一个数量级是正常的**；
    首次 Web 编译 3-8 分钟不奇怪，不是卡死。
-3. 构建 APK 与 Web 预览**互斥**（共用 Flutter 启动锁），
-   执行前请先问我。
+3. 构建 APK 与 Web 预览**互斥**（共用 Flutter 启动锁），执行前请先问我。
 4. 写入文件是**覆盖写**，改代码前请先 read_file 看清现状。
 
-【建议开场】
-先调用 foa_info 建立环境认知；需要排查环境问题时调用 foa_diag；
-如需更多细节，读取 resource `foa://guide`。
+【怎么接活】
+我在编辑器里派的作业会写到 `$projectRoot/.foa/ai-inbox.md`，
+每条对应一个 `.foa/ai-jobs/*.md` 详单（含文件、光标位置与附近上下文）。
+**开工前先读这个收件箱。**
+
+【工作纪律】
+
+只有两种情况你才动手：
+1. 收件箱里有**未处理**的作业（没有 `status: done` 的）；
+2. 我在这段对话里**直接给了你**明确指令。
+
+除此之外一律停下来等：
+- 收件箱空 / 条目都已 `status: done` → **只回一句
+  "当前没有待处理作业"就结束**，不要顺带看看项目、不要分析代码、
+  不要执行任何命令。
+- 作业指向的位置看起来已经完整 → 这**不是**扩大范围的理由。
+  按作业要求做，或说明"该位置看起来已完整，需要我做什么请明确"后等。
+- 要求含糊 → **问清楚再动**，不要用"顺便检查一下"来补全意图。
+
+验证默认克制：**不要**主动跑编译、构建、`flutter analyze`、测试来
+"确认一切正常"，除非作业正文或我刚才明确要求。排查该作业相关的报错时
+读文件是可以的，但别把一次补全作业扩大成整个项目的健康检查。
+
+这么严的原因：构建经 QEMU 转发，一次几分钟起、耗电且占满 CPU。
+你要的是改那几行，不是工程体检。**"多做一点"在这里是负分。**
+
+改完文件后，在对应作业文件顶部追加 `status: done`。
+
+【开场】
+读 `.foa/ai-inbox.md`：有未处理作业就处理，没有就回一句
+"当前没有待处理作业"，然后停下等指令。
 ''';
 }

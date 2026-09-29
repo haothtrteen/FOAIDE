@@ -38,6 +38,20 @@ class DownloadException implements Exception {
   String toString() => message;
 }
 
+/// 信号：镜像不支持 Range 请求（整包回 HTTP 200）。
+///
+/// **不是错误**，是需要外层切换策略的信号（Bug 470）。
+/// 分片函数抛出它 → 外层收齐所有分片后改走单流整包下载。
+///
+/// 为什么要单独一个类型：混进 `DownloadException` 会被分片里的
+/// `on DownloadException { rethrow }` 当成"明确失败"直接换镜像重试，
+/// 而换镜像结果一样（同一个源就是没开 Range），白白多跑 N 轮。
+class _RangeUnsupported implements Exception {
+  const _RangeUnsupported();
+  @override
+  String toString() => '镜像不支持 Range 请求';
+}
+
 /// 单个镜像的探测结果（Bug 464：把失败原因**留证**，不再一律吞掉）。
 ///
 /// 背景：`_probe` 原先 `catch (_) { return (m, null); }` —— 任何异常都被
@@ -104,13 +118,9 @@ class SdkDownloader {
   static const Duration slowSpeedWindow = Duration(seconds: 10);
   static const int slowSpeedFloor = 64 * 1024;
 
-  /// Bug 456：当前下载任务的分片布局/分片文件表。
-  ///
-  /// 仅用于「服务器不支持 Range → 整包兜底」时让分片 0 知道：要把整份文件
-  /// 写进哪个分片、以及哪些分片需要被跳过。单线程事件循环下同一时刻只有一个
-  /// 下载任务，用静态字段传递是安全的（任务结束在 finally 里清空）。
-  static List<({int start, int end})>? _currentSegsHint;
-  static List<File>? _currentPartsHint;
+  // （已删除 Bug 456 时代用于传参的 _currentSegsHint / _currentPartsHint：
+  //   Bug 470 把整包兜底提到外层 Future.wait 之后统一执行，
+  //   布局与分片表以普通参数传递即可，不再需要静态字段传参。）
 
   /// 并发竞速选源：返回按"探测耗时升序"排序的镜像列表（最快在前）。
   /// 全部探测失败抛 [DownloadException]。
@@ -237,6 +247,32 @@ class SdkDownloader {
     if (mirrors.isEmpty) throw DownloadException('没有可用镜像源');
     if (expectedSize <= 0) throw DownloadException('未知文件大小，无法分段下载');
 
+    // ---- Bug 471：确保**父目录存在**（这是"UI 不行、终端可以"的真正原因）----
+    //
+    // 真机报错：
+    //   PathNotFoundException: Cannot open file,
+    //   path = '.../files/rootfs/debian/opt/foa-bin/cloudflared.dl.p0'
+    //   (OS Error: No such file or directory, errno = 2)
+    //
+    // 注意 errno=2 是 **ENOENT**（打不开），不是句柄失效。也就是说
+    // `open(mode: FileMode.append)` 时那个文件**连同它的父目录都不存在**。
+    //
+    // 为什么终端里 `wget -O` 能成功、UI 里就失败：**终端那行命令是
+    // `mkdir -p <dir> && wget ...`，我们自己建了目录**；而 UI 走的是
+    // 这段 Dart 代码——它**从头到尾没有建过目录**，把"父目录已存在"
+    // 当成了调用方的责任。`cloudflared_install.dart` 里确实有
+    // `mkdir -p $dirPath`，但那在**落位那一步**（下载成功之后），
+    // 时序上晚于本次下载 → 目录还没建，下载先挂了。
+    //
+    // 修法：下载器自己保证目录存在（幂等，已存在则 no-op）。
+    // **不依赖调用方**——这类"把前置条件推给调用方"的写法在项目里
+    // 已经坑过多次（Bug 464 的读写不对称是同一类）。下载器要能独立工作：
+    // 给它一个路径，它就该负责把文件放进去。
+    final parent = Directory(File(savePath).parent.path);
+    if (!await parent.exists()) {
+      await parent.create(recursive: true);
+    }
+
     // ---- 分片区间（[start, end)，最后一个分片可能偏短）----
     final n = segments < 1
         ? 1
@@ -278,32 +314,74 @@ class SdkDownloader {
     }
 
     // ---- 各分片并发下载（Future.wait 同时发出 N 路请求）----
-    // Bug 456 的整包兜底需要知道全部分片布局才能"只写 .p0、其余标记完成"，
-    // 故经实例字段传递（Dart 无闭包捕获跨静态方法外层的便利）。
-    _currentSegsHint = segs;
-    _currentPartsHint = parts;
-    try {
-      await Future.wait([
-        for (var i = 0; i < segs.length; i++)
-          _downloadSegment(
-            mirrors,
-            index: i,
-            seg: segs[i],
-            partFile: parts[i],
-            token: token,
-            onChunk: (len) {
-              totalDone += len;
-              windowBytes += len;
-              emit();
-            },
-            onMirrorUsed: onMirrorUsed,
-          ),
-      ]);
-    } finally {
-      _currentSegsHint = null;
-      _currentPartsHint = null;
-    }
+    // Bug 470：镜像不支持 Range 时不再由分片就地兜底（那会与并发分片抢文件），
+    // 而是抛出 [_RangeUnsupported] 信号，等这里收齐全部分片后再统一处理。
+    var needWholeFile = false;
+    await Future.wait([
+      for (var i = 0; i < segs.length; i++)
+        _downloadSegment(
+          mirrors,
+          index: i,
+          seg: segs[i],
+          partFile: parts[i],
+          token: token,
+          onChunk: (len) {
+            totalDone += len;
+            windowBytes += len;
+            emit();
+          },
+          onMirrorUsed: onMirrorUsed,
+        ).catchError((Object e) {
+          // 必须在这里吞掉：Future.wait 遇任一抛错就整体失败，
+          // 而我们想要的是「其余分片正常收尾，之后再统一兜底」。
+          if (e is _RangeUnsupported) {
+            needWholeFile = true;
+            return;
+          }
+          throw e; // 其它异常照常上抛
+        }),
+    ]);
     if (token?.isCancelled ?? false) throw DownloadException('已取消');
+
+    // ---- 兜底：所有分片已退出，此时才安全地改写文件 ----
+    // 这一刻不存在任何分片持有 .p<i> 的打开句柄，删/建都不会踩到别人。
+    // （这与 Bug 470 之前的实现是本质区别：原先由分片 0 在并发期就地兜底，
+    //   会删掉分片 1..n 正在持有的文件。）
+    if (needWholeFile) {
+      await _downloadAsWholeFile(
+        mirrors,
+        totalBytes: expectedSize,
+        savePath: savePath,
+        token: token,
+        onChunk: (len) {
+          totalDone += len;
+          windowBytes += len;
+          emit();
+        },
+      );
+      // 兜底直接写的是最终 savePath，无需拼接；做完整性 + 校验后收工。
+      final f = File(savePath);
+      if (await f.length() != expectedSize) {
+        await f.delete();
+        throw DownloadException('整包兜底后大小不符（期望 $expectedSize）');
+      }
+      if (sha256 != null || sha1 != null) {
+        final ok256 = await verifySha256(savePath, sha256 ?? '');
+        final ok1 = await verifySha1(savePath, sha1 ?? '');
+        if (!ok256 || !ok1) {
+          await f.delete();
+          throw DownloadException('校验失败（sha256=$ok256, sha1=$ok1）');
+        }
+      }
+      // 清掉分片残留
+      for (final p in parts) {
+        if (await p.exists()) await p.delete();
+      }
+      onProgress?.call(
+        DownloadProgress(received: expectedSize, total: expectedSize, speed: 0),
+      );
+      return;
+    }
 
     // ---- 拼接分片 → 落盘 → 删除分片 ---- 
     final out = File(savePath);
@@ -388,35 +466,20 @@ class SdkDownloader {
             // 超时抛 TimeoutException → 重试/换镜像
             final resp = await req.close().timeout(respHeaderTimeout);
             if (resp.statusCode == 200) {
-              // Bug 456：服务器不支持 Range（整包回 200）。
-              // 原实现在此直接抛异常换镜像——但 cloudflared 只有 2 个源，
-              // GitHub 直链国内不通，等于整链必失败（用户实测报"下载失败"）。
-              // 正确做法：**退化为单流整包下载**（由分片 0 承担），
-              // 其余分片清空即视为完成。代价是没有并发，但没有并发也远好过装不上。
+              // Bug 456 / Bug 470：服务器不支持 Range（整包回 200）。
               //
-              // 注意：此处**不能**在这里直接跑兜底——本分片可能是 index != 0，
-              // 而兜底要写 .p0 并清空别的分片，会和正在并发运行的分片互相踩。
-              // 正确做法是让**分片 0** 去执行：这里只把分片 0 标记为"必须兜底"，
-              // 自己作为非 0 分片直接静默返回（内容由分片 0 提供）。
-              if (index != 0) {
-                // 非 0 分片遇到不支持 Range：本分片无法独立完成，交给分片 0。
-                // 释放句柄后直接返回；.p{index} 保持空长度 → 拼接时贡献 0 字节。
-                await resp.drain<void>();
-                return;
-              }
-              // index == 0：先释放请求与文件句柄，再整体兜底（避免双重 close）
+              // 历史实现让**分片 0 就地**执行整包兜底（写 .p0、删掉 .p1..n）。
+              // 那是个竞态：分片 0 删文件时，分片 1..n 可能仍持有这些文件的
+              // 打开句柄（在 369 行以 append 打开），随后 close/flush 就报
+              // `PathNotFoundException: Cannot open file '.../x.dl.p1'`
+              // ——真机实测表现极具误导性：**4/4 镜像全可用却"下载失败"**。
+              //
+              // 现在改为：**任何分片**遇到 200 都只抛这个专用信号，
+              // 由外层在 `Future.wait` 收齐全部分片后再统一兜底。
+              // 那时所有分片都已退出，绝无句柄与文件的交叠。
               await resp.drain<void>();
               client.close(force: true);
-              await raf.close();
-              rafClosed = true;
-              await _downloadAsWholeFile(
-                mirror,
-                segs: _currentSegsHint,
-                partFiles: _currentPartsHint,
-                token: token,
-                onChunk: onChunk,
-              );
-              return;
+              throw const _RangeUnsupported();
             }
             if (resp.statusCode != 206) {
               throw DownloadException('下载被拒绝（HTTP ${resp.statusCode}）');
@@ -458,6 +521,12 @@ class SdkDownloader {
             // 明确失败原因：不浪费重试，直接换镜像（分片续传）
             client.close(force: true);
             rethrow;
+          } on _RangeUnsupported {
+            // Bug 470：不支持 Range 是**策略信号**，不是错误——
+            // 必须原样穿透（既不能重试也不能换镜像：同一批源都没开 Range），
+            // 由外层收齐全部分片后统一切到整包单流。
+            client.close(force: true);
+            rethrow;
           } catch (_) {
             client.close(force: true);
             if (attempt >= maxRetriesPerMirror) {
@@ -466,6 +535,10 @@ class SdkDownloader {
             // 瞬时网络抖动：同一镜像重试
           }
         }
+      } on _RangeUnsupported {
+        // 同样必须穿透：若被下面的 `catch (_)` 吞成"网络错误"，
+        // 信号就丢了，外层永远不知道该走整包兜底。
+        rethrow;
       } on DownloadException catch (e) {
         lastError = e.message;
       } catch (_) {
@@ -478,101 +551,100 @@ class SdkDownloader {
     throw DownloadException(lastError);
   }
 
-  /// Bug 456：镜像不支持 Range 时的**整包单流下载**兜底。
+  /// Bug 456 / Bug 470：镜像不支持 Range 时的**整包单流下载**兜底。
   ///
-  /// 背景：`_downloadSegment` 原本要求分片请求必须回 206，遇到回 200 的镜像
-  /// 直接判"该镜像不能用"并换源。对多镜像的 SDK 下载（清华/阿里/华为…）无所谓，
-  /// 但像 cloudflared 这样**只有 2 个源、且其中一个国内不通**的资产，路径就断了：
-  /// 唯一可用的镜像若回 200，整条链必然失败。
+  /// 背景：`_downloadSegment` 要求分片请求必须回 206，遇到回 200 的镜像
+  /// 就无法分段。对多镜像的 SDK 下载（清华/阿里/华为…）无所谓，
+  /// 但像 cloudflared 这样源较少的资产，路径就断了。
   ///
-  /// 本方法把"整包"当成一个覆盖 `[0, expectedSize)` 的分片写入 `.p0`，
-  /// 其余分片文件**清空**（长度 0 即天然"已完成"，拼接阶段会跳过它们）。
-  /// 这样拼接/SHA 校验逻辑完全不用改，也不会被其它分片的并发写破坏。
+  /// **Bug 470 重写**：本方法原先由分片 0 **就地**调用，会 delete 掉
+  /// `.p1..pn` —— 而此时分片 1..n 可能仍持有这些文件的打开句柄，
+  /// 于是 close/flush 报 `PathNotFoundException`（真机表现为
+  /// 「4/4 镜像全可用却下载失败」）。
   ///
-  /// 代价：没有并发。但在"能装 vs 装不上"之间，这个取舍没有悬念。
+  /// 现在本方法**只在所有分片都已退出后**由外层调用，因此：
+  /// - 不再需要"清空其它分片"（它们已经不写了，外层会在结束后统一删）；
+  /// - 直接写入最终 [savePath]，省掉一次拼接；
+  /// - 失败时自动轮换镜像（多源，且**每个源都试**，不再只试探测最快那个）。
   static Future<void> _downloadAsWholeFile(
-    MirrorSource mirror, {
-    required List<({int start, int end})>? segs,
-    required List<File>? partFiles,
+    List<MirrorSource> mirrors, {
+    required int totalBytes,
+    required String savePath,
     DownloadCancelToken? token,
     required void Function(int) onChunk,
   }) async {
-    final layout = segs;
-    final parts = partFiles;
-    if (layout == null || parts == null || layout.isEmpty) {
-      throw DownloadException('整包兜底缺少分片布局');
-    }
-    final fullLen = layout.last.end;
-    final target = parts[0];
-    // 清掉其它分片：长度 0 → 拼接阶段视作"该分片已完成且无内容"。
-    // 先删再建空文件，避免留下上一轮的旧长度造成拼接错位。
-    for (var i = 1; i < parts.length; i++) {
-      if (await parts[i].exists()) await parts[i].delete();
-      await parts[i].create();
-    }
-    if (await target.exists()) await target.delete();
+    final fullLen = totalBytes;
+    final out = File(savePath);
+    if (await out.exists()) await out.delete();
 
-    var attempt = 0;
-    while (true) {
-      attempt++;
-      if (token?.isCancelled ?? false) throw DownloadException('已取消');
-      final client = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 20);
-      final raf = await target.open(mode: FileMode.write);
-      var written = 0;
-      try {
-        // 不带 Range 头：整包从头下载
-        final resp =
-            await client.getUrl(Uri.parse(mirror.url)).then((r) => r.close())
-                .timeout(respHeaderTimeout);
-        if (resp.statusCode != 200 && resp.statusCode != 206) {
-          throw DownloadException('整包下载被拒绝（HTTP ${resp.statusCode}）');
-        }
-        if (resp.contentLength > 0 && resp.contentLength != fullLen) {
-          throw DownloadException(
-              '整包长度不符（期望 $fullLen，服务端 ${resp.contentLength}）');
-        }
-        var slowAt = DateTime.now();
-        var slowBytes = 0;
-        await for (final chunk in resp.timeout(stallTimeout)) {
-          if (token?.isCancelled ?? false) throw DownloadException('已取消');
-          await raf.writeFrom(chunk);
-          written += chunk.length;
-          onChunk(chunk.length);
-          slowBytes += chunk.length;
-          final slowDt = DateTime.now().difference(slowAt);
-          if (slowDt >= slowSpeedWindow) {
-            final bps = slowBytes / slowDt.inMilliseconds * 1000;
-            if (bps < slowSpeedFloor) {
-              throw DownloadException(
-                  '镜像限速（${(bps / 1024).toStringAsFixed(0)}KB/s '
-                  '< ${(slowSpeedFloor / 1024)}KB/s）');
-            }
-            slowAt = DateTime.now();
-            slowBytes = 0;
+    Object? lastError;
+    for (final mirror in mirrors) {
+      var attempt = 0;
+      while (attempt < maxRetriesPerMirror) {
+        attempt++;
+        if (token?.isCancelled ?? false) throw DownloadException('已取消');
+        final client = HttpClient()
+          ..connectionTimeout = const Duration(seconds: 20);
+        final raf = await out.open(mode: FileMode.write);
+        var written = 0;
+        try {
+          // 不带 Range 头：整包从头下载
+          final resp =
+              await client.getUrl(Uri.parse(mirror.url)).then((r) => r.close())
+                  .timeout(respHeaderTimeout);
+          if (resp.statusCode != 200 && resp.statusCode != 206) {
+            throw DownloadException('整包下载被拒绝（HTTP ${resp.statusCode}）');
           }
+          if (resp.contentLength > 0 && resp.contentLength != fullLen) {
+            throw DownloadException(
+                '整包长度不符（期望 $fullLen，服务端 ${resp.contentLength}）');
+          }
+          var slowAt = DateTime.now();
+          var slowBytes = 0;
+          await for (final chunk in resp.timeout(stallTimeout)) {
+            if (token?.isCancelled ?? false) throw DownloadException('已取消');
+            await raf.writeFrom(chunk);
+            written += chunk.length;
+            onChunk(chunk.length);
+            slowBytes += chunk.length;
+            final slowDt = DateTime.now().difference(slowAt);
+            if (slowDt >= slowSpeedWindow) {
+              final bps = slowBytes / slowDt.inMilliseconds * 1000;
+              if (bps < slowSpeedFloor) {
+                throw DownloadException(
+                    '镜像限速（${(bps / 1024).toStringAsFixed(0)}KB/s '
+                    '< ${(slowSpeedFloor / 1024)}KB/s）');
+              }
+              slowAt = DateTime.now();
+              slowBytes = 0;
+            }
+          }
+          await raf.flush();
+          if (written != fullLen) {
+            throw DownloadException('整包不完整（$written/$fullLen）');
+          }
+          return; // 成功
+        } on DownloadException catch (e) {
+          client.close(force: true);
+          // 该源明确失败（拒绝/限速/长度不符）→ 不再对它重试，换下一个源
+          lastError = e;
+          break;
+        } catch (e) {
+          client.close(force: true);
+          lastError = e;
+          if (attempt >= maxRetriesPerMirror) {
+            // 本源的瞬时错误重试用尽 → 换下一个源
+            break;
+          }
+        } finally {
+          await raf.close();
         }
-        await raf.flush();
-        if (written != fullLen) {
-          throw DownloadException('整包不完整（$written/$fullLen）');
-        }
-        return; // 成功
-      } on DownloadException {
-        client.close(force: true);
-        rethrow;
-      } catch (_) {
-        client.close(force: true);
-        if (attempt >= maxRetriesPerMirror) {
-          throw DownloadException('整包下载网络错误（${mirror.name}）');
-        }
-      } finally {
-        await raf.close();
-      }
-      // 重试：从头（整包没有续传点，只能重来）
-      if (attempt < maxRetriesPerMirror && await target.exists()) {
-        await target.delete();
+        // 重试：从头（整包没有续传点，只能重来）
+        if (await out.exists()) await out.delete();
       }
     }
+    throw DownloadException(
+        '整包下载失败（已尝试 ${mirrors.length} 个源）：$lastError');
   }
 
   static Future<String> _sha256Of(String path) async {

@@ -17,7 +17,7 @@ import '../core/theme.dart';
 /// 本次按反馈补齐为**以"这个项目现在什么状态"为中心**的面板：
 ///
 /// - 顶部仍是项目信息（名称/包名/版本/依赖）；
-/// - 一行三个操作卡：Web 预览（热重载）、远程接管、故障排查；
+/// - 一行三个操作卡：Web 预览（热重载）、远程协助、故障排查；
 /// - 「依赖管理」卡：pub 缓存里已下载几个包、占多少空间——回答
 ///   "我依赖到底拉全了没"；
 /// - 「构建历史」卡：最近一次构建状态 + 最近几次产物（文件名/大小/时间），
@@ -31,6 +31,12 @@ class ProjectPreview extends StatefulWidget {
   final VoidCallback onOpenCode;
   final VoidCallback onOpenBuild;
 
+  /// 切到「设计」区预览（alpha.72）。
+  ///
+  /// 设计区在同一个 IndexedStack 里，所以这里只是切区 ——
+  /// 用户从预览卡点进来会看到上次设计的那棵树，接着改就行。
+  final VoidCallback onOpenDesign;
+
   const ProjectPreview({
     super.key,
     required this.projectName,
@@ -38,6 +44,7 @@ class ProjectPreview extends StatefulWidget {
     required this.env,
     required this.onOpenCode,
     required this.onOpenBuild,
+    required this.onOpenDesign,
   });
 
   @override
@@ -146,7 +153,8 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                                fontSize: 12, color: FoaColors.of(context).muted)),
+                                fontSize: 12,
+                                color: FoaColors.of(context).muted)),
                     ],
                   ),
                 ),
@@ -155,7 +163,8 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                   onPressed: _loadingStats ? null : _loadStats,
                   icon: _loadingStats
                       ? const SizedBox(
-                          width: 16, height: 16,
+                          width: 16,
+                          height: 16,
                           child: CircularProgressIndicator(strokeWidth: 2))
                       : const Icon(Icons.refresh, size: 20),
                 ),
@@ -166,8 +175,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
             _kv('版本', '${i.versionName}+${i.versionCode}'),
             _kv('依赖声明', '${i.depCount} 个'),
             _kv('容器路径', '/root/projects/${widget.projectName}'),
-            _kv('构建后端',
-                i.backendLabel),
+            _kv('构建后端', i.backendLabel),
           ],
         ),
       ),
@@ -183,7 +191,8 @@ class _ProjectPreviewState extends State<ProjectPreview> {
           SizedBox(
             width: 76,
             child: Text(k,
-                style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
+                style: TextStyle(
+                    fontSize: 12, color: FoaColors.of(context).muted)),
           ),
           Expanded(
             child: SelectableText(v,
@@ -194,44 +203,64 @@ class _ProjectPreviewState extends State<ProjectPreview> {
     );
   }
 
-  // ---------------- ② 三个操作入口 ----------------
+  // ---------------- ② 四个操作入口 ----------------
 
   Widget _actionRow() {
-    return Row(
+    // 两行两列而不是一行四个：一行四个卡片在手机上每个只剩 80px 宽，
+    // 「故障排查」这种四字标题会换行成两行，卡片高度参差不齐。
+    return Column(
       children: [
-        Expanded(
-          child: _actionCard(
-            Icons.web,
-            'Web 预览',
-            _preview.busy ? '运行中 · 点此挂回' : '热重载调试',
-            () => _openWebPreview(),
-            highlight: _preview.busy,
-          ),
+        Row(
+          children: [
+            Expanded(
+              child: _actionCard(
+                Icons.design_services_outlined,
+                '设计预览',
+                '零编译 · 即时',
+                widget.onOpenDesign,
+                highlight: true,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _actionCard(
+                Icons.web,
+                'Web 预览',
+                _preview.busy ? '运行中 · 点此挂回' : '真跑一遍',
+                () => _openWebPreview(),
+                highlight: _preview.busy,
+              ),
+            ),
+          ],
         ),
-        const SizedBox(width: 8),
-        Expanded(
-          child: _actionCard(
-            Icons.hub_outlined,
-            '远程接管',
-            '让 AI 接入',
-            () => Navigator.of(context).push(MaterialPageRoute(
-              builder: (_) =>
-                  RemoteTakeoverPage(projectName: widget.projectName),
-            )),
-            highlight: false,
-          ),
-        ),
-        const SizedBox(width: 8),
-        Expanded(
-          child: _actionCard(
-            Icons.health_and_safety_outlined,
-            '故障排查',
-            '环境自检',
-            () => Navigator.of(context).push(MaterialPageRoute(
-              builder: (_) => const DiagPage(),
-            )),
-            highlight: false,
-          ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: _actionCard(
+                Icons.hub_outlined,
+                '远程协助',
+                '让 AI 接入',
+                () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) =>
+                      RemoteTakeoverPage(projectName: widget.projectName),
+                )),
+                highlight: false,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _actionCard(
+                Icons.health_and_safety_outlined,
+                '故障排查',
+                '环境自检',
+                () => Navigator.of(context).push(MaterialPageRoute(
+                  builder: (_) => const DiagPage(),
+                )),
+                highlight: false,
+              ),
+            ),
+          ],
         ),
       ],
     );
@@ -310,7 +339,9 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                   ),
                 ),
                 Container(
-                    width: 1, height: 32, color: Colors.grey.withValues(alpha: 0.25)),
+                    width: 1,
+                    height: 32,
+                    color: Colors.grey.withValues(alpha: 0.25)),
                 Expanded(
                   child: _metric(
                     '缓存占用',
@@ -321,7 +352,9 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                   ),
                 ),
                 Container(
-                    width: 1, height: 32, color: Colors.grey.withValues(alpha: 0.25)),
+                    width: 1,
+                    height: 32,
+                    color: Colors.grey.withValues(alpha: 0.25)),
                 Expanded(
                   child: _metric(
                     '本项目',
@@ -360,7 +393,9 @@ class _ProjectPreviewState extends State<ProjectPreview> {
               '缓存目录：${ProjectStatsReader.pubCacheDir}/hosted/pub.dev'
               ' · 多个项目共用，删掉会拖慢下次打包',
               style: TextStyle(
-                  fontSize: 11, color: FoaColors.of(context).muted, height: 1.4),
+                  fontSize: 11,
+                  color: FoaColors.of(context).muted,
+                  height: 1.4),
             ),
           ],
         ),
@@ -377,13 +412,13 @@ class _ProjectPreviewState extends State<ProjectPreview> {
           textBaseline: TextBaseline.alphabetic,
           children: [
             Text(value,
-                style: const TextStyle(
-                    fontSize: 20, fontWeight: FontWeight.bold)),
+                style:
+                    const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
             if (unit.isNotEmpty) ...[
               const SizedBox(width: 3),
               Text(unit,
-                  style:
-                      TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
+                  style: TextStyle(
+                      fontSize: 11, color: FoaColors.of(context).muted)),
             ],
           ],
         ),
@@ -453,8 +488,7 @@ class _ProjectPreviewState extends State<ProjectPreview> {
                       MaterialPageRoute(builder: (_) => const BuildPage()),
                     ),
                     icon: const Icon(Icons.install_mobile, size: 16),
-                    label: const Text('安装产物',
-                        style: TextStyle(fontSize: 13)),
+                    label: const Text('安装产物', style: TextStyle(fontSize: 13)),
                   ),
               ],
             ),
@@ -511,8 +545,8 @@ class _ProjectPreviewState extends State<ProjectPreview> {
         ),
         const SizedBox(width: 6),
         Expanded(
-          child: Text(text,
-              style: const TextStyle(fontSize: 12.5, height: 1.45)),
+          child:
+              Text(text, style: const TextStyle(fontSize: 12.5, height: 1.45)),
         ),
       ],
     );
@@ -529,11 +563,11 @@ class _ProjectPreviewState extends State<ProjectPreview> {
             child: Text(a.displayName,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                    fontSize: 12, fontFamily: 'monospace')),
+                style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
           ),
           Text('${fmtBytes(a.sizeBytes)} · ${fmtRelativeTime(a.mtimeMs)}',
-              style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
+              style:
+                  TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
         ],
       ),
     );

@@ -874,15 +874,36 @@ echo UNINSTALL_OK
   ///
   /// ⚠️ `@REAL@` **不在**这里替换：它是 `gen()` 内部按每个文件写入的
   /// 真身路径（由 `gen()` 里的 `sed` 完成），不是全局常量。
-  static String fill(String script, {String sdk = sdkHome, String proj = ''}) =>
+  /// 用真实路径填充脚本占位符。
+  ///
+  /// alpha.97 起 [sdk] / [flutterHome] / [engineDir] 可覆盖：原先
+  /// `@FLUTTER@`、`@ENGINE@` 固定为类常量（= 容器的 `/opt/flutter` 与
+  /// `/opt/android-sdk`），而 **termux 后端的 Flutter 与 SDK 装在
+  /// prefix 下**。于是 termux 构建时三段被填充的脚本全都指向容器路径——
+  /// - stampFix：写一个不存在的目录，Bug 436 的优化等于没生效；
+  /// - diag：`[ -x @QEMU@ ] || exit 0` 直接短路，诊断段静默什么也不做；
+  /// - heal：目录不存在 → `HEALED=0`，自愈是空跑；
+  /// - reassert：`[ -d "$E" ] || exit 0` → 转发层重建是空跑。
+  /// 四段都"看起来正常"（都有输出行），所以这个 bug 藏了很久。
+  ///
+  /// 参数化后，调用方按后端传对应路径即可。默认值保持不变，
+  /// 既有 proot 调用方语义完全不受影响。
+  static String fill(
+    String script, {
+    String sdk = sdkHome,
+    String proj = '',
+    String? flutterHomeOverride,
+    String? engineDirOverride,
+    String? sdkHomeOverride,
+  }) =>
       script
           .replaceAll('__FOA_GEN__', _wrapGenFunc.trim())
           .replaceAll('@QEMU@', qemuBin)
           .replaceAll('@LOADER@', x64Loader)
-          .replaceAll('@ENGINE@', engineDir)
-          .replaceAll('@FLUTTER@', flutterHome)
+          .replaceAll('@ENGINE@', engineDirOverride ?? engineDir)
+          .replaceAll('@FLUTTER@', flutterHomeOverride ?? flutterHome)
           .replaceAll('@PROJ@', proj)
-          .replaceAll('@SDK@', sdk);
+          .replaceAll('@SDK@', sdkHomeOverride ?? sdk);
 
   // ---------------- 验证 ----------------
 

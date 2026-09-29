@@ -13,6 +13,8 @@ import '../toolchain/build_runner.dart';
 import '../toolchain/termux_backend.dart';
 import '../filemanager/fs_browser_bridge.dart';
 import '../core/theme.dart';
+import 'keystore_store.dart';
+import 'signing.dart';
 
 /// 项目工作台 ·「打包」区（alpha.61 优化）。
 ///
@@ -30,7 +32,8 @@ class BuildPanel extends StatefulWidget {
   final String projectName;
   final EnvInfo? env;
   final BuildBackend backend;
-  final Future<void> Function() onStartBuild;
+  /// 开始构建（alpha.93：带上构建类型，父页据此传给 BuildRunner）。
+  final Future<void> Function(BuildFlavor flavor) onStartBuild;
 
   /// 构建后端切换（写回 BackendPrefs 由父页负责）。
   final ValueChanged<BuildBackend>? onBackendChanged;
@@ -65,11 +68,36 @@ class _BuildPanelState extends State<BuildPanel> {
   bool _checked = false;
   bool _cleaning = false;
 
+  /// alpha.93：验签进行中（apksigner 在容器里跑，QEMU 下要几秒）。
+  bool _signBusy = false;
+
+  /// alpha.93：构建类型（debug 档不走 AOT，是设备端唯一显著提速的档位）。
+  /// 默认 release——与加这个开关之前的行为完全一致，不擅改用户预期。
+  BuildFlavor _flavor = BuildFlavor.release;
+
   @override
   void initState() {
     super.initState();
     // 首次进入就做一次静默检查（不阻塞界面）
-    WidgetsBinding.instance.addPostFrameCallback((_) => _preflight(silent: true));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _preflight(silent: true);
+      _loadFlavor();
+    });
+  }
+
+  /// 读回上次选择的构建类型（写盘持久化，与后端偏好同风格）。
+  Future<void> _loadFlavor() async {
+    final env = widget.env;
+    if (env == null) return;
+    final v = await FlavorPrefs.load(env);
+    if (mounted) setState(() => _flavor = v);
+  }
+
+  /// 切换构建类型（写盘持久化，下次进来还是这个）。
+  Future<void> _switchFlavor(BuildFlavor v) async {
+    final env = widget.env;
+    setState(() => _flavor = v);
+    if (env != null) await FlavorPrefs.save(env, v);
   }
 
   @override
@@ -146,8 +174,7 @@ class _BuildPanelState extends State<BuildPanel> {
     ));
 
     // 4. 是否已有 AndroidManifest（模板缺这个 gradle 会失败）
-    final mf = await _fb
-        .read('$proj/android/app/src/main/AndroidManifest.xml');
+    final mf = await _fb.read('$proj/android/app/src/main/AndroidManifest.xml');
     out.add((
       name: 'AndroidManifest.xml',
       ok: mf.ok,
@@ -229,7 +256,7 @@ class _BuildPanelState extends State<BuildPanel> {
         duration: Duration(seconds: 4),
       ));
     }
-    await widget.onStartBuild();
+    await widget.onStartBuild(_flavor);
     if (mounted) setState(() {});
   }
 
@@ -316,7 +343,8 @@ class _BuildPanelState extends State<BuildPanel> {
               const SizedBox(height: 6),
               Text('构建需要容器环境，请先在主页完成环境安装',
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
+                  style: TextStyle(
+                      fontSize: 12, color: FoaColors.of(context).muted)),
             ],
           ),
         ),
@@ -326,7 +354,9 @@ class _BuildPanelState extends State<BuildPanel> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        if (otherBuilding) _otherBuildingCard() else ...[
+        if (otherBuilding)
+          _otherBuildingCard()
+        else ...[
           if (r.building && mine)
             _buildingCard()
           else ...[
@@ -360,15 +390,17 @@ class _BuildPanelState extends State<BuildPanel> {
             const Icon(Icons.hourglass_top, size: 34, color: Color(0xFFFFB74D)),
             const SizedBox(height: 12),
             Text('「${r.active}」正在构建中',
-                style: const TextStyle(
-                    fontSize: 15, fontWeight: FontWeight.w600)),
+                style:
+                    const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
             const SizedBox(height: 6),
             Text(
               '同一时间只能有一个构建任务——同时构建两个项目会\n'
               '把 CPU 和内存打满，两边都跑不完。',
               textAlign: TextAlign.center,
               style: TextStyle(
-                  fontSize: 12, height: 1.6, color: FoaColors.of(context).muted),
+                  fontSize: 12,
+                  height: 1.6,
+                  color: FoaColors.of(context).muted),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
@@ -429,7 +461,8 @@ class _BuildPanelState extends State<BuildPanel> {
             Row(
               children: [
                 Text('已用 ${BuildRunner.fmtDur(r.elapsedSec)}',
-                    style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
+                    style: TextStyle(
+                        fontSize: 11, color: FoaColors.of(context).muted)),
                 const SizedBox(width: 10),
                 Icon(Icons.notifications_active_outlined,
                     size: 12, color: FoaColors.of(context).muted),
@@ -455,8 +488,8 @@ class _BuildPanelState extends State<BuildPanel> {
                 Expanded(
                   child: OutlinedButton.icon(
                     onPressed: () async {
-                      final go = await _confirm('取消构建？',
-                          '将终止当前构建进程。已经完成的部分不会保留，\n下次构建需要重新开始。');
+                      final go = await _confirm(
+                          '取消构建？', '将终止当前构建进程。已经完成的部分不会保留，\n下次构建需要重新开始。');
                       if (go) await r.cancel();
                     },
                     icon: const Icon(Icons.stop_circle_outlined, size: 16),
@@ -556,8 +589,8 @@ class _BuildPanelState extends State<BuildPanel> {
                     size: 18, color: Color(0xFF4C8DFF)),
                 const SizedBox(width: 8),
                 const Text('构建前检查',
-                    style: TextStyle(
-                        fontSize: 15, fontWeight: FontWeight.bold)),
+                    style:
+                        TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
                 const Spacer(),
                 if (_checking)
                   const SizedBox(
@@ -577,9 +610,7 @@ class _BuildPanelState extends State<BuildPanel> {
             const SizedBox(height: 4),
             Text(
               _checked
-                  ? (_hasBlocking
-                      ? '有未通过项，构建大概率会失败'
-                      : '全部通过，可以开始构建')
+                  ? (_hasBlocking ? '有未通过项，构建大概率会失败' : '全部通过，可以开始构建')
                   : '正在检查…',
               style: TextStyle(
                 fontSize: 11,
@@ -639,9 +670,8 @@ class _BuildPanelState extends State<BuildPanel> {
 
   Widget _paramsCard() {
     final env = widget.env;
-    final backendLabel = widget.backend == BuildBackend.termux
-        ? 'Termux 裸原生'
-        : 'Proot 容器';
+    final backendLabel =
+        widget.backend == BuildBackend.termux ? 'Termux 裸原生' : 'Proot 容器';
     return Card(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
@@ -653,16 +683,18 @@ class _BuildPanelState extends State<BuildPanel> {
                 Icon(Icons.tune, size: 18, color: Color(0xFF4C8DFF)),
                 SizedBox(width: 8),
                 Text('本次构建参数',
-                    style: TextStyle(
-                        fontSize: 15, fontWeight: FontWeight.bold)),
+                    style:
+                        TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
               ],
             ),
             const SizedBox(height: 4),
             Text('开始前确认一下，构建中不可更改',
-                style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
+                style: TextStyle(
+                    fontSize: 11, color: FoaColors.of(context).muted)),
             const Divider(height: 20),
             _paramRow('项目', widget.projectName),
-            _paramRow('构建目标', 'release APK（arm64-v8a）'),
+            _paramRow('构建目标',
+                '${_flavor == BuildFlavor.debug ? 'debug' : 'release'} APK（arm64-v8a）'),
             _paramRow('构建后端', backendLabel,
                 note: widget.backend == BuildBackend.termux
                     ? '实验性，更快但兼容性差'
@@ -670,7 +702,50 @@ class _BuildPanelState extends State<BuildPanel> {
             _paramRow('容器路径', '/root/projects/${widget.projectName}'),
             if (env != null) _paramRow('ABI', env.abi ?? '未知'),
             if (env != null)
-              _paramRow('Android SDK', env.androidSdk > 0 ? 'API ${env.androidSdk}' : '未知'),
+              _paramRow('Android SDK',
+                  env.androidSdk > 0 ? 'API ${env.androidSdk}' : '未知'),
+            const Divider(height: 20),
+            // alpha.93：构建类型切换。debug 档不走 AOT——真机卡在
+            // 「AOT 编译（gen_snapshot）」时切它能直接砍掉最慢的一段。
+            Row(
+              children: [
+                Expanded(
+                  child: Text('构建类型',
+                      style: TextStyle(
+                          fontSize: 12, color: FoaColors.of(context).muted)),
+                ),
+                SegmentedButton<BuildFlavor>(
+                  segments: const [
+                    ButtonSegment(
+                      value: BuildFlavor.release,
+                      label: Text('Release', style: TextStyle(fontSize: 11)),
+                    ),
+                    ButtonSegment(
+                      value: BuildFlavor.debug,
+                      label: Text('Debug', style: TextStyle(fontSize: 11)),
+                    ),
+                  ],
+                  selected: {_flavor},
+                  onSelectionChanged: r.building ? null : (s) => _switchFlavor(s.first),
+                  showSelectedIcon: false,
+                  style: const ButtonStyle(
+                    visualDensity: VisualDensity.compact,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            // 如实标注代价：debug 不是"更好"，是"更快但有条件"
+            Text(
+              _flavor == BuildFlavor.debug
+                  ? '不走 AOT（gen_snapshot），跳过最慢的一段，明显更快。'
+                      '首次需下载一批 debug 引擎构件；产物仅用于自测，不能上架。'
+                  : '走 AOT 编译，产物可上架。gen_snapshot 是 x86_64 二进制、'
+                      '靠转译执行，这是构建慢的主要原因。',
+              style:
+                  TextStyle(fontSize: 10.5, color: FoaColors.of(context).muted),
+            ),
             const Divider(height: 20),
             // 后端切换：直接在这里改，不用跑去工具链页
             Row(
@@ -718,7 +793,8 @@ class _BuildPanelState extends State<BuildPanel> {
           SizedBox(
             width: 76,
             child: Text(k,
-                style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted)),
+                style: TextStyle(
+                    fontSize: 12, color: FoaColors.of(context).muted)),
           ),
           Expanded(
             child: Column(
@@ -797,7 +873,8 @@ class _BuildPanelState extends State<BuildPanel> {
         Text(
           '清理缓存会删除 build/ 与 .dart_tool/，下次构建更慢但能解决'
           '"缓存导致的玄学失败"',
-          style: TextStyle(fontSize: 10.5, height: 1.5, color: FoaColors.of(context).muted),
+          style: TextStyle(
+              fontSize: 10.5, height: 1.5, color: FoaColors.of(context).muted),
         ),
       ],
     );
@@ -875,8 +952,7 @@ class _BuildPanelState extends State<BuildPanel> {
                       MaterialPageRoute(builder: (_) => const BuildPage()),
                     ),
                     icon: const Icon(Icons.open_in_new, size: 16),
-                    label: const Text('构建台详情',
-                        style: TextStyle(fontSize: 12)),
+                    label: const Text('构建台详情', style: TextStyle(fontSize: 12)),
                   ),
                 ),
               ],
@@ -896,8 +972,8 @@ class _BuildPanelState extends State<BuildPanel> {
       decoration: BoxDecoration(
         color: const Color(0xFF3DDC84).withValues(alpha: 0.08),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-            color: const Color(0xFF3DDC84).withValues(alpha: 0.3)),
+        border:
+            Border.all(color: const Color(0xFF3DDC84).withValues(alpha: 0.3)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -905,6 +981,20 @@ class _BuildPanelState extends State<BuildPanel> {
           Row(
             children: [
               const Icon(Icons.android, size: 18, color: Color(0xFF3DDC84)),
+              const Spacer(),
+              // alpha.93：签完名到底是不是正式签名，以前只能靠猜
+              // （"我没配过签名，应该是 debug 的吧"）。
+              TextButton.icon(
+                onPressed: _signBusy ? null : _verifySignature,
+                icon: _signBusy
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.verified_outlined, size: 15),
+                label: Text(_signBusy ? '检查中…' : '验签',
+                    style: const TextStyle(fontSize: 11)),
+              ),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(name,
@@ -920,7 +1010,8 @@ class _BuildPanelState extends State<BuildPanel> {
           const SizedBox(height: 4),
           Text('容器内路径：$guest',
               maxLines: 2,
-              style: TextStyle(fontSize: 10, color: FoaColors.of(context).muted)),
+              style:
+                  TextStyle(fontSize: 10, color: FoaColors.of(context).muted)),
           const SizedBox(height: 10),
           Row(
             children: [
@@ -952,6 +1043,194 @@ class _BuildPanelState extends State<BuildPanel> {
               ),
             ],
           ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _signBusy ? null : () => _resign(),
+                  icon: const Icon(Icons.draw_outlined, size: 16),
+                  label: const Text('用正式签名重签',
+                      style: TextStyle(fontSize: 11.5)),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  // alpha.94：想拿 debug 签名的包，两条路都给：
+                  // ① 切到 debug 档构建（release 变体才走 signingConfigs，
+                  //    debug 档本来就是 debug 签名）；
+                  // ② 对已产出的包直接换 debug 签名（这条按钮）。
+                  onPressed: _signBusy ? null : _resignDebug,
+                  icon: const Icon(Icons.bug_report_outlined, size: 16),
+                  label: const Text('用 debug 签名重签',
+                      style: TextStyle(fontSize: 11.5)),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg),
+      duration: const Duration(seconds: 3),
+    ));
+  }
+
+  /// 读这个工程的签名配置（唯一真源是 android/key.properties）。
+  Future<SigningConfig?> _signingConfig() async {
+    for (final f in const [
+      'android/key.properties',
+      'android/app/key.properties',
+    ]) {
+      final s = await _fb.read('/root/projects/${widget.projectName}/$f');
+      if (!s.ok) continue;
+      final c = Signing.configFrom(s.content);
+      if (c != null) return c;
+    }
+    return null;
+  }
+
+  /// 用 Android 官方约定的 debug keystore 重签（alpha.94）。
+  ///
+  /// 「有正式签名但想用 debug 签名」的正解其实是**切到 debug 档构建**——
+  /// `signingConfigs.release` 只作用于 release 变体，debug 档本来就是
+  /// debug 签名。但有时用户手上只有一个已经打好的 release 包
+  /// （比如换回 debug 签名做本地对照测试），所以这里也留一条产物级出口。
+  ///
+  /// debug keystore 的参数是 AOSP/Gradle 的公开约定（alias
+  /// `androiddebugkey`、口令 `android`、DN `CN=Android Debug`），
+  /// Gradle 自己在 ~/.android/debug.keystore 生成的也是这一套。
+  Future<void> _resignDebug() async {
+    final guest = r.apkGuest;
+    if (guest == null || _signBusy) return;
+    setState(() => _signBusy = true);
+    final st = KeystoreStore(_bridge);
+    final dk = await st.ensureDebugKeystore();
+    if (!mounted) return;
+    if (!dk.ok) {
+      setState(() => _signBusy = false);
+      _toast(dk.msg);
+      return;
+    }
+    final res = await Signing.signApk(
+      _bridge,
+      apkIn: guest,
+      keystorePath: dk.path,
+      alias: KeystoreStore.debugAlias,
+      storePass: KeystoreStore.debugPass,
+      keyPass: KeystoreStore.debugPass,
+    );
+    if (!mounted) return;
+    setState(() => _signBusy = false);
+    // ⚠️ Signing.signApk 会把"仍是 debug 证书"当成异常提示（那是给正式
+    // 签名准备的判断），这里本来就是要 debug 签，别拿那条文案吓人。
+    _toast(res.ok ? '已用 debug 签名重签：${res.apk ?? ''}' : res.msg);
+    if (!res.ok) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('签名失败'),
+          content: SizedBox(
+            width: 460,
+            child: SingleChildScrollView(
+              child: SelectableText(res.msg,
+                  style: const TextStyle(
+                      fontSize: 11, height: 1.5, fontFamily: 'monospace')),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('知道了')),
+          ],
+        ),
+      );
+    }
+  }
+
+  /// 对已产出的 APK 直接签名（不改任何源码，DSL 无关）。
+  ///
+  /// 存在的理由：构建脚本补丁匹配不到模板时会**拒绝硬改**，
+  /// 那时"构建即签名"走不通，这条路仍然可用。
+  Future<void> _resign() async {
+    final guest = r.apkGuest;
+    if (guest == null || _signBusy) return;
+    setState(() => _signBusy = true);
+    final cfg = await _signingConfig();
+    if (!mounted) return;
+    if (cfg == null) {
+      setState(() => _signBusy = false);
+      _toast('还没配置正式签名：请先在「清单」区点"生成并配置签名"');
+      return;
+    }
+    final res = await Signing.signApk(
+      _bridge,
+      apkIn: guest,
+      keystorePath: cfg.storeFile,
+      alias: cfg.keyAlias,
+      storePass: cfg.storePassword,
+      keyPass: cfg.keyPassword,
+    );
+    if (!mounted) return;
+    setState(() => _signBusy = false);
+    _toast(res.ok ? '已签名：${res.apk ?? ''}' : res.msg);
+    if (res.ok) return;
+    // 失败时把容器原文拿出来看——apksigner 的报错只在终端里看得全。
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('签名失败'),
+        content: SizedBox(
+          width: 460,
+          child: SingleChildScrollView(
+            child: SelectableText(res.msg,
+                style: const TextStyle(
+                    fontSize: 11, height: 1.5, fontFamily: 'monospace')),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 验签：这个包到底是正式签名还是 debug 签名。
+  ///
+  /// 用 apksigner（容器 build-tools 自带，AOSP 开源），不引任何新依赖。
+  Future<void> _verifySignature() async {
+    final guest = r.apkGuest;
+    if (guest == null || _signBusy) return;
+    setState(() => _signBusy = true);
+    final res = await Signing.verify(_bridge, guest);
+    if (!mounted) return;
+    setState(() => _signBusy = false);
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('签名检查结果'),
+        content: SizedBox(
+          width: 460,
+          child: SingleChildScrollView(
+            child: SelectableText(res.msg,
+                style: const TextStyle(
+                    fontSize: 11, height: 1.5, fontFamily: 'monospace')),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('知道了'),
+          ),
         ],
       ),
     );
@@ -977,7 +1256,8 @@ class _BuildPanelState extends State<BuildPanel> {
       return Text(
         '打开日志看最后 20 行，通常能看到真正的错误原因。'
         '如果是莫名其妙的失败，先试"清理缓存"再构建。',
-        style: TextStyle(fontSize: 11, height: 1.6, color: FoaColors.of(context).muted),
+        style: TextStyle(
+            fontSize: 11, height: 1.6, color: FoaColors.of(context).muted),
       );
     }
     return Container(
@@ -991,12 +1271,11 @@ class _BuildPanelState extends State<BuildPanel> {
         children: [
           const Row(
             children: [
-              Icon(Icons.lightbulb_outline,
-                  size: 16, color: Color(0xFFFFB74D)),
+              Icon(Icons.lightbulb_outline, size: 16, color: Color(0xFFFFB74D)),
               SizedBox(width: 6),
               Text('可能的修复方向',
-                  style: TextStyle(
-                      fontSize: 12.5, fontWeight: FontWeight.w600)),
+                  style:
+                      TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600)),
             ],
           ),
           // ignore: prefer_const_literals_to_create_immutables
@@ -1023,9 +1302,8 @@ class _BuildPanelState extends State<BuildPanel> {
   // ---------- 日志预览 ----------
 
   Widget _logPreviewCard() {
-    final lines = r.lines.length > 6
-        ? r.lines.sublist(r.lines.length - 6)
-        : r.lines;
+    final lines =
+        r.lines.length > 6 ? r.lines.sublist(r.lines.length - 6) : r.lines;
     return Card(
       color: const Color(0xFF0C0F13),
       clipBehavior: Clip.antiAlias,
@@ -1039,8 +1317,8 @@ class _BuildPanelState extends State<BuildPanel> {
               Row(
                 children: [
                   Text('日志预览（共 ${r.lines.length} 行）',
-                      style:
-                          TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
+                      style: TextStyle(
+                          fontSize: 11, color: FoaColors.of(context).muted)),
                   const Spacer(),
                   const Icon(Icons.unfold_more, size: 14, color: Colors.grey),
                   const SizedBox(width: 4),
@@ -1200,19 +1478,17 @@ class _LogSheetState extends State<_LogSheet> {
                         TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
                 const SizedBox(width: 8),
                 Text('${lines.length} 行',
-                    style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
+                    style: TextStyle(
+                        fontSize: 11, color: FoaColors.of(context).muted)),
                 const Spacer(),
                 IconButton(
                   tooltip: _onlyErrors ? '显示全部' : '只看错误',
                   visualDensity: VisualDensity.compact,
-                  onPressed: () =>
-                      setState(() => _onlyErrors = !_onlyErrors),
+                  onPressed: () => setState(() => _onlyErrors = !_onlyErrors),
                   icon: Icon(
                     _onlyErrors ? Icons.filter_alt : Icons.filter_alt_off,
                     size: 18,
-                    color: _onlyErrors
-                        ? const Color(0xFFFF7A7A)
-                        : Colors.grey,
+                    color: _onlyErrors ? const Color(0xFFFF7A7A) : Colors.grey,
                   ),
                 ),
                 IconButton(
@@ -1263,8 +1539,8 @@ class _LogSheetState extends State<_LogSheet> {
                 ? Center(
                     child: Text(
                       _onlyErrors ? '没有匹配的错误行' : '暂无日志',
-                      style:
-                          TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
+                      style: TextStyle(
+                          fontSize: 12, color: FoaColors.of(context).muted),
                     ),
                   )
                 : NotificationListener<ScrollNotification>(

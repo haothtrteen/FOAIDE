@@ -54,12 +54,15 @@ void main() {
   group('打包面板 · 前置检查先于构建', () {
     test('_start 里第一步就是 _preflight', () {
       final i = src.indexOf('Future<void> _start() async {');
-      final body = src.substring(i, src.indexOf('Future<void> _confirmClean()'));
+      final body =
+          src.substring(i, src.indexOf('Future<void> _confirmClean()'));
       final pre = body.indexOf('await _preflight()');
-      final go = body.indexOf('widget.onStartBuild()');
+      // alpha.93：onStartBuild 带上构建类型（debug 档不走 AOT）
+      final go = body.indexOf('widget.onStartBuild(_flavor)');
       expect(pre, greaterThanOrEqualTo(0));
-      expect(go, greaterThan(pre),
-          reason: '先检查再构建——顺序反了就失去"提前拦下"的意义');
+      expect(go, greaterThan(pre), reason: '先检查再构建——顺序反了就失去"提前拦下"的意义');
+      expect(go, greaterThanOrEqualTo(0),
+          reason: '开始构建必须把构建类型传给父页，否则 BuildRunner 拿不到 flavor');
     });
 
     test('检查项区分 blocking 与提示项（不是所有缺项都拦人）', () {
@@ -70,8 +73,7 @@ void main() {
 
     test('阻断项存在时必须让用户二次确认，不能直接拒绝', () {
       expect(src.contains('前置检查未通过'), isTrue);
-      expect(src.contains('仍要继续吗？'), isTrue,
-          reason: '检查可能是误报，必须给"我就要构建"的出路');
+      expect(src.contains('仍要继续吗？'), isTrue, reason: '检查可能是误报，必须给"我就要构建"的出路');
     });
 
     test('首次进入就静默检查一次（不阻塞界面）', () {
@@ -218,7 +220,8 @@ void main() {
     });
 
     test('已经跑完且非 idle 时才显示结果卡', () {
-      expect(src.contains('!r.building && mine && r.status != BuildStatus.idle'),
+      expect(
+          src.contains('!r.building && mine && r.status != BuildStatus.idle'),
           isTrue);
     });
 
@@ -247,8 +250,14 @@ void main() {
 
   group('打包面板 · 构建过程中的状态不会自相矛盾', () {
     test('构建中不显示"开始构建"按钮组', () {
-      final i = src.indexOf('if (otherBuilding) _otherBuildingCard()');
-      final body = src.substring(i, src.indexOf('// ---------- 别人的构建占着'));
+      // ⚠️ 别按"整行字符串"找：`dart format` 会把长的 collection-if 折行，
+      // 断言的是**逻辑**（有个 otherBuilding 分支），不是排版。
+      final m = RegExp(r'if\s*\(otherBuilding\)\s*_otherBuildingCard\(\)')
+          .firstMatch(src);
+      expect(m, isNotNull, reason: '找不到"别人在构建"的分支');
+      final end = src.indexOf('// ---------- 别人的构建占着');
+      expect(end, greaterThan(m!.start), reason: '章节锚点必须落在分支之后');
+      final body = src.substring(m.start, end);
       expect(body.contains('_buildingCard()'), isTrue);
       expect(body.contains('_actionsCard()'), isTrue,
           reason: '_actionsCard 在 else 分支里，构建中不该出现');

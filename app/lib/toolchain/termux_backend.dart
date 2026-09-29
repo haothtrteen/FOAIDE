@@ -130,6 +130,15 @@ class TermuxPaths {
 
   static String flutterHome(EnvInfo env) => '${prefix(env)}/opt/flutter';
 
+  /// alpha.97：termux 后端**没有**独立 SDK 目录——Flutter 的 Android
+  /// 构建链（build-tools / platform-tools）都在 prefix 下。
+  ///
+  /// 这个 getter 存在的意义是给 [QemuCompat.fill] 的 `@SDK@` 占位符
+  /// 一个后端正确的值：heal 脚本用它扫 `$S/build-tools/*` 与
+  /// `$S/platform-tools`。原先写死容器的 `/opt/android-sdk`，termux 下
+  /// 那两个目录都不存在 → heal 的第三段**静默空跑**。
+  static String sdkHome(EnvInfo env) => prefix(env);
+
   static String aapt2(EnvInfo env) => '${prefix(env)}/bin/aapt2';
 
   static bool prefixExists(EnvInfo env) => Directory(prefix(env)).existsSync();

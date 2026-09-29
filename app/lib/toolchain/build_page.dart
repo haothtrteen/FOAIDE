@@ -3,8 +3,10 @@ import 'package:flutter/material.dart';
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
 import '../filemanager/fs_browser_bridge.dart';
+import 'artifact_prefetch.dart';
 import 'build_notify.dart';
 import 'build_runner.dart';
+import 'first_build_notice.dart';
 import 'termux_backend.dart';
 import '../core/theme.dart';
 
@@ -61,6 +63,32 @@ class _BuildPageState extends State<BuildPage> {
   /// 未选择过 = proot（构建页不弹询问，默认值）。
   BuildBackend _backend = BuildBackend.proot;
 
+  /// alpha.93：构建类型（与工作台打包区共享同一份偏好，
+  /// 用户在那里选了 debug，从通知回跳进来仍然是 debug）。
+  BuildFlavor _flavor = BuildFlavor.release;
+
+  /// alpha.95：构件预取（入口放在"正要构建"这一刻）。
+  ///
+  /// 之前的入口只在工具链页 —— 但触发场景是"在打包区点了构建、第一次
+  /// 慢 20~30 分钟"，用户在错的地方等。放到这里让他**在下手之前**就看到。
+  /// 工具链页那一份保留（那是"我想主动预取"的心智）。
+  final PrefetchJob _prefetch = PrefetchJob(ProotBridge());
+  bool _prefetchDone = false;
+  bool _prefetchFailed = false;
+
+  /// 是否还要显示预取提示卡：跑过一次就不再占地方。
+  bool get _showPrefetchHint => !_prefetchDone && !_prefetchFailed;
+
+  /// 这台设备上是否已经成功构建过一次。
+  ///
+  /// false 时：点「构建」先弹一次时长说明（见 [showFirstBuildNotice]），
+  /// 构建中进度面板再挂一条常驻提示。真正成功构建一次后才转 true
+  /// （标记写在 `BuildRunner._finish`，不在本页 —— 用户中途锁屏切走
+  /// 才是常态，写在页面上会漏记）。
+  // 初值 false（= 当作还没构建过）：与 FirstBuildPrefs.done() 的"读不到
+  // 就返回 false"同向 —— 加载失败时宁可多提示一次。
+  bool _firstBuildDone = false;
+
   /// 滚动是否跟随到底部。用户手动上滑看历史时自动关闭，避免被强行拽回。
   bool _autoScroll = true;
   bool _showJumpToBottom = false;
@@ -91,6 +119,9 @@ class _BuildPageState extends State<BuildPage> {
     r.onAutoScroll = () {
       if (_autoScroll) _scrollToBottom();
     };
+    _prefetch.onChanged = () {
+      if (mounted) setState(() {});
+    };
     _load();
   }
 
@@ -101,8 +132,27 @@ class _BuildPageState extends State<BuildPage> {
     // 前台服务保活，通知栏可见进度，点通知回本页。只解绑 UI 钩子。
     r.onUiChanged = null;
     r.onAutoScroll = null;
+    // 预取是**可以离开页面继续跑**的（182MB 要下几分钟），
+    // 所以这里只解绑回调，不停任务。
+    _prefetch.onChanged = null;
     _scroll.dispose();
     super.dispose();
+  }
+
+  /// 开始预取 debug 档构件（打包区那个入口专用：只取 debug）。
+  Future<void> _startPrefetch() async {
+    await _prefetch.start(PrefetchMode.debug);
+    if (!mounted) return;
+    if (_prefetch.ok) {
+      setState(() {
+        _prefetchDone = true;
+        _prefetchFailed = false;
+      });
+    } else if (_prefetch.error.isNotEmpty) {
+      // 失败时**保留卡片**（用户要看到失败原因并重试），
+      // 不能像成功那样把入口收掉。
+      setState(() => _prefetchFailed = true);
+    }
   }
 
   Future<void> _load() async {
@@ -113,6 +163,8 @@ class _BuildPageState extends State<BuildPage> {
     try {
       final env = await _bridge.envInfo();
       final backend = await BackendPrefs.load(env);
+      final flavor = await FlavorPrefs.load(env);
+      final firstDone = await FirstBuildPrefs.done();
       final list = env.rootfsInstalled
           ? await _fb.browse('/root/projects')
           : null;
@@ -120,6 +172,8 @@ class _BuildPageState extends State<BuildPage> {
       setState(() {
         _env = env;
         if (backend != null) _backend = backend;
+        _flavor = flavor;
+        _firstBuildDone = firstDone;
         _projects = (list?.entries ?? const []).where((e) => e.isDir).toList();
         _loading = false;
       });
@@ -160,7 +214,7 @@ class _BuildPageState extends State<BuildPage> {
   static String _mb(int bytes) =>
       (bytes / 1048576).toStringAsFixed(1);
 
-  /// 点构建：通知可用性提示（不阻断）→ 全局 Runner 启动。
+  /// 点构建：通知可用性提示（不阻断）→ 首次时长说明（拦一次）→ Runner 启动。
   Future<void> _startBuild(String name) async {
     final env = _env;
     if (env == null || r.building) return;
@@ -176,7 +230,14 @@ class _BuildPageState extends State<BuildPage> {
         ),
       );
     }
-    await r.start(name, env, _backend);
+    // 首次构建的时长预告。**放在启动之前而不是之后**：等到日志挂在那儿
+    // 不动时再说"这会很慢"已经晚了 —— 用户那时已经在找"取消"按钮了。
+    if (!_firstBuildDone) {
+      if (!mounted) return;
+      final go = await showFirstBuildNotice(context);
+      if (go != true) return; // 用户选了「取消」，别开始
+    }
+    await r.start(name, env, _backend, flavor: _flavor);
   }
 
   Future<void> _cancel() => r.cancel();
@@ -216,6 +277,103 @@ class _BuildPageState extends State<BuildPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('构建 APK')),
       body: r.status == BuildStatus.idle ? _buildProjectList() : _buildLogView(),
+    );
+  }
+
+  // ============================ 构件预取 ============================
+
+  /// 「先预取构件」提示卡（alpha.95，打包区的构建前入口）。
+  ///
+  /// 为什么值得单独一张卡：这两批构件（debug 约 182MB）**不在本地 SDK 缓存
+  /// 里**，第一次打某个档位的包必然要联网下。用户看到的是进度条卡在
+  /// "下载 io.flutter:*"很久，很容易以为构建挂了。提前点一下，构建时
+  /// 就不触发下载。
+  Widget _prefetchCard() {
+    final running = _prefetch.running;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.cloud_download_outlined,
+                    size: 18, color: Color(0xFFFFC46B)),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text('第一次构建前，可以先下好构件',
+                      style: TextStyle(
+                          fontSize: 13, fontWeight: FontWeight.w600)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Flutter 的 Gradle 插件在构建期从 download.flutter.io 拉 '
+              'io.flutter:* 构件，这批文件不在本地 SDK 缓存里 —— 第一次打包'
+              '必然要联网下（debug 约 ${PrefetchMode.debug.sizeHint}）。'
+              '提前点一下，构建时就不用等了。不点也能构建，只是慢。',
+              style: TextStyle(
+                  fontSize: 11,
+                  height: 1.45,
+                  color: FoaColors.of(context).muted),
+            ),
+            const SizedBox(height: 10),
+            if (running) ...[
+              Row(
+                children: [
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text('正在预取…（可离开本页，会在后台继续）',
+                        style: TextStyle(
+                            fontSize: 11,
+                            color: FoaColors.of(context).muted)),
+                  ),
+                  TextButton(
+                    onPressed: _prefetch.stop,
+                    child: const Text('取消'),
+                  ),
+                ],
+              ),
+              if (_prefetch.lines.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                Text(
+                  _prefetch.lines.last,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 10, fontFamily: 'monospace', color: Colors.grey),
+                ),
+              ],
+            ] else
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: _startPrefetch,
+                      icon: const Icon(Icons.download_outlined, size: 17),
+                      label: const Text('预取 debug 构件',
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // "不用了"要能关掉：这个卡片是**提醒**不是阻塞，
+                  // 不给出口就变成了每次进来都被念一遍。
+                  TextButton(
+                    onPressed: () => setState(() => _prefetchDone = true),
+                    child: const Text('不用'),
+                  ),
+                ],
+              ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -286,6 +444,11 @@ class _BuildPageState extends State<BuildPage> {
           ),
         ),
         const SizedBox(height: 12),
+        // alpha.95：构件预取入口。放在项目列表**上方** —— 用户在点构建
+        // 之前就会看到，而不是构建卡在"下载 io.flutter:* 构件"时才后悔。
+        // 跑过 / 失败过就不再占地方（这个提示本身不该变成常驻噪音）。
+        if (_showPrefetchHint && !_loading && _loadError.isEmpty)
+          _prefetchCard(),
         if (_loading)
           const Padding(
             padding: EdgeInsets.all(24),
@@ -561,9 +724,10 @@ class _BuildPageState extends State<BuildPage> {
               ),
               if (building) ...[
                 const SizedBox(width: 10),
+                // 时长信息交给下面那条单独的提示条（带底色、带"后面会快"
+                // 的解释）；这里只说保活，一句话一件事，塞一起反而都看不清。
                 Text(
-                  '构建为长任务（首次 15~30 分钟），退到桌面/锁屏后由前台服务保活，'
-                      '通知栏可见进度',
+                  '退到桌面/锁屏后由前台服务保活，通知栏可见进度',
                   style: TextStyle(
                       fontSize: 11,
                       color: FoaColors.of(context).muted,
@@ -572,6 +736,41 @@ class _BuildPageState extends State<BuildPage> {
               ],
             ],
           ),
+          // 首次构建的常驻提醒。弹窗只在点「构建」那一刻出现一次，
+          // 而这 20~30 分钟里用户会反复回来看 —— 他每次都需要被提醒
+          // "现在慢是正常的"，否则"是不是卡住了"的念头会一直回来。
+          if (building && !_firstBuildDone) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFFC46B).withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                    color: const Color(0xFFFFC46B).withValues(alpha: 0.35)),
+              ),
+              child: const Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Padding(
+                    padding: EdgeInsets.only(top: 1),
+                    child: Icon(Icons.hourglass_empty,
+                        size: 14, color: Color(0xFFFFC46B)),
+                  ),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '第一次构建通常需要 20~30 分钟（Gradle 冷启动 + 拉取依赖），'
+                      '进度条前期走得慢是正常的。构建一次之后，同一个项目再构建'
+                      '一般 1~3 分钟。',
+                      style: TextStyle(
+                          fontSize: 11, height: 1.45, color: Color(0xFFFFC46B)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
           if (!building && r.hints.isNotEmpty) ...[
             const SizedBox(height: 8),
             const Divider(height: 1),

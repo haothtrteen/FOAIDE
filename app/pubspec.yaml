@@ -1,7 +1,7 @@
 name: foaide
 description: FOAIDE - a Flutter IDE that runs natively on Android, with a local Flutter SDK, in-device container, Web hot-reload preview and on-device APK building.
 publish_to: 'none'
-version: 0.1.0-alpha.63+63
+version: 0.1.0-alpha.98+98
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -21,6 +21,18 @@ dependencies:
   highlight: ^0.7.0
   flutter_highlight: ^0.7.0
   dart_style: ^3.1.13
+
+  # alpha.71 导入已有 UI：用真正的 Dart 解析器（不是正则）把项目里
+  # 已写好的 build 方法还原成设计树。正则干这个活会在第一个多行参数、
+  # 第一个嵌套字符串时就散架。
+  #
+  # ⚠️ 它**本来就是** transitive 依赖（dart_style 要求 analyzer >=13.1.0），
+  # 这里显式声明是**故意**的：靠别人捎带的话，哪天 dart_style 换实现或
+  # 去掉这条依赖，我们的 import 会**静默消失**（表现为编译期报
+  # "Target of URI doesn't exist"，而错误信息完全指不到根因）。
+  # 自己用的东西自己声明。
+  analyzer: ^14.4.0
+
   url_launcher: ^6.3.2
   crypto: ^3.0.7
 
@@ -37,6 +49,12 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  # alpha.69 App 图标：从 assets/icon/ 的 1024 源图生成各密度的
+  # mipmap-*/ic_launcher.png + adaptive icon 前景层。
+  # 源图由 tools/gen_icon.py 画（不手绘、不引二进制素材）。
+  # 配置见 flutter_launcher_icons.yaml；重新生成：
+  #   python3 tools/gen_icon.py && dart run flutter_launcher_icons
+  flutter_launcher_icons: ^0.14.4
 
 flutter:
   uses-material-design: true
@@ -46,3 +64,8 @@ flutter:
     - assets/tools/
     - assets/rootfs/
     - assets/ca/
+    # alpha.70：关于页头部要显示应用图标，直接复用启动器那张源图。
+    # 复用而非另生成一张小尺寸副本 —— 那样两份图迟早会漂移，
+    # 用户会看到"关于页的图标和桌面图标不一样"。
+    # 代价是 1024×1024 源图（8.6KB）被当运行时资产打进包，可忽略。
+    - assets/icon/

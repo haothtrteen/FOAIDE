@@ -87,16 +87,24 @@ class CloudflaredInstall {
   /// 不是锦上添花，是必需项。子集截断能骗过大小检查与探测，只有内容校验
   /// 拦得住。
   static const List<MirrorSource> mirrors = [
-    MirrorSource('ghfast', 'https://ghfast.top/https://github.com/'
-        'cloudflare/cloudflared/releases/download/$version/$assetName'),
-    MirrorSource('gh-proxy.com', 'https://gh-proxy.com/https://github.com/'
-        'cloudflare/cloudflared/releases/download/$version/$assetName'),
+    MirrorSource(
+        'ghfast',
+        'https://ghfast.top/https://github.com/'
+            'cloudflare/cloudflared/releases/download/$version/$assetName'),
+    MirrorSource(
+        'gh-proxy.com',
+        'https://gh-proxy.com/https://github.com/'
+            'cloudflare/cloudflared/releases/download/$version/$assetName'),
     // ghproxy.net 实测会截断，排在有验证的源之后（仍保留：不同网络下
     // 表现可能不同，多一条路总比少一条好）
-    MirrorSource('ghproxy.net', 'https://ghproxy.net/https://github.com/'
-        'cloudflare/cloudflared/releases/download/$version/$assetName'),
-    MirrorSource('github', 'https://github.com/cloudflare/cloudflared/'
-        'releases/download/$version/$assetName'),
+    MirrorSource(
+        'ghproxy.net',
+        'https://ghproxy.net/https://github.com/'
+            'cloudflare/cloudflared/releases/download/$version/$assetName'),
+    MirrorSource(
+        'github',
+        'https://github.com/cloudflare/cloudflared/'
+            'releases/download/$version/$assetName'),
   ];
 
   /// Bug 464：逐镜像探测并汇报**具体失败原因**（供 UI「下载诊断」用）。
@@ -132,17 +140,27 @@ class CloudflaredInstall {
 
     // ② 下载到宿主可见路径（rootfs 内 → 容器内也在同一位置）
     final savePath = '${env.rootfsPath}/opt/foa-bin/cloudflared.dl';
-    onLog?.call('· 下载 $assetName（约 ${(expectedSize / 1024 / 1024).toStringAsFixed(0)}MB）…');
+    onLog?.call(
+        '· 下载 $assetName（约 ${(expectedSize / 1024 / 1024).toStringAsFixed(0)}MB）…');
     try {
       final fastest = await SdkDownloader.pickFastest(mirrors);
       await SdkDownloader.downloadMultiSource(
         fastest,
         savePath,
         expectedSize,
+        // Bug 470：**单流下载**（segments: 1）。
+        // cloudflared 只有约 37MB、源也少，分段并发的收益远小于它的风险：
+        // 分段路径在"镜像不支持 Range"时要走整包兜底，而兜底与并发分片
+        // 曾产生竞态（分片 0 删掉其它分片仍持有句柄的文件 → 真机报
+        // PathNotFoundException，表现为"4/4 镜像可用却下载失败"）。
+        // 单流没有分片、没有拼接、也没有那个竞态面。
+        segments: 1,
+        sha256: sha256,
         onProgress: (p) {
           if (p.total > 0 && p.received % (4 * 1024 * 1024) < 65536) {
             final pct = (p.received * 100 / p.total).toStringAsFixed(0);
-            onLog?.call('· 下载中 $pct%（${(p.received / 1024 / 1024).toStringAsFixed(1)}MB）');
+            onLog?.call(
+                '· 下载中 $pct%（${(p.received / 1024 / 1024).toStringAsFixed(1)}MB）');
           }
         },
         onMirrorUsed: (m) => onLog?.call('· 使用镜像源：${m.name}'),

@@ -4,13 +4,30 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- alpha.31 构建前台服务：退到桌面/锁屏构建继续（保活 proot/gradle/dart 进程树） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- 通知栏构建进度（Android 13+ 运行时权限；targetSdk<33 由系统自动授予） -->
+    <!-- 通知栏构建进度（Android 13+ 运行时权限）。
+         ⚠️ 这句话原先写的是"targetSdk<33 由系统自动授予"，只对**设备升级**
+         场景成立：Android 13+ **新装**的应用通知默认是关的。而且 targetSdk<33
+         时判定权在系统手里（见 REQUEST_INSTALL_PACKAGES 下方说明），
+         应用无法主动弹框，只能检查 + 引导去设置页。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- alpha.72 安装构建产物：从系统安装器拉起 APK。
+         之前**整条缺失** —— 连系统设置里「安装未知应用」的列表中都找不到本应用，
+         于是构建完点「安装」必被系统拦下，且用户无处可开。
+         targetSdk=28 ≥ 26，所以这道 AppOps 闸门（OP_REQUEST_INSTALL_PACKAGES）
+         对我们是**生效**的：必须声明 + 用 canRequestPackageInstalls() 检查 +
+         在未开启时跳 ACTION_MANAGE_UNKNOWN_APP_SOURCES（引导页第 3 页负责）。
+         注意它不是危险权限，没有运行时弹框，requestPermissions() 对它无效。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name="${applicationName}"
         android:label="FOAIDE"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:icon="@mipmap/ic_launcher">
+        <!-- alpha.58 Web 预览：targetSdk 28 默认禁明文 HTTP，App 内 WebView
+             要加载 http://127.0.0.1:8090（容器开发服务器）——networkSecurityConfig
+             只放行 127.0.0.1/localhost，不开全局明文（其余域仍强制 HTTPS）。
+             浏览器进程不受本 App manifest 约束，系统浏览器路径不受影响。 -->
         <!-- proot 走 jniLibs 路径需要 so 落地为真实文件：AGP 9 起由
              build.gradle.kts 的 packaging.jniLibs.useLegacyPackaging = true 控制
              （等价于旧 Manifest 属性 extractNativeLibs="true"） -->
@@ -45,8 +62,8 @@
         <!-- Step 6：构建产物 APK 安装——FileProvider 授权 content:// 给系统安装器。
              authority 用 ${applicationId} 占位符（AGP 在合并清单时替换为真实包名），
              与 MainActivity.fileProviderAuthority 同源——改包名时无需改这里。
-             历史教训：曾写死完整包名，与 Kotlin 侧各存一份，改包名漏改一处会在
-             安装 APK 时抛 IllegalArgumentException。 -->
+             历史教训：曾写死 "dev.foa.flutter_on_android.fileprovider"，与 Kotlin
+             侧各存一份，改包名漏改一处会在安装 APK 时抛 IllegalArgumentException。 -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

@@ -18,8 +18,7 @@ class FsEntry {
   });
 
   /// 容器内完整路径。
-  String pathOf(String parent) =>
-      parent == '/' ? '/$name' : '$parent/$name';
+  String pathOf(String parent) => parent == '/' ? '/$name' : '$parent/$name';
 
   factory FsEntry.fromMap(Map<Object?, Object?> m) => FsEntry(
         name: m['name'] as String? ?? '',

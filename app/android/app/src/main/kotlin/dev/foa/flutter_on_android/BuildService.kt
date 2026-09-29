@@ -29,8 +29,14 @@ import android.os.IBinder
  *   Dart 就绪后 takeNavigate 拉取（MainActivity.pendingNavigate 暂存）。
  *
  * 权限注记（targetSdk 28）：FOREGROUND_SERVICE（API 28+ 必需）声明即可，
- * 无 foregroundServiceType 强制（那是 targetSdk 34+ 的约束）；
- * POST_NOTIFICATIONS 对 targetSdk<33 的应用在 Android 13+ 由系统自动授予。
+ * 无 foregroundServiceType 强制（那是 targetSdk 34+ 的约束）。
+ *
+ * ⚠️ POST_NOTIFICATIONS 这里原先写的是"对 targetSdk<33 的应用在 Android 13+
+ * 由系统自动授予" —— **只对设备升级场景成立**。Android 13+ **新装**的应用
+ * 通知默认是关的；而且 targetSdk<33 时弹框时机由系统掌握（"建过通知渠道后
+ * 的某次启动"才问一次），点一次「不允许」就永不重弹。所以本应用对通知
+ * 权限只能"检查 + 引导去设置页"（见 MainActivity.openNotificationSettings），
+ * 不能指望它自动就有。
  */
 class BuildService : Service() {
 

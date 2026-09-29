@@ -18,8 +18,13 @@ import 'package:foaide/core/theme.dart';
 /// 单测无法验证真机渲染，但可以拦住"改了 Dart 忘了改 Kotlin/XML"这类
 /// 最容易复发的失误。
 void main() {
-  const darkHex = 0xFF101418;
-  const lightHex = 0xFFF5F7F8;
+  // alpha.92：浅色值由 #F5F7F8 改为 #FBFCFD。
+  // 原因见 `FoaTheme.lightSurface` 的注释 —— Bug 457 只对齐了
+  // "状态栏 vs 顶栏"，顶栏当时是 transparent、透出的是 `surface`
+  // （浅色下带绿调的 #F6FBF3），于是顶部仍有三段色。
+  // 现在三色统一到 panelBg，这个常量必须跟着走。
+  const darkHex = 0xFF14181E;
+  const lightHex = 0xFFFBFCFD;
 
   group('Dart 侧主题常量', () {
     test('浅色主题状态栏必须是实色，不能是 transparent', () {
@@ -38,7 +43,7 @@ void main() {
       expect(style.statusBarIconBrightness, Brightness.dark);
     });
 
-    test('深色主题状态栏保持 #101418 + 浅色图标', () {
+    test('深色主题状态栏跟随 panelBg + 浅色图标', () {
       final style = FoaTheme.dark().appBarTheme.systemOverlayStyle!;
       expect(style.statusBarColor!.toARGB32(), equals(darkHex));
       expect(style.statusBarIconBrightness, Brightness.light);
@@ -73,10 +78,14 @@ void main() {
       final xml = f('android/app/src/main/res/values/colors.xml');
       expect(xml.existsSync(), isTrue, reason: '颜色资源文件应存在');
       final t = xml.readAsStringSync().toUpperCase();
-      expect(t.contains(rgb(darkHex)), isTrue,
-          reason: 'foa_bg 应为 #FF101418（深色）');
+      // alpha.92：foa_bg 是**窗口背景**（= FoaTheme.bg 的 #101418），
+      // foa_bg_light 是浅色的窗口/系统栏底（= lightSurface）。两者不同源是
+      // 刻意的 —— 深色的窗口背景与顶栏差 2.5% 亮度，浅色则同值
+      // （浅色下顶栏底下没有"浮起的一块"，同值更干净）。
+      expect(t.contains(rgb(0xFF101418)), isTrue,
+          reason: 'foa_bg 应为 #FF101418（= FoaTheme.bg，窗口背景）');
       expect(t.contains(rgb(lightHex)), isTrue,
-          reason: 'foa_bg_light 应为 #FFF5F7F8（浅色）');
+          reason: 'foa_bg_light 应为 lightHex（浅色窗口/系统栏底）');
     });
 
     test('浅色 styles.xml 用浅色值、night 用深色值', () {
@@ -97,10 +106,14 @@ void main() {
       final kt = f(
         'android/app/src/main/kotlin/dev/foa/flutter_on_android/MainActivity.kt',
       ).readAsStringSync();
-      expect(kt.contains('0xFF101418'), isTrue,
-          reason: 'Kotlin 深色兜底应含 0xFF101418（与 FoaTheme.bg 同源）');
-      expect(kt.contains('0xFFF5F7F8'), isTrue,
-          reason: 'Kotlin 浅色兜底应含 0xFFF5F7F8（与 FoaTheme.lightSurface 同源）');
+      // alpha.92：Kotlin 兜底的目标值从 `FoaTheme.bg` 改成 `FoaTheme.panelBg`
+      // —— 它设的是**系统栏**色，而系统栏现在与顶栏同色（panelBg）。
+      expect(kt.contains('0xFF14181E.toInt()'), isTrue,
+          reason: 'Kotlin 深色兜底应含 0xFF14181E（与 panelBg(dark) 同源）');
+      expect(kt.contains('0xFFFBFCFD.toInt()'), isTrue,
+          reason: 'Kotlin 浅色兜底应含 0xFFFBFCFD（与 lightSurface 同源）');
+      expect(kt.contains('0xFFF5F7F8'), isFalse,
+          reason: '0xFFF5F7F8 是 alpha.92 之前的浅色值，改漏了会与顶栏分叉');
     });
 
     test('main.dart 不再硬编码深色 overlay（改走 FoaTheme.overlayFor）', () {

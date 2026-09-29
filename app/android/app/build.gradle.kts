@@ -95,3 +95,106 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+// ---------------------------------------------------------------------------
+// Bug 627 的**出包侧** workaround（alpha.94）
+//
+// 现象：`mergeReleaseJniLibFolders` 必挂
+//   Failed to create MD5 hash for file: .../merged_jni_libs/.../libapp.so
+//
+// 实测结论（alpha.94 重新取证，推翻了 alpha.92 的"sync 后就恢复"）：
+//   · 文件是**完好的** —— 等约 20s 后 md5sum 立刻成功，且与上游
+//     merged_native_libs / generated/jniLibs 两处同名文件 md5 **完全一致**；
+//   · 只有 gradle **刚 copy 出来的那一份**立刻读会 `Input/output error`
+//     （`dd` 读出 0 字节，`stat` 大小正常）；
+//   · `sync` 之后**仍然复挂**（sync 只是发起回写，返回≠落盘完成）。
+//
+// 也就是说：Gradle 在这个 overlayfs 上"写完马上 hash"撞进一个窗口。
+//
+// ⚠️⚠️ alpha.96 **第二次更正** —— alpha.94 的 `doLast` 解法**不够**。
+//
+// alpha.96 出包时复现，报错变了：
+//
+//   > Cannot access output property 'outputDir' of task
+//   >   ':app:mergeReleaseJniLibFolders'. Accessing unreadable inputs or
+//   >   outputs is not supported.
+//   > Failed to create MD5 hash for file: .../libapp.so
+//
+// 关键：**报错的是"访问 outputDir"这个动作本身**，不是某个具体文件。
+// 说明 `doLast` 里读通之后，Gradle 自己的快照阶段**又读了一次**
+// （这次走的是 `outputDir` 属性），而那一下又撞进 IO error 窗口。
+//
+// 也就是说：`doLast` 只保证了"我读的时候可读"，**保证不了"Gradle 读的时候可读"**。
+// 中间隔了一个快照阶段，时间窗又拉开了。
+//
+// 试过 **`doNotTrackState()`**（Gradle 报错里建议的那条），**不行**：
+//   > Changes are not tracked, unable determine incremental changes.
+//   这个 task 是增量的，关掉状态跟踪后它自己就没法工作了。
+//
+// alpha.96 采用的解法：**加 `doFirst` 预热 + 延长 `doLast` 重试**。
+//
+//   · `doFirst`：copy 之前先等**上一轮的残留产物**可读（如果有），
+//     把"上一次留下的不可读窗口"在 task 开始前就消掉；
+//   · `doLast`：copy 之后读到可读为止（最多 60s，alpha.94 是 30s）；
+//   · 两段都读 `outputs.files.files`，覆盖 Gradle 两条访问路径。
+//
+// ⚠️ 这条**只加在 FOA 自己的出包工程**里，不要抄进给用户工程用的 Flutter
+// 模板：这个 IO error 是本沙箱 overlayfs 的现象，手机上是真实 ext4/f2fs，
+// 且用户的构建脚本该保持干净。
+// ---------------------------------------------------------------------------
+
+/// Bug 627 的等待助手：把所有输出文件读到"读得动"为止。
+///
+/// 抽成函数是因为 `doFirst` / `doLast` 两处要用同一套逻辑。
+///
+/// ⚠️ 别写 `java.util.*`：脚本里 `java` 是 JavaPluginExtension 的属性名，
+/// 会被 `plugins {}` 遮蔽成 `Unresolved reference`（这个坑本项目踩过两次）。
+fun bug627WaitReadable(
+    files: Iterable<File>,
+    label: String,
+    maxMs: Long,
+) {
+    val deadline = System.currentTimeMillis() + maxMs
+    var waited = 0
+    while (System.currentTimeMillis() < deadline) {
+        try {
+            var n = 0
+            // 显式栈遍历：Kotlin DSL 里 FileTree.visit {} 的重载
+            // 解析不出 lambda 参数（会报 Unresolved reference 'it'）。
+            val stack = mutableListOf<File>()
+            files.forEach { stack.add(it) }
+            while (stack.isNotEmpty()) {
+                val f = stack.removeAt(stack.lastIndex)
+                if (f.isDirectory) {
+                    f.listFiles()?.forEach { stack.add(it) }
+                } else {
+                    // 读一小段就够触发 overlayfs 的 IO error
+                    f.inputStream().use { s -> s.read(ByteArray(8192)) }
+                    n++
+                }
+            }
+            if (waited > 0) {
+                logger.lifecycle("Bug 627[$label]：等 ${waited}s 后 $n 个文件可读")
+            }
+            return
+        } catch (e: java.io.IOException) {
+            Thread.sleep(1000)
+            waited++
+        }
+    }
+    logger.warn("Bug 627[$label]：等了 ${maxMs / 1000}s 仍不可读")
+}
+
+tasks.configureEach {
+    if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
+        // ① copy 之前：把上一轮残留的不可读窗口消掉
+        doFirst {
+            bug627WaitReadable(outputs.files.files, "pre", 15_000)
+        }
+        // ② copy 之后：等新产物可读
+        doLast {
+            bug627WaitReadable(outputs.files.files, "post", 60_000)
+        }
+    }
+}
+

@@ -15,6 +15,37 @@ import 'sdk_installer.dart';
 /// 创建工程/构建 APK 全部 exit 1。此处幂等确保：已装秒过，缺失走 apt 镜像
 /// 安装（镜像已在 Step 3 配好，国内源可用）；装好后再把 git 的 github
 /// 克隆改写为国内镜像（gitclone.com），避免直连 github 超时。
+/// 磁盘空间体检结果（alpha.93）。
+///
+/// 两档阈值的依据：
+/// - **2GB 以下告警**：手册 Bug 603 定的线。Flutter 首次构建要落
+///   Gradle 依赖缓存 + 引擎构件 + 中间产物，2GB 是"还能跑但紧张"；
+/// - **800MB 以下阻断**：这个量级下 `No space left on device` 几乎必然
+///   发生，而手机上一次构建 20~30 分钟——**让它跑下去纯属浪费时间**，
+///   不如拦下来让用户先清空间。
+///
+/// 只告警不阻断的那档是有意的：空间估算受机型/项目差异影响大，
+/// 为了"可能不够"就拒绝构建，比多提示一句更惹人烦。
+class DiskSpace {
+  final int freeMb;
+
+  const DiskSpace({required this.freeMb});
+
+  static const int warnMb = 2048;
+  static const int blockMb = 800;
+
+  bool get blocking => freeMb < blockMb;
+  bool get warning => freeMb < warnMb;
+
+  String get human => freeMb >= 1024
+      ? '${(freeMb / 1024).toStringAsFixed(1)} GB'
+      : '$freeMb MB';
+
+  String get advice =>
+      '清理入口：工作台打包区「清理缓存」（flutter clean），'
+      '或到「工具链」页删除不用的 SDK 版本与 Gradle 缓存。';
+}
+
 class ToolchainEnsure {
   final ProotBridge _bridge = ProotBridge();
 
@@ -403,6 +434,32 @@ class ToolchainEnsure {
   }
 
   /// 确保容器内 git 可用并完成国内镜像配置；成功返回 null，失败返回错误文案。
+  /// 构建前磁盘空间体检（手册 Bug 603 方案第 1 条，alpha.93 落地）。
+  ///
+  /// 以前只有**失败后**的分诊提示（`no space left` → 建议清理），
+  /// 而一次构建在手机上是 20~30 分钟——等它烧完再告诉用户"空间不够"
+  /// 等于白等。所以挪到构建前。
+  ///
+  /// 返回 null = 空间充足；否则返回**给用户的提示文案**，
+  /// [DiskSpace.blocking] 表示是否该拦下构建。
+  Future<DiskSpace?> diskSpace() async {
+    // `df -Pm` 用 POSIX 单行格式（避免长设备名换行导致解析错位），
+    // 单位是 MB。取 /root 所在挂载点——rootfs、Gradle 缓存、构建产物
+    // 全在这一棵树上，它是唯一会写满的地方。
+    final r = await _bridge.exec(
+      'df -Pm /root 2>/dev/null | tail -1 || echo DF_FAIL',
+      timeoutSec: 30,
+    );
+    final line = r.stdout.trim();
+    if (line.isEmpty || line.startsWith('DF_FAIL')) return null; // 探测不到就不挡路
+    final cols = line.split(RegExp(r'\s+'));
+    if (cols.length < 4) return null;
+    final free = int.tryParse(cols[3]);
+    if (free == null) return null;
+
+    return DiskSpace(freeMb: free);
+  }
+
   Future<String?> git() async {
     final check = await _bridge.exec(
       'command -v git >/dev/null 2>&1 && echo GIT_OK || echo GIT_MISSING',

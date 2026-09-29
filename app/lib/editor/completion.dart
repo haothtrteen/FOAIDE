@@ -4,7 +4,7 @@
 // Flutter 高频类型/方法）。够 Step 2 编辑体验用，
 // 后续工具链阶段可替换为真实 Dart analysis server 补全。
 
-enum CompletionKind { keyword, snippet, type, method }
+enum CompletionKind { keyword, snippet, type, method, identifier }
 
 class CompletionItem {
   final String word; // 匹配用的名称
@@ -156,10 +156,34 @@ const List<CompletionItem> kDartCompletions = [
 ];
 
 /// 前缀匹配：精确前缀优先，关键字其次，其余按字母序；最多 8 条。
-List<CompletionItem> matchCompletions(String prefix) {
+List<CompletionItem> matchCompletions(String prefix) =>
+    matchCompletionsWithIdentifiers(prefix, const <String>{});
+
+/// alpha.80：词库 + 当前文件标识符合并匹配（全文提取版）。
+///
+/// 借鉴 WebIDE 的 LocalCompletionLanguage 思路（零依赖本地补全）：
+/// 静态词库覆盖不到用户自定义的 `_buildActionButton` 这类名字，
+/// 扫一遍当前文件的标识符并进候选，补全实用度立刻上一个台阶。
+List<CompletionItem> matchCompletionsInSource(String prefix, String source) =>
+    matchCompletionsWithIdentifiers(prefix, extractIdentifiers(source));
+
+/// 核心版：标识符集合由调用方提供（编辑器侧对提取结果做 debounce 缓存，
+/// 避免每次按键都全文件正则扫描）。
+List<CompletionItem> matchCompletionsWithIdentifiers(
+    String prefix, Set<String> identifiers) {
   final p = prefix.toLowerCase();
-  final hits =
-      kDartCompletions.where((c) => c.word.toLowerCase().startsWith(p)).toList();
+  final hits = kDartCompletions
+      .where((c) => c.word.toLowerCase().startsWith(p))
+      .toList();
+  // 文件标识符：排除与词库重名（大小写不敏感）与正在输入的词本身。
+  final known = hits.map((c) => c.word.toLowerCase()).toSet();
+  for (final id in identifiers) {
+    if (id == prefix) continue; // 自己不补自己
+    if (known.contains(id.toLowerCase())) continue;
+    if (id.toLowerCase().startsWith(p)) {
+      hits.add(CompletionItem(id, CompletionKind.identifier));
+    }
+  }
   if (hits.isEmpty) return const [];
   hits.sort((a, b) {
     final ae = a.word.toLowerCase() == p ? 0 : 1;
@@ -171,4 +195,28 @@ List<CompletionItem> matchCompletions(String prefix) {
     return a.word.compareTo(b.word);
   });
   return hits.take(8).toList();
+}
+
+/// 从源码里提取标识符（去重、保出现序），供文件内补全。
+///
+/// - 最小长度 3：`x`/`ab` 这类短名补全没意义；
+/// - 首字符限字母/下划线（正则天然排除纯数字字面量）；
+/// - 上限 [kMaxFileIdentifiers]：防超大文件候选爆炸。
+const int kMaxFileIdentifiers = 400;
+
+/// 负向后顾：标识符前不能是字母/数字/下划线/$。
+/// 排除 `0xFF` 切出的伪标识符 `xFF`、`a1b` 内部重复匹配等数字字面量碎片；
+/// 故意**不含点**——`obj.method` 的属性名是常见补全需求，照收。
+final RegExp _identRegExp =
+    RegExp(r'(?<![A-Za-z0-9_$])[A-Za-z_$][A-Za-z0-9_$]*');
+
+Set<String> extractIdentifiers(String source) {
+  final out = <String>{};
+  if (source.isEmpty) return out;
+  for (final m in _identRegExp.allMatches(source)) {
+    final w = m.group(0)!;
+    if (w.length >= 3) out.add(w);
+    if (out.length >= kMaxFileIdentifiers) break;
+  }
+  return out;
 }

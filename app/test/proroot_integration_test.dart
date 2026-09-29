@@ -18,15 +18,13 @@ import 'package:foaide/toolchain/termux_backend.dart';
 void main() {
   group('proroot · 二进制来源（许可边界）', () {
     test('5 个 .so 的文件名与上游一致且顺序固定', () {
-      // 顺序固定很重要：导入逻辑是按名单认领的，
-      // 改顺序不会崩但会让"加载顺序"的注释变成谎话。
-      expect(ProrootOption.soFiles, const [
-        'libproroot.so',
-        'libproroot-runtime.so',
-        'libproroot-linker.so',
-        'libproroot-bridge.so',
-        'libproroot-stub-loader.so',
-      ]);
+      // ⚠️ alpha.69 更新：本 App **不再内置也不再分发**这套二进制
+      // （上游许可 Proprietary 禁止再分发），清单已清空。
+      // 这条从"守住名字与顺序"改为"守住它保持为空" —— 同样是防复活：
+      // 一旦有人把五件套加回来，这里会红，tools/verify_apk.sh 的
+      // 第 4/5 项合规检查也会红。历史名单（v1.2.5）见
+      // PROROOT-许可与分发决策.md。
+      expect(ProrootOption.soFiles, isEmpty);
     });
 
     test('不提供下载地址——只给"上游仓库 + 让你自己去取"的引导', () {
@@ -76,18 +74,55 @@ void main() {
   });
 
   group('proroot · 兼容性提示', () {
-    test('本项目 rootfs（Debian）判为未验证组合，并指向冒烟测试', () {
+    // Bug 471：结论翻过**两次**，每次都是被真机实测推翻的。
+    //   alpha.63：断言"未验证组合，可能起不来"。
+    //   其后：真机实测 v1.2.8 失败 → 改成"已实测确认不兼容"。
+    //   再其后：查明 v1.2.8 要 glibc 2.38，改钉 v1.2.5（只要 2.34），
+    //          一度以为"Debian 12 的 2.36 够用" → 又被 SIGSEGV 推翻。
+    //   再其后（2026-09-21 判别实验）：误判为 `DT_NEEDED` 写了开发名。
+    //   本版（2026-09-21 andClaw 对照定案）：真因是**加载方式不对** ——
+    //          `libproroot.so` 的 `PT_INTERP` 是 `/system/bin/linker64`，
+    //          必须从 `nativeLibraryDir` 直接 exec。**与 glibc 版本无关**，
+    //          也与 rootfs 无关；换 Debian 13 / glibc 2.41 报错逐字相同。
+    test('本项目 rootfs（Debian）必须直说"硬条件满足 + 尚未接通"', () {
+      // ⚠️ 本条被真机实测推翻过**四次**：
+      //    第 ① 次（2026-09-20）：原断言是"非官方组合但版本够、
+      //      仍要先跑冒烟测试"。冒烟跑了、结果是崩的，"够"不成立。
+      //    第 ② 次（2026-09-21）：改成断言含 'SIGSEGV' —— 但那只
+      //      是**下游症状**。
+      //    第 ③ 次：改成断言含 'libc.so'（DT_NEEDED 开发名）—— 解读错了，
+      //      那是 bionic 语境下的正常依赖名。
+      //    第 ④ 次：改成断言含 '未支持' —— 措辞**过重**，把作者的产品
+      //      配置当成了技术前提。官方硬条件是 glibc（非 musl），本项目满足。
+      //    第 ⑤ 版（当前）：不在官方验证环境内、但硬条件满足；真实卡点是集成方式。
       final n = ProrootOption.compatNote(
           rootfsDistro: ProrootOption.foaRootfsDistro);
       expect(n.contains('Debian 12 bookworm'), isTrue);
-      expect(n.contains('未验证组合'), isTrue);
-      expect(n.contains('冒烟测试'), isTrue);
+      expect(n.contains(ProrootOption.rootfsGlibc), isTrue,
+          reason: '要写明本机有什么');
+      expect(n.contains('硬条件满足'), isTrue,
+          reason: '要讲准：不在官方验证环境内，但硬条件（glibc 非 musl）满足');
+      expect(n.contains('未支持'), isFalse,
+          reason: '"未支持组合"过重：官方 Requirements 的硬条件是 glibc 而非发行版');
+      expect(n.contains('libproroot.so'), isTrue,
+          reason: '2026-09-21 定案：要指向真实卡点（nativeLibraryDir 直接 exec），'
+              '而不是停在 SIGSEGV / 偏移表这类下游症状');
+      expect(n.contains('nativeLibraryDir'), isTrue,
+          reason: '要点名真正的出路');
+      expect(n.contains('rootfs 不是'), isTrue,
+          reason: 'rootfs 不是卡点这件事必须说清，否则用户会去白折腾');
+      expect(n.contains('跑通就不必换'), isTrue,
+          reason: '要给出正确顺序：先做集成改造，用现有 rootfs 实测决定');
+      expect(n.contains('够'), isFalse,
+          reason: '不许再说"版本够"——实测证伪过');
+      expect(n.contains('DT_NEEDED'), isFalse,
+          reason: '"DT_NEEDED 写了开发名"已作废，不许留在文案里');
     });
 
-    test('若换成 Ubuntu rootfs 则提示符合要求（不无脑报警）', () {
+    test('若换成 Ubuntu rootfs 则提示与验证环境一致（不无脑报警）', () {
       final n = ProrootOption.compatNote(rootfsDistro: 'Ubuntu 24.04 arm64');
-      expect(n.contains('符合官方要求'), isTrue);
-      expect(n.contains('未验证组合'), isFalse);
+      expect(n.contains('一致'), isTrue);
+      expect(n.contains('不兼容'), isFalse);
     });
 
     test('发行版为空时不崩且说不知道', () {
@@ -97,15 +132,24 @@ void main() {
   });
 
   group('proroot · 启动器形态与 proot 的差异（接入时的核心坑）', () {
-    test('launcherUsage 记录的是 proroot 的 argv 顺序', () {
+    test('launcherUsage 记录的是 proroot 的 argv 形态（-b host:guest，无 -0）', () {
       const u = ProrootOption.launcherUsage;
       expect(u.contains('libproroot.so'), isTrue);
-      // proroot 是 `-r <rootfs> -0`，proot 是 `-0 -r <rootfs>`
-      final pr = u.indexOf('-r <rootfs>');
-      final pz = u.indexOf('-0');
-      expect(pr, lessThan(pz),
-          reason: 'proroot 的 -r 在 -0 之前（与 proot 相反）——'
-              '顺序写错会得到一个跑不起来的启动器');
+      // ⚠️ 本条 2026-09-21 修正。旧断言要求 `-r` 出现在 `-0` 之前，
+      //    依据是"proroot 是 `-r <rootfs> -0`，与 proot 相反"。
+      //    对照作者 andClaw（ProrootManager.kt:581-592）后确认：
+      //    **proroot 分支根本不带 `-0`**，`-0` 是 proot 分支的事。
+      //    旧断言在钉一个不存在的参数。
+      expect(u.contains('-0'), isFalse,
+          reason: 'proroot 不带 -0（那是 proot 的参数），写进去会跑不起来');
+      expect(u.contains('-r <rootfs>'), isTrue);
+      // `-b` 必须是 host:guest 冒号对形式 —— 这是 proroot 与 proot 的
+      // 真正差异点（proot 用单路径），抄错了就是挂载错位。
+      expect(u.contains('-b /dev:/dev'), isTrue,
+          reason: 'proroot 的 -b 是 host:guest 形式，这是接入的核心坑之一');
+      expect(u.contains('-b /proc:/proc'), isTrue);
+      expect(u.contains('-b /sys:/sys'), isTrue);
+      expect(u.contains('--link2symlink'), isTrue);
     });
 
     test('Kotlin 侧确实有独立的 buildProrootCmd 实现（不是复用 buildProotCmd）', () {

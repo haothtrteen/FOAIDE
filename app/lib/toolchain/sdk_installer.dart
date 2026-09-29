@@ -231,6 +231,56 @@ class AndroidSdkInstaller {
 
   static int get totalSize => components.fold(0, (s, c) => s + c.size);
 
+  /// 把解压脚本的失败输出翻成一句「用户能照着做」的话，并**正确归因**。
+  ///
+  /// 抽成静态方法是为了可测：这段映射是上一版最容易出错的地方 ——
+  /// 真机上出现过「报 platform-tools、实际错在 platforms;android-36」，
+  /// 因为脚本不检查 `rm` 退出码，带着脏暂存目录继续往下跑，
+  /// 错误信息里于是只有上一条无关的 rm 报错。现在脚本会在脏目录处
+  /// `exit 5` 并打 `STAGE_STUCK`，这里据此单独给处置提示。
+  ///
+  /// 分支顺序有意为之：`STAGE_STUCK` 优先于 `KEYFILE_MISSING` ——
+  /// 暂存目录不干净时后面的 keyTest 失败是**后果**不是原因，
+  /// 报"关键文件缺失"会把用户引到错误的方向去。
+  static String explainExtractFailure(AndroidSdkComponent c, String stdout,
+      String stderr) {
+    final out = stdout.trim();
+    final err = stderr.trim();
+    // 脚本 echo 的组件名（用于交叉核对，防止张冠李戴）
+    final reported = RegExp(r'COMPONENT (\S+)')
+        .firstMatch(out)
+        ?.group(1);
+
+    if (out.contains('STAGE_STUCK')) {
+      return '组件 ${c.id} 解压失败：临时目录 /opt/foa-sdk-stage 清不掉'
+          '（容器内的删除操作有残留）。\n'
+          '已下载的安装包还在，不会被重下。\n'
+          '建议：重启 App 后点「重试失败的那一步」；'
+          '若仍不行，去工具链页用「从本地文件导入」跳过这一环。'
+          '${err.isEmpty ? '' : '\n底层报错：$err'}';
+    }
+
+    if (out.contains('KEYFILE_MISSING')) {
+      final top = RegExp(r'STAGE_TOP\n(.*)', dotAll: true)
+          .firstMatch('$out\n')
+          ?.group(1)
+          ?.trim();
+      return '组件 ${c.id} 解压后缺少关键文件'
+          '（被校验的路径：$sdkHome/${c.keyPath}）。\n'
+          '这通常说明下载到的 zip 内容不对或解压被中断。'
+          '${top == null || top.isEmpty ? '' : '\n暂存目录顶层：$top'}';
+    }
+
+    // 其余情况：把 stderr 和 stdout 分开呈现 —— 上一版混成一句，
+    // 于是那条无关的 rm 报错把真正的原因盖住了。
+    final detail = err.isNotEmpty ? err : out;
+    final who = reported != null && reported != c.id
+        ? '（脚本内实际执行到：$reported）'
+        : '';
+    return '组件 ${c.id} 解压失败$who：'
+        '${detail.isEmpty ? '命令无输出，可能是容器未响应' : detail}';
+  }
+
   static List<MirrorSource> domesticMirrors(String file) => [
         MirrorSource(
           '腾讯云',
@@ -423,12 +473,52 @@ class AndroidSdkInstaller {
       // android-16/、cmdline-tools/ 等——统一「取顶层条目改名归位」）。
       // 归位后立即校验该组件关键文件，缺失即报错并输出暂存目录结构，
       // 精确暴露「哪个组件、缺哪个文件」，不再笼统"关键组件缺失"（Bug 417）。
+      //
+      // ============ alpha.72：暂存目录必须能被清掉，否则失败会"粘住" ============
+      //
+      // 真机报过：
+      //   rm: cannot remove '/opt/foa-sdk-stage/android-36/data/res/'
+      //       'values-mcc310-mnc210-el': Directory not empty
+      //
+      // 追出来的完整经过（两个缺陷叠加，缺一不可）：
+      //
+      //  ① `mv "$d"` 只移走**一个**顶层子目录，暂存目录下其余内容留在原地，
+      //     而清理（原第 438 行）只在成功路径上。于是"mv 成功但 keyTest 失败"
+      //     的那一轮会留下残骸。
+      //  ② 下一轮开头的 `rm -rf /opt/foa-sdk-stage` 本该清掉它，但那一次 rm
+      //     自己失败了 —— proot 把 unlinkat 转发到宿主内核，`rm -rf` 是
+      //     "先删子项再删父目录"的 post-order 遍历，只要某次 getdents 漏读
+      //     条目或与安装器抢跑，就会留下这种"目录非空"的残留。
+      //     （不是权限问题：proot 内是 root，权限错会报 Permission denied。）
+      //
+      //  ③ 致命的是脚本**不检查 rm 的退出码**，`&&` 链断掉后继续往下跑，
+      //     `$d` 取到残留目录 → mv 看似成功 → keyTest 又失败 → 报错里只有
+      //     那条 rm 的 stderr。于是用户看到「platform-tools 解压失败」，
+      //     而真正出问题的是上一个组件 platforms;android-36 —— 错误信息
+      //     把组件名配错了。
+      //
+      // 所以这里三层都要治：**清理要硬、失败要停、归因要准**。
       onPhase?.call('extracting');
       final slash = c.guestDir.lastIndexOf('/');
       final parent =
           slash < 0 ? sdkHome : '$sdkHome/${c.guestDir.substring(0, slash)}';
       final ex = await bridge.exec(
-        'rm -rf /opt/foa-sdk-stage && mkdir -p /opt/foa-sdk-stage && '
+        // ① 清理单独成段并显式查退出码。
+        //    `rm -rf` 对不存在的路径也返回 0，所以它非 0 只能是"真删不干净"。
+        //    兜底再用 find -delete 逐个删（对 proot 下 rm 的目录遍历差异更稳），
+        //    仍然卡住就 STAGE_STUCK 中止 —— 绝不能带着脏目录继续往下，
+        //    那正是上面 ③ 的错位报错来源。
+        'if ! rm -rf /opt/foa-sdk-stage 2>/tmp/foa-stage-rm.err; then '
+        '  find /opt/foa-sdk-stage -mindepth 1 -delete 2>/dev/null; '
+        'fi; '
+        'if [ -d /opt/foa-sdk-stage ]; then '
+        '  echo STAGE_STUCK; '
+        '  cat /tmp/foa-stage-rm.err 2>/dev/null; '
+        '  exit 5; '
+        'fi; '
+        // ② 组件名回显：报错时能对上"到底在装哪个"，不再张冠李戴。
+        'echo "COMPONENT ${c.id}"; '
+        'mkdir -p /opt/foa-sdk-stage && '
         'unzip -qo /opt/foa-dl/${c.file} -d /opt/foa-sdk-stage && '
         'd=\$(ls -d /opt/foa-sdk-stage/* 2>/dev/null | head -1) && '
         'mkdir -p $parent && '
@@ -443,15 +533,8 @@ class AndroidSdkInstaller {
         timeoutSec: 300,
       );
       if (ex.exitCode != 0 || !ex.stdout.contains('SDK_COMPONENT_OK')) {
-        if (ex.stdout.contains('KEYFILE_MISSING')) {
-          throw DownloadException(
-            '组件 ${c.id} 解压失败：${ex.stdout.trim()}',
-          );
-        }
         throw DownloadException(
-          '组件 ${c.id} 解压失败：'
-          '${ex.stderr.trim().isEmpty ? ex.stdout.trim() : ex.stderr.trim()}',
-        );
+            explainExtractFailure(c, ex.stdout, ex.stderr));
       }
     }
 

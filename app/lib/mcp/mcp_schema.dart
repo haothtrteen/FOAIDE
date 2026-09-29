@@ -1,7 +1,7 @@
 /// MCP 工具与资源定义（alpha.60）。
 ///
 /// **纯数据 + 纯函数**：本文件不依赖任何 Flutter/平台 API，可被单测直接
-/// import。协议侧（mcp_server.dart 的 tools/list）与 UI 侧（远程接管页
+/// import。协议侧（mcp_server.dart 的 tools/list）与 UI 侧（远程协助页
 /// 的「可用能力清单」）**同源渲染本文件**——避免文档与实现漂移。
 ///
 /// 设计要点（面向「确保远程 AI 知道它能干什么」）：
@@ -33,14 +33,16 @@ class McpTool {
 }
 
 /// 简易 schema 构造器（省掉大段重复字面量）。
-Map<String, Object?> _schema(Map<String, Object?> props, List<String> required) =>
+Map<String, Object?> _schema(
+        Map<String, Object?> props, List<String> required) =>
     {
       'type': 'object',
       'properties': props,
       'required': required,
     };
 
-Map<String, Object?> _str(String desc) => {'type': 'string', 'description': desc};
+Map<String, Object?> _str(String desc) =>
+    {'type': 'string', 'description': desc};
 
 /// 设备容器内可用的项目根（与 FsBridge 的 kProjectsRoot 一致）。
 const String kProjectsRootMcp = '/root/projects';
@@ -163,7 +165,7 @@ const String kInstructions = '''
 
 /// resource `foa://guide`：按需拉取的详细说明（Markdown）。
 const String kGuideMarkdown = '''
-# FOA 远程接管 · 环境指南
+# FOA 远程协助 · 环境指南
 
 ## 1. 这是什么
 

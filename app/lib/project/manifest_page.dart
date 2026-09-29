@@ -2,7 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../editor/fs_bridge.dart';
+import '../env/proot_bridge.dart';
+import '../filemanager/fs_browser_bridge.dart';
+import 'icon_replacer.dart';
+import 'keystore_store.dart';
 import 'manifest_codec.dart';
+import 'signing.dart';
+import 'signing_dialog.dart';
 import '../core/theme.dart';
 
 /// 项目工作台 ·「清单」区（alpha.61 重做）。
@@ -72,6 +78,15 @@ class ManifestPageState extends State<ManifestPage> {
   // ---- 界面上的当前值 ----
   late final TextEditingController _nameCtl;
   late final TextEditingController _descCtl;
+
+  /// 应用包名（applicationId）。alpha.74 起**可编辑** ——
+  /// 之前是只读的，理由是"装机后不可改"。但那是**运行时**的限制：
+  /// 还没发布的工程、或者内部测试包，改包名是完全正常的操作
+  /// （换个渠道名、把 `com.example.xxx` 改成公司域名）。一刀切成只读，
+  /// 用户只能自己去编辑器里翻 build.gradle。
+  ///
+  /// 风险照旧要讲清楚，但不拦着 —— 见包名卡片里那段提示。
+  late final TextEditingController _pkgCtl;
   late final TextEditingController _verNameCtl;
   late final TextEditingController _verCodeCtl;
 
@@ -89,11 +104,59 @@ class ManifestPageState extends State<ManifestPage> {
   String _iconPath = '';
   String _iconNote = '';
 
-  /// 签名配置是否存在。
+  /// alpha.95：图标真实内容的预览字节。
+  ///
+  /// 之前那一格写死 `Icons.flutter_dash`，换完图标预览照旧 —— 真机反馈
+  /// "导入自定义图标但是界面预览没变"。现在真去读那个 PNG（容器 base64），
+  /// 读不到才回落默认图标。
+  Uint8List? _iconBytes;
+
+  /// alpha.93：图标替换的进行中与结果（替换是秒级但也走容器，给反馈）。
+  bool _iconBusy = false;
+  String? _iconResult;
+  bool _iconOk = false;
+
+  /// 签名配置是否存在（只看文件在不在）。
   bool _hasSigning = false;
+
+  /// alpha.93：key.properties 的**实际内容**（不在就 null）。
+  ///
+  /// 光知道"文件存在"不够——要看 keystore 路径/别名/口令是否齐全，
+  /// 缺一项的话"验签""重签"这些按钮点了也是白点。
+  SigningConfig? _signCfg;
+
+  /// 签名操作进行中 / 结果。
+  bool _signBusy = false;
+  String? _signResult;
+  bool _signOk = true;
+
+  /// alpha.94：签名库（容器里登记过的全部 keystore）。
+  ///
+  /// 与 `_signCfg` 是两件事：这里是"我有哪些钥匙"，那里是
+  /// "这个工程现在用哪把"。
+  List<KeystoreEntry> _store = const <KeystoreEntry>[];
+
+  /// alpha.96：这个工程的 build.gradle.kts 里还留着**会编译失败的**老写法。
+  ///
+  /// 背景：`plugins {}` 会遮蔽 `java` 标识符，所以
+  /// `java.util.Properties()` 全限定名报 `Unresolved reference 'util'`。
+  /// alpha.94 修好了补丁生成器，但**已经打过旧补丁的工程不会自动回写** ——
+  /// 用户反复构建、反复报同一个错，而 FOA 这边看起来"早就修了"。
+  ///
+  /// 这里在打开清单页时就检测一次，检测到就把修复按钮显示出来。
+  bool _hasLegacyGradle = false;
 
   /// 混淆开关（读自 build.gradle）。
   bool _minify = true;
+
+  /// gradle 里**是否显式**写了 `minifyEnabled`。
+  ///
+  /// 官方模板的 `release {}` 里没有这一行（见
+  /// [ManifestCodec.setMinify] 的注释），此时 [\_minify] 是 AGP 的
+  /// 默认值 true。UI 分开措辞：显式写了就说"现在是开/关"，
+  /// 没写就说"没写这一行（AGP 默认开）"—— 后者用户才会明白
+  /// 为什么自己点关闭之后文件里会多出一行。
+  bool _minifyExplicit = false;
 
   /// 上次保存的结果提示（成功/失败都留在界面上，用户不用翻 SnackBar）。
   String _saveNote = '';
@@ -101,26 +164,14 @@ class ManifestPageState extends State<ManifestPage> {
 
   /// 可勾选的常用权限（超出这些的权限走"在 Manifest 里手动加"）。
   static const List<({String name, String short, String why})> _commonPerms = [
-    (
-      name: 'android.permission.INTERNET',
-      short: '联网',
-      why: '访问网络（几乎所有应用都需要）'
-    ),
+    (name: 'android.permission.INTERNET', short: '联网', why: '访问网络（几乎所有应用都需要）'),
     (
       name: 'android.permission.ACCESS_NETWORK_STATE',
       short: '网络状态',
       why: '判断当前是否联网/是否 WiFi'
     ),
-    (
-      name: 'android.permission.CAMERA',
-      short: '相机',
-      why: '拍照、扫码'
-    ),
-    (
-      name: 'android.permission.RECORD_AUDIO',
-      short: '录音',
-      why: '语音输入、通话'
-    ),
+    (name: 'android.permission.CAMERA', short: '相机', why: '拍照、扫码'),
+    (name: 'android.permission.RECORD_AUDIO', short: '录音', why: '语音输入、通话'),
     (
       name: 'android.permission.READ_EXTERNAL_STORAGE',
       short: '读存储',
@@ -146,11 +197,7 @@ class ManifestPageState extends State<ManifestPage> {
       short: '发通知',
       why: '推送通知（Android 13+ 需显式申请）'
     ),
-    (
-      name: 'android.permission.VIBRATE',
-      short: '振动',
-      why: '消息提醒振动'
-    ),
+    (name: 'android.permission.VIBRATE', short: '振动', why: '消息提醒振动'),
   ];
 
   @override
@@ -158,10 +205,12 @@ class ManifestPageState extends State<ManifestPage> {
     super.initState();
     _nameCtl = TextEditingController();
     _descCtl = TextEditingController();
+    _pkgCtl = TextEditingController();
     _verNameCtl = TextEditingController();
     _verCodeCtl = TextEditingController();
     _nameCtl.addListener(_markDirty);
     _descCtl.addListener(_markDirty);
+    _pkgCtl.addListener(_markDirty);
     _verNameCtl.addListener(_markDirty);
     _verCodeCtl.addListener(_markDirty);
     _load();
@@ -171,6 +220,7 @@ class ManifestPageState extends State<ManifestPage> {
   void dispose() {
     _nameCtl.dispose();
     _descCtl.dispose();
+    _pkgCtl.dispose();
     _verNameCtl.dispose();
     _verCodeCtl.dispose();
     super.dispose();
@@ -178,9 +228,69 @@ class ManifestPageState extends State<ManifestPage> {
 
   String _p(String rel) => '/root/projects/${widget.projectName}/$rel';
 
+  /// 图标缩略图：优先显示**真实文件内容**，拿不到才回落 Flutter 图标。
+  ///
+  /// alpha.95 之前这里写死 `Icons.flutter_dash`，所以换完图标预览不改，
+  /// 用户合理怀疑"替换没生效"。现在读的是容器里的那个 PNG。
+  Widget _iconThumb() {
+    final bytes = _iconBytes;
+    return Container(
+      width: 56,
+      height: 56,
+      decoration: BoxDecoration(
+        color: const Color(0xFF173F35),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: bytes == null
+          ? const Icon(Icons.flutter_dash, color: Color(0xFF3DDC84), size: 30)
+          : Image.memory(
+              bytes,
+              width: 56,
+              height: 56,
+              fit: BoxFit.cover,
+              // 文件在但解不出来（比如根本不是 PNG）时也要有东西显示，
+              // 不能抛异常把整张卡片带下去。
+              errorBuilder: (_, __, ___) => const Icon(Icons.broken_image,
+                  color: Color(0xFF3DDC84), size: 26),
+            ),
+    );
+  }
+
   static const _pubRel = 'pubspec.yaml';
   static const _mfRel = 'android/app/src/main/AndroidManifest.xml';
   static const _gradleRel = 'android/app/build.gradle';
+
+  /// alpha.96：老式签名补丁的说明文案。
+  ///
+  /// 抽成常量是为了避开一个 lint 自相矛盾：
+  /// 直接写在 `Text(...)` 里时，`prefer_const_constructors` 建议加 `const`，
+  /// 但加了又报 `unnecessary_const`（因为那串是相邻字面量拼接，
+  /// 编译器已视为常量）。抽出来当参数引用，两个 lint 都不再响。
+  static const String _kLegacyGradleNote =
+      '这个工程的 build.gradle.kts 里用了 `java.util.Properties()` '
+      '这种全限定写法。Kotlin DSL 里只要文件开头有 `plugins {}` 块，'
+      '`java` 这个标识符就会被遮蔽，构建时必然报：\n'
+      '  Unresolved reference: util / io\n\n'
+      '这是旧版本打签名补丁留下的，FOA 已修复生成逻辑，'
+      '但已生成的工程不会自动改写——点下面按钮修一下就好，'
+      '不会动你的密钥。';
+
+  /// Gradle 清单文件的**实际路径**（Bug 470）。
+  ///
+  /// Flutter 新版模板生成的是 `android/app/build.gradle.kts`，
+  /// 而旧代码读写不对称：读的时候遍历 `[_gradleRel, _gradleRel + '.kts']`
+  /// 两个候选，写的时候却只用写死的 `_gradleRel` → 在 .kts 工程上
+  /// 保存时报「读取失败：不是文件 …/build.gradle」。
+  ///
+  /// 现在统一走这里：读时探测并**记住**命中哪个，写时复用同一个。
+  /// 两个都不存在时返回 null，由调用方给出明确文案（而不是抛"不是文件"）。
+  String? _gradleActual;
+
+  static const List<String> _gradleCandidates = [
+    _gradleRel,
+    'android/app/build.gradle.kts',
+  ];
 
   // ============================ 读 ============================
 
@@ -197,6 +307,9 @@ class ManifestPageState extends State<ManifestPage> {
       var label = '';
       var appId = '';
       var minify = true;
+      // gradle 里到底有没有显式写 minifyEnabled —— 影响 UI 的措辞
+      // （"现在是开" vs "没写这一行、AGP 默认开"）。
+      var minifyExplicit = false;
       final perms = <String>{};
 
       final pub = await _fb.read(_p(_pubRel));
@@ -217,25 +330,47 @@ class ManifestPageState extends State<ManifestPage> {
         perms.addAll(r.permissions);
       }
 
-      for (final f in const [_gradleRel, 'android/app/build.gradle.kts']) {
+      // Gradle 清单：兼容 android/app/build.gradle 与 .kts 两种（Bug 470：
+      // 探测结果必须**记住**，否则写回时会写到不存在的那一个）
+      _gradleActual = null;
+      _hasLegacyGradle = false;
+      for (final f in _gradleCandidates) {
         final g = await _fb.read(_p(f));
         if (!g.ok) continue;
+        _gradleActual = f; // 命中即记住，写回复用
         final r = ManifestCodec.parseGradle(g.content);
         if (r.appId.isNotEmpty) appId = r.appId;
         minify = r.minify;
-        if (appId.isNotEmpty) break;
+        minifyExplicit = r.minifyExplicit;
+        // alpha.96：老式签名补丁里写着 `java.util.Properties()`，
+        // 在 `plugins {}` 存在时**编译必挂**（Unresolved reference 'util'）。
+        // 这里顺手检测，检测到就在签名卡上给修复入口。
+        if (f.endsWith('.kts')) {
+          _hasLegacyGradle = Signing.hasLegacyJavaFqn(g.content);
+        }
       }
 
-      // 签名配置探测（不解析内容，只看文件在不在）
+      // 签名配置探测（alpha.93：除了"在不在"，还要解析出 keystore 与口令，
+      // 否则打包区的验签/重签没法用）
+      _hasSigning = false;
+      _signCfg = null;
       for (final f in const [
         'android/key.properties',
         'android/app/key.properties',
       ]) {
         final s = await _fb.read(_p(f));
-        if (s.ok) {
-          _hasSigning = true;
-          break;
-        }
+        if (!s.ok) continue;
+        _hasSigning = true;
+        _signCfg = Signing.configFrom(s.content);
+        break;
+      }
+
+      // alpha.94：签名库。读失败就当空表（容器没装好时 exec 会抛，
+      // 不能让整页白屏——签名只是这一张卡的事）。
+      try {
+        _store = await KeystoreStore(ProotBridge()).load();
+      } catch (_) {
+        _store = const <KeystoreEntry>[];
       }
 
       // 图标探测：列 launcher 资源目录，找 ic_launcher
@@ -264,6 +399,11 @@ class ManifestPageState extends State<ManifestPage> {
             ? '已替换为自定义图标'
             : '图标在 drawable 目录（非常规位置）';
       }
+      // 读真实图标内容用于预览。失败就 null（回落 Flutter 图标）——
+      // 预览读不到不该挡住整张卡片。
+      _iconBytes = _iconPath.isEmpty
+          ? null
+          : await IconReplacer.readAsBytes(ProotBridge(), _p(_iconPath));
 
       if (!mounted) return;
       _disk = ManifestState(
@@ -278,6 +418,7 @@ class ManifestPageState extends State<ManifestPage> {
       );
       _nameCtl.text = label;
       _descCtl.text = description;
+      _pkgCtl.text = appId;
       _verNameCtl.text = verName;
       _verCodeCtl.text = verCode;
       _permExisting
@@ -285,6 +426,7 @@ class ManifestPageState extends State<ManifestPage> {
         ..addAll(perms);
       _permChecked.clear();
       _minify = minify;
+      _minifyExplicit = minifyExplicit;
       setState(() {
         _loading = false;
         _saveNote = '';
@@ -308,6 +450,7 @@ class ManifestPageState extends State<ManifestPage> {
   ({
     bool name,
     bool desc,
+    bool pkg,
     bool verName,
     bool verCode,
     bool perms,
@@ -321,6 +464,7 @@ class ManifestPageState extends State<ManifestPage> {
     return (
       name: name,
       desc: desc,
+      pkg: _pkgCtl.text.trim() != _disk.appId,
       verName: vn,
       verCode: vc,
       perms: perms,
@@ -330,7 +474,8 @@ class ManifestPageState extends State<ManifestPage> {
 
   /// 已被用户**取消勾选**的原有权限（要从 Manifest 里删掉的）。
   Set<String> _uncheckedExisting() => _permExisting
-      .where((p) => !_permChecked.contains(p) && !_permChecked.contains(_short(p)))
+      .where(
+          (p) => !_permChecked.contains(p) && !_permChecked.contains(_short(p)))
       .toSet();
 
   /// 勾选集合统一存**短名或全名**都可能，这里统一成全名比较。
@@ -353,7 +498,13 @@ class ManifestPageState extends State<ManifestPage> {
 
   bool _anyDirty() {
     final d = _diff();
-    return d.name || d.desc || d.verName || d.verCode || d.perms || d.minify;
+    return d.name ||
+        d.desc ||
+        d.pkg ||
+        d.verName ||
+        d.verCode ||
+        d.perms ||
+        d.minify;
   }
 
   void _markDirty() {
@@ -376,15 +527,34 @@ class ManifestPageState extends State<ManifestPage> {
   Future<void> save() async {
     if (_saving) return;
     final d = _diff();
-    if (!d.name && !d.desc && !d.verName && !d.verCode && !d.perms && !d.minify) {
+    if (!d.name &&
+        !d.desc &&
+        !d.verName &&
+        !d.verCode &&
+        !d.perms &&
+        !d.minify &&
+        !d.pkg) {
       _note('没有需要保存的改动', ok: true);
       return;
     }
+    // 新包名（界面上的值，已 trim）。
+    final newPkg = _pkgCtl.text.trim();
+    // 这一次保存**新插入**了 minifyEnabled 行 —— 影响成功提示的措辞。
+    var insertedMinify = false;
 
     // ---------- 校验（先全部校验完再动盘，避免写一半发现格式错） ----------
     final label = _nameCtl.text.trim();
     if (d.name && !ManifestCodec.validLabel(label)) {
       _note('应用名不能为空，且不超过 80 字', ok: false);
+      return;
+    }
+    if (d.pkg && !ManifestCodec.validAppId(newPkg)) {
+      _note(
+        '包名格式不对：要像 com.example.myapp 这样，'
+        '每段以字母开头、只含字母数字下划线，至少两段。'
+        '（大写字母和中文都不能用）',
+        ok: false,
+      );
       return;
     }
     final vn = _verNameCtl.text.trim();
@@ -398,7 +568,8 @@ class ManifestPageState extends State<ManifestPage> {
       return;
     }
     // 降级提醒：版本名变小了，应用商店会拒收
-    if (d.verName && ManifestCodec.versionNameDowngrade(_disk.versionName, vn)) {
+    if (d.verName &&
+        ManifestCodec.versionNameDowngrade(_disk.versionName, vn)) {
       final go = await _confirm(
         '版本名降级',
         '从 ${_disk.versionName} 降到 $vn。\n\n'
@@ -425,7 +596,8 @@ class ManifestPageState extends State<ManifestPage> {
           t = ManifestCodec.setDescription(t, _descCtl.text.trim());
         }
         if (d.verName || d.verCode) {
-          t = ManifestCodec.setVersion(t, vn, d.verCode ? vc : _disk.versionCode);
+          t = ManifestCodec.setVersion(
+              t, vn, d.verCode ? vc : _disk.versionCode);
         }
         final w = await _fb.write(_p(_pubRel), t);
         if (w.ok) {
@@ -436,14 +608,20 @@ class ManifestPageState extends State<ManifestPage> {
       }
     }
 
-    // ---------- 2. AndroidManifest（应用名 / 权限） ----------
-    if (d.name || d.perms) {
+    // ---------- 2. AndroidManifest（应用名 / 权限 / 老式包名） ----------
+    if (d.name || d.perms || d.pkg) {
       final r = await _fb.read(_p(_mfRel));
       if (!r.ok) {
         failed.add('AndroidManifest.xml（读取失败：${r.error}）');
       } else {
         var t = r.content;
         if (d.name) t = ManifestCodec.setLabel(t, label);
+        // AGP 8 起 Manifest 里没有 `package="..."` 了（包名由 gradle 的
+        // `namespace` 决定）。老工程才有 —— 有就跟着改，没有就跳过。
+        if (d.pkg) {
+          final mp = ManifestCodec.setManifestPackage(t, newPkg);
+          t = mp.code;
+        }
         if (d.perms) {
           t = ManifestCodec.applyPermissions(
             t,
@@ -460,23 +638,61 @@ class ManifestPageState extends State<ManifestPage> {
       }
     }
 
-    // ---------- 3. build.gradle（混淆） ----------
-    if (d.minify) {
-      final r = await _fb.read(_p(_gradleRel));
-      if (!r.ok) {
-        failed.add('build.gradle（读取失败：${r.error}）');
+    // ---------- 3. 构建选项：gradle 的包名 / 混淆开关（Bug 470） ----------
+    // 用读阶段探测到的实际路径（.gradle 或 .gradle.kts），
+    // 不再写死 `_gradleRel` —— 否则 .kts 工程会报「不是文件」。
+    if (d.minify || d.pkg) {
+      if (_gradleActual == null) {
+        failed.add('构建选项（工程内没有 android/app/build.gradle(.kts)，'
+            '无法写入${d.pkg ? "包名与" : ""}混淆开关）');
       } else {
-        final before = r.content;
-        final after = ManifestCodec.setMinify(before, _minify);
-        if (after == before) {
-          // gradle 里没有 minifyEnabled 键——不能硬插，只能提示
-          failed.add('build.gradle（未找到 minifyEnabled，请在编辑器中手动修改）');
+        final label =
+            _gradleActual == _gradleRel ? 'build.gradle' : 'build.gradle.kts';
+        final r = await _fb.read(_p(_gradleActual!));
+        if (!r.ok) {
+          failed.add('$label（读取失败：${r.error}）');
         } else {
-          final w = await _fb.write(_p(_gradleRel), after);
-          if (w.ok) {
-            done.add('build.gradle');
+          var before = r.content;
+          var touched = false;
+          // 3a. 包名：namespace 与 applicationId 一起改。
+          //
+          // ⚠️ 顺序**必须先包名后混淆** —— 两次都是全字符串替换，
+          // 但包名那次用 `replaceFirstMapped` 前后加了内容，
+          // 先做谁其实等价；放在前面只是为了让"哪一步失败"更好归因。
+          if (d.pkg) {
+            final ap = ManifestCodec.setAppId(before, newPkg);
+            if (!ap.changed) {
+              failed.add('$label（没找到 namespace / applicationId，'
+                  '无法写入包名）');
+            } else {
+              before = ap.code;
+              touched = true;
+            }
+          }
+          // 3b. 混淆开关。
+          if (d.minify) {
+            final mn = ManifestCodec.setMinify(before, _minify);
+            if (mn.code == before) {
+              // 连 buildTypes 都没有 —— 这种 gradle 我们不敢动结构。
+              failed.add('$label（没找到 buildTypes / release 块，'
+                  '无法写入混淆开关）');
+            } else {
+              if (mn.inserted) {
+                insertedMinify = true;
+              }
+              before = mn.code;
+              touched = true;
+            }
+          }
+          if (!touched) {
+            // 一步都没写成（失败项已经进 failed 了），别写回原内容。
           } else {
-            failed.add('build.gradle（${w.error}）');
+            final w = await _fb.write(_p(_gradleActual!), before);
+            if (w.ok) {
+              done.add(label);
+            } else {
+              failed.add('$label（${w.error}）');
+            }
           }
         }
       }
@@ -486,7 +702,13 @@ class ManifestPageState extends State<ManifestPage> {
     setState(() => _saving = false);
 
     if (failed.isEmpty) {
-      _note('已保存：${done.join('、')}', ok: true);
+      // 新插了一行 minifyEnabled 的话要**说出来**。用户点的是"关闭混淆"，
+      // 结果文件里凭空多了一行 —— 不解释他会怀疑工具乱改了他的 gradle。
+      final extra = insertedMinify
+          ? '（build.gradle 里原本没有 minifyEnabled 这一行，'
+              '已写进 buildTypes.release）'
+          : '';
+      _note('已保存：${done.join('、')}$extra', ok: true);
       // 静默复查：重新读一遍，确认磁盘上真的是新值（而不是自己以为写成了）
       await _verify();
     } else {
@@ -504,8 +726,7 @@ class ManifestPageState extends State<ManifestPage> {
     if (!mounted) return;
     final d = _diff();
     if (d.name || d.desc || d.verName || d.verCode || d.perms || d.minify) {
-      _note('写入后校验发现内容不一致，请检查文件权限或是否有其它进程在改这个项目',
-          ok: false);
+      _note('写入后校验发现内容不一致，请检查文件权限或是否有其它进程在改这个项目', ok: false);
     }
   }
 
@@ -580,7 +801,8 @@ class ManifestPageState extends State<ManifestPage> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.error_outline, size: 40, color: Color(0xFFFF7A7A)),
+              const Icon(Icons.error_outline,
+                  size: 40, color: Color(0xFFFF7A7A)),
               const SizedBox(height: 12),
               Text(_loadError, textAlign: TextAlign.center),
               const SizedBox(height: 16),
@@ -723,8 +945,7 @@ class ManifestPageState extends State<ManifestPage> {
       title: '应用身份',
       subtitle: '桌面显示的名字，以及应用的唯一标识',
       children: [
-        _label('应用名（android:label）',
-            hint: '显示在桌面图标下方，可随时修改'),
+        _label('应用名（android:label）', hint: '显示在桌面图标下方，可随时修改'),
         TextField(
           controller: _nameCtl,
           style: const TextStyle(fontSize: 15),
@@ -743,44 +964,71 @@ class ManifestPageState extends State<ManifestPage> {
         ),
         if (d.name) _hint('原名：${_disk.label.isEmpty ? "（未设置）" : _disk.label}'),
         const SizedBox(height: 18),
-        _label('应用包名（applicationId）', hint: '唯一标识，装机后不可更改'),
+        _label('应用包名（applicationId）', hint: '唯一标识，装机后不可更换（未发布前可以随便改）'),
         Row(
           children: [
             Expanded(
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.18),
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: Colors.white12),
+              child: TextField(
+                controller: _pkgCtl,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontFamily: 'monospace',
+                  height: 1.3,
                 ),
-                child: Text(
-                  _disk.appId.isEmpty ? '（未在 build.gradle 中找到）' : _disk.appId,
-                  style: TextStyle(
+                decoration: InputDecoration(
+                  hintText: 'com.example.myapp',
+                  hintStyle: const TextStyle(
                     fontSize: 13,
                     fontFamily: 'monospace',
-                    color: _disk.appId.isEmpty
-                        ? Colors.grey
-                        : const Color(0xFFC9CFD6),
                   ),
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                  suffixIcon: _pkgCtl.text.isEmpty
+                      ? null
+                      : IconButton(
+                          tooltip: '恢复为磁盘上的包名',
+                          icon: const Icon(Icons.settings_backup_restore,
+                              size: 18),
+                          onPressed: () {
+                            _pkgCtl.text = _disk.appId;
+                            _markDirty();
+                          },
+                        ),
                 ),
               ),
             ),
             const SizedBox(width: 8),
             IconButton(
               tooltip: '复制包名',
-              onPressed: () => _copy('包名', _disk.appId),
+              onPressed: () => _copy('包名', _pkgCtl.text.trim()),
               icon: const Icon(Icons.copy, size: 18),
             ),
           ],
         ),
+        if (d.pkg && !ManifestCodec.validAppId(_pkgCtl.text.trim()))
+          _hint(
+            '格式不对：要像 com.example.myapp 这样，至少两段，'
+            '每段以字母开头（首段），只含字母数字下划线。',
+            warn: true,
+          ),
+        if (d.pkg)
+          _hint(
+            '原包名：'
+            '${_disk.appId.isEmpty ? "（未找到）" : _disk.appId}'
+            '  ·  保存后会同时改 build.gradle 的 namespace 与 applicationId。',
+          ),
         _hint(
-          '为什么不能改：包名决定应用的"身份证"。改了系统会当成另一个应用——'
-          '旧版本无法升级安装，签名、第三方 SDK（推送/统计/支付）后台登记的'
-          '包名也全部要改。真要改请新建项目。',
-          warn: true,
+          '改包名会发生什么：Android 把包名当应用的"身份证"——'
+          '已装过旧包名的手机装不上（系统当它是另一个应用），'
+          '第三方 SDK（推送/统计/支付）后台登记的包名也要跟着改。'
+          '还没发布过、或者只是内部测试包，随便改。',
+          warn: d.pkg,
         ),
+        if (d.pkg)
+          _hint(
+            'Kotlin 源码目录（android/app/src/main/kotlin/...）不会跟着搬 —— '
+            '这不影响编译，AGP 允许 Kotlin 的 package 声明与 namespace 不一致。',
+          ),
       ],
     );
   }
@@ -838,8 +1086,9 @@ class ManifestPageState extends State<ManifestPage> {
                       hintText: '1',
                       isDense: true,
                       border: const OutlineInputBorder(),
-                      errorText:
-                          _verCodeCtl.text.trim().isEmpty || vcOk ? null : '必须是整数',
+                      errorText: _verCodeCtl.text.trim().isEmpty || vcOk
+                          ? null
+                          : '必须是整数',
                     ),
                   ),
                 ],
@@ -848,8 +1097,7 @@ class ManifestPageState extends State<ManifestPage> {
           ],
         ),
         if (downgrade)
-          _hint('⚠️ 版本名比当前（${_disk.versionName}）小，应用商店会拒绝上架',
-              warn: true),
+          _hint('⚠️ 版本名比当前（${_disk.versionName}）小，应用商店会拒绝上架', warn: true),
         if (d.verCode) _hint('当前磁盘上的版本代码：${_disk.versionCode}'),
       ],
     );
@@ -953,7 +1201,8 @@ class ManifestPageState extends State<ManifestPage> {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 5, vertical: 1),
                           decoration: BoxDecoration(
-                            color: const Color(0xFF4C8DFF).withValues(alpha: 0.2),
+                            color:
+                                const Color(0xFF4C8DFF).withValues(alpha: 0.2),
                             borderRadius: BorderRadius.circular(4),
                           ),
                           child: const Text('已声明',
@@ -987,17 +1236,14 @@ class ManifestPageState extends State<ManifestPage> {
       children: [
         Row(
           children: [
-            Container(
-              width: 56,
-              height: 56,
-              decoration: BoxDecoration(
-                color: const Color(0xFF173F35),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: const Icon(Icons.flutter_dash,
-                  color: Color(0xFF3DDC84), size: 30),
-            ),
-            const SizedBox(width: 14),
+            // ⚠️ alpha.95 修：这里原来写死 `Icons.flutter_dash`，
+            // 于是**换完图标预览照旧是 Flutter 默认图标**，用户以为没生效。
+            // 真机反馈原话："导入自定义图标但是界面预览没变"。
+            //
+            // 现在真去显示那个 PNG。走的是容器 base64（FsBridge 只走文本），
+            // 拿不到就回落 Flutter 图标（宁可显示默认，也不能显示一个
+            // 和真实文件无关的假预览）。
+            _iconThumb(),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1011,7 +1257,9 @@ class ManifestPageState extends State<ManifestPage> {
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                        fontSize: 10, fontFamily: 'monospace', color: Colors.grey),
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                        color: Colors.grey),
                   ),
                 ],
               ),
@@ -1022,59 +1270,199 @@ class ManifestPageState extends State<ManifestPage> {
         Row(
           children: [
             Expanded(
+              child: FilledButton.icon(
+                // alpha.93：真正的替换入口。以前这里只有"在编辑器中打开"
+                // + 一句"把 png 覆盖到 mipmap-*"的提示——用户看完提示还得
+                // 自己去文件管理器里操作，等于没做。
+                onPressed: _iconBusy ? null : _replaceIcon,
+                icon: _iconBusy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.upload_file, size: 16),
+                label: Text(_iconBusy ? '替换中…' : '选择图片替换',
+                    style: const TextStyle(fontSize: 12)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
               child: OutlinedButton.icon(
-                onPressed: () => widget.onOpenFile(_iconPath.isEmpty
-                    ? 'android/app/src/main/res'
-                    : _iconPath),
+                onPressed: () => widget.onOpenFile(
+                    _iconPath.isEmpty ? 'android/app/src/main/res' : _iconPath),
                 icon: const Icon(Icons.folder_open, size: 16),
                 label: const Text('在编辑器中打开', style: TextStyle(fontSize: 12)),
               ),
             ),
           ],
         ),
-        _hint('图标替换：把 ic_launcher.png 覆盖到 '
-            'android/app/src/main/res/mipmap-*/ 各密度目录。'
-            '正规做法是用 flutter_launcher_icons 插件（在 pubspec 里配置后执行生成命令），'
-            '可以一次性产出所有尺寸并避免拉伸模糊。'),
+        if (_iconResult != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            _iconResult!,
+            style: TextStyle(
+              fontSize: 11,
+              color: _iconOk
+                  ? FoaColors.of(context).success
+                  : FoaColors.of(context).danger,
+            ),
+          ),
+        ],
+        _hint('选一张方形 PNG，建议 ${IconReplacer.recommendedSize}×'
+            '${IconReplacer.recommendedSize} 或更大。'
+            '容器里有 imagemagick / Pillow 时会按密度生成精确尺寸；'
+            '没有则各密度目录放同一张图，由系统按屏幕密度缩放——'
+            '能用，但原图太小会在高密度屏上发虚。'
+            '替换后需重新打包才会生效。'
+            '（在电脑上正规做法是在 pubspec 里配 flutter_launcher_icons '
+            '然后跑一次生成；手机上没法跑那个包，这里是用容器里的'
+            'imagemagick / Pillow 做等价的事。）'),
       ],
     );
+  }
+
+  /// 选择图片并替换项目图标。
+  Future<void> _replaceIcon() async {
+    setState(() {
+      _iconBusy = true;
+      _iconResult = null;
+    });
+    try {
+      // SAF 选文件 → 原生侧已复制到容器 /root/imports/
+      final picked = await FileBrowserBridge().pickImport();
+      if (!picked.ok || picked.path == null) {
+        if (mounted) {
+          setState(() {
+            _iconBusy = false;
+            _iconOk = false;
+            _iconResult = picked.error ?? '未选择文件';
+          });
+        }
+        return;
+      }
+      final r = await IconReplacer.apply(
+        ProotBridge(),
+        widget.projectName,
+        picked.path!,
+      );
+      if (!mounted) return;
+      setState(() {
+        _iconBusy = false;
+        _iconOk = r.ok;
+        _iconResult = r.msg;
+      });
+      if (r.ok) await _load(); // 重读，让"已找到图标资源"状态跟上
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _iconBusy = false;
+          _iconOk = false;
+          _iconResult = '替换失败：$e';
+        });
+      }
+    }
   }
 
   // ---------- 卡片 5：签名 ----------
 
   Widget _signingCard() {
+    final cfg = _signCfg;
+    // 三态：读不出内容（有文件但缺项）/ 已配好 / 没配。
+    // 分开是因为"文件在但缺项"最容易让人以为配好了——按已配处理的话
+    // 构建会在 gradle 里炸，而报错信息根本不会提到 key.properties。
+    final broken = _hasSigning && cfg == null;
+    final ok = cfg != null;
+    final color = ok
+        ? const Color(0xFF3DDC84)
+        : (broken ? FoaColors.of(context).danger : const Color(0xFFFFB74D));
     return _card(
       icon: Icons.key_outlined,
-      title: '签名配置',
-      subtitle: _hasSigning ? '已检测到签名配置' : '未配置：当前用 debug 签名',
+      title: '正式签名',
+      subtitle: ok
+          ? '已配置：release 构建用正式密钥'
+          : (broken ? 'key.properties 内容不完整' : '未配置：当前用 debug 签名'),
       children: [
+        // alpha.96：构建脚本里还留着**会让 gradle 编译失败**的老写法。
+        // 这块要显眼且可操作 —— 用户现在大概率就是被这个挡住构建的。
+        if (_hasLegacyGradle) ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: FoaColors.of(context).danger.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: FoaColors.of(context).danger.withValues(alpha: 0.4),
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.build_circle_outlined,
+                        size: 18, color: FoaColors.of(context).danger),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '构建脚本需要修复',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: FoaColors.of(context).danger,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  _kLegacyGradleNote,
+                  style: TextStyle(fontSize: 11.5, height: 1.5),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _signBusy ? null : _repairGradle,
+                    icon: const Icon(Icons.healing_outlined, size: 16),
+                    label: const Text('修复构建脚本',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 12)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+        ],
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
-            color: (_hasSigning
-                    ? const Color(0xFF3DDC84)
-                    : const Color(0xFFFFB74D))
-                .withValues(alpha: 0.12),
+            color: color.withValues(alpha: 0.12),
             borderRadius: BorderRadius.circular(8),
           ),
           child: Row(
             children: [
               Icon(
-                _hasSigning ? Icons.verified_outlined : Icons.info_outline,
+                ok
+                    ? Icons.verified_outlined
+                    : (broken ? Icons.error_outline : Icons.info_outline),
                 size: 18,
-                color: _hasSigning
-                    ? const Color(0xFF3DDC84)
-                    : const Color(0xFFFFB74D),
+                color: color,
               ),
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
-                  _hasSigning
-                      ? '项目里存在 key.properties。发布到应用商店前请确认'
-                          'storeFile / storePassword / keyAlias 填写正确。'
-                      : 'debug 签名的 APK 不能上架，也不能覆盖安装正式版。'
-                          '自用/测试没问题，要发布就得生成 keystore 并配置 '
-                          'android/key.properties。',
+                  ok
+                      ? '别名 ${cfg.keyAlias}，keystore 在 ${cfg.storeFile}。'
+                          '密钥丢了就再也发不了升级包，建议导出一份备份。'
+                      : (broken
+                          ? 'key.properties 里 storeFile / keyAlias / '
+                              'storePassword / keyPassword 有缺失，'
+                              'gradle 读到一半会失败。点"重新生成"可以重写一份。'
+                          : 'debug 签名的 APK 不能上架，也不能覆盖安装正式版。'
+                              '自用/测试没问题，要发布就得生成 keystore。'),
                   style: const TextStyle(fontSize: 11, height: 1.5),
                 ),
               ),
@@ -1085,18 +1473,458 @@ class ManifestPageState extends State<ManifestPage> {
         Row(
           children: [
             Expanded(
-              child: OutlinedButton.icon(
-                onPressed: () => widget.onOpenFile(
-                    _hasSigning ? 'android/key.properties' : 'android/app/build.gradle'),
-                icon: const Icon(Icons.code, size: 16),
-                label: Text(_hasSigning ? '查看 key.properties' : '查看 build.gradle',
+              child: FilledButton.icon(
+                // alpha.93：真正干活的入口。以前这张卡只有"查看 build.gradle"
+                // —— 用户看完还得自己去找 keytool、改 gradle，等于没做。
+                onPressed: _signBusy ? null : () => _genKeystore(force: false),
+                icon: _signBusy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.vpn_key, size: 16),
+                label: Text(_signBusy ? '处理中…' : '生成并配置签名',
                     style: const TextStyle(fontSize: 12)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: (_signBusy || cfg == null) ? null : _exportKeystore,
+                icon: const Icon(Icons.ios_share_outlined, size: 16),
+                label: const Text('备份 keystore',
+                    style: TextStyle(fontSize: 12)),
               ),
             ),
           ],
         ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                // Bug 470：同样要跟随实际存在的 gradle 文件（.gradle / .kts），
+                // 否则点了会打开一个不存在的路径
+                onPressed: () => widget.onOpenFile(_hasSigning
+                    ? 'android/key.properties'
+                    : (_gradleActual ?? _gradleRel)),
+                icon: const Icon(Icons.code, size: 16),
+                label: Text(
+                    _hasSigning
+                        ? '查看 key.properties'
+                        : (_gradleActual?.endsWith('.kts') ?? false
+                            ? '查看 build.gradle.kts'
+                            : '查看 build.gradle'),
+                    style: const TextStyle(fontSize: 12)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: (_signBusy || cfg == null)
+                    ? null
+                    : () => _genKeystore(force: true),
+                icon: const Icon(Icons.restart_alt, size: 16),
+                label: const Text('重新生成', style: TextStyle(fontSize: 12)),
+              ),
+            ),
+          ],
+        ),
+        // ---------- alpha.94：签名库（多份钥匙 + 导入） ----------
+        const SizedBox(height: 12),
+        const Divider(height: 1),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Icon(Icons.vpn_key_outlined, size: 15,
+                color: FoaColors.of(context).muted),
+            const SizedBox(width: 6),
+            Text('签名库（${_store.length}）',
+                style: const TextStyle(
+                    fontSize: 12, fontWeight: FontWeight.bold)),
+            const Spacer(),
+            TextButton.icon(
+              onPressed: _signBusy ? null : _importKeystore,
+              icon: const Icon(Icons.upload_file, size: 15),
+              label: const Text('导入 keystore',
+                  style: TextStyle(fontSize: 11.5)),
+            ),
+          ],
+        ),
+        if (_store.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(
+              '还没有登记过钥匙。生成或导入之后，这里会列出来，'
+              '可以在同一个工程里随时切换用哪一把。',
+              style: TextStyle(
+                  fontSize: 10.5, color: FoaColors.of(context).muted),
+            ),
+          )
+        else
+          ..._store.map((e) {
+            final inUse = _signCfg?.storeFile == e.path;
+            return Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Row(
+                children: [
+                  Icon(
+                    inUse ? Icons.check_circle : Icons.vpn_key_outlined,
+                    size: 15,
+                    color: inUse
+                        ? const Color(0xFF3DDC84)
+                        : FoaColors.of(context).muted,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(e.display,
+                            style: const TextStyle(fontSize: 11.5)),
+                        Text(e.detail,
+                            style: TextStyle(
+                                fontSize: 10,
+                                color: FoaColors.of(context).muted)),
+                      ],
+                    ),
+                  ),
+                  if (inUse)
+                    const Text('当前',
+                        style: TextStyle(
+                            fontSize: 11, color: Color(0xFF3DDC84)))
+                  else
+                    TextButton(
+                      onPressed: _signBusy ? null : () => _useKeystore(e),
+                      child: const Text('使用',
+                          style: TextStyle(fontSize: 11.5)),
+                    ),
+                  SizedBox(
+                    width: 32,
+                    child: IconButton(
+                      tooltip: '从库里移除',
+                      iconSize: 15,
+                      onPressed: _signBusy ? null : () => _removeKeystore(e),
+                      icon: Icon(Icons.delete_outline,
+                          size: 15, color: FoaColors.of(context).muted),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }),
+        if (_signResult != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            _signResult!,
+            style: TextStyle(
+              fontSize: 11,
+              height: 1.5,
+              color: _signOk
+                  ? FoaColors.of(context).success
+                  : FoaColors.of(context).danger,
+            ),
+          ),
+        ],
+        _hint(
+          '流程是：容器里的 keytool 生成 JKS 密钥 → 写 android/key.properties '
+          '（并把它加进 .gitignore，避免明文口令进版本库）→ 给 '
+          'android/app/build.gradle(.kts) 打补丁，让 release 变体改用正式密钥。'
+          '构建脚本的模板匹配不到时**不会硬改**，会明确告诉你改用「打包区的验签/重签」。'
+          '上架用的自签证书 Google Play 与多数国内商店都接受，'
+          '但如果你已经从商店后台导出过上传证书，请直接改 key.properties 指到它。',
+        ),
       ],
     );
+  }
+
+  /// alpha.96：修掉构建脚本里会让 gradle **编译失败**的老写法。
+  ///
+  /// 为什么单独做一个按钮，而不是并进"生成并配置签名"：
+  /// 那个入口会**重新生成一把新 keystore**。用户现在的诉求只是
+  /// "让构建别再报 Unresolved reference"，不该被迫换钥匙
+  /// （换了钥匙，已上架的应用就发不了升级包）。
+  Future<void> _repairGradle() async {
+    setState(() {
+      _signBusy = true;
+      _signResult = null;
+    });
+    final log = <String>[];
+    final r = await Signing.repairLegacyPatch(
+      _fb,
+      projectName: widget.projectName,
+    );
+    log.add(r.msg);
+    if (r.changed) {
+      log.add('请重新构建。这次不该再看到 '
+          '`Unresolved reference: util / io` 了。');
+    }
+    await _load();
+    if (!mounted) return;
+    return _finishSign(r.changed, log.join('\n'));
+  }
+
+  /// 生成 keystore → 写 key.properties → 给构建脚本接线。
+  Future<void> _genKeystore({required bool force}) async {
+    final plan = await showSigningDialog(
+      context,
+      projectName: widget.projectName,
+      replacing: force,
+    );
+    if (plan == null || !mounted) return;
+    setState(() {
+      _signBusy = true;
+      _signResult = null;
+    });
+
+    final ksPath = Signing.keystorePathFor(widget.projectName);
+    final log = <String>[];
+
+    // 1) keystore
+    final gen = await Signing.generateKeystore(
+      ProotBridge(),
+      keystorePath: ksPath,
+      alias: plan.alias,
+      storePass: plan.storePass,
+      keyPass: plan.keyPass,
+      dname: plan.dname,
+      force: force,
+    );
+    log.add(gen.msg);
+    if (!gen.ok) return _finishSign(false, log.join('\n'));
+
+    // 2) key.properties（keystore 写成功了才写，否则会留下指不到文件的配置）
+    final w = await Signing.writeKeyProperties(
+      _fb,
+      projectName: widget.projectName,
+      storeFile: ksPath,
+      storePassword: plan.storePass,
+      keyPassword: plan.keyPass,
+      keyAlias: plan.alias,
+    );
+    log.add(w.msg);
+    if (!w.ok) return _finishSign(false, log.join('\n'));
+
+    // 3) 构建脚本接线（匹配不到就拒绝，此时上面两步已经生效，
+    //    用户仍可在打包区对产物直接签名）
+    final p = await Signing.patchBuildScript(_fb, projectName: widget.projectName);
+    log.add(p.ok ? p.msg : '构建脚本没改：${p.msg}\n'
+        '（keystore 与 key.properties 已就绪，可在打包区对 APK 直接签名）');
+
+    // alpha.94：登记进签名库。不登记的话这把钥匙就"只属于这个工程"——
+    // 换个工程要重新生成，想在正式/测试之间切换也没得选。
+    final st = KeystoreStore(ProotBridge());
+    final id = KeystoreStore.safeId(widget.projectName);
+    final entry = KeystoreEntry(
+      id: id,
+      label: widget.projectName,
+      path: ksPath,
+      alias: plan.alias,
+      storePass: plan.storePass,
+      keyPass: plan.keyPass,
+    );
+    final saved = await st.save(<KeystoreEntry>[
+      ..._store.where((e) => e.id != id),
+      entry,
+    ]);
+    log.add(saved.ok ? '已登记进签名库（${saved.msg}）' : '签名库登记失败：${saved.msg}');
+    return _finishSign(true, log.join('\n'));
+  }
+
+  /// 把库里的某把钥匙接到这个工程（写 key.properties + 给 gradle 接线）。
+  Future<void> _useKeystore(KeystoreEntry e) async {
+    setState(() {
+      _signBusy = true;
+      _signResult = null;
+    });
+    final log = <String>[];
+    final w = await Signing.writeKeyProperties(
+      _fb,
+      projectName: widget.projectName,
+      storeFile: e.path,
+      storePassword: e.storePass,
+      keyPassword: e.keyPass,
+      keyAlias: e.alias,
+    );
+    log.add(w.msg);
+    if (!w.ok) return _finishSign(false, log.join('\n'));
+    final p =
+        await Signing.patchBuildScript(_fb, projectName: widget.projectName);
+    log.add(p.ok ? p.msg : '构建脚本没改：${p.msg}\n'
+        '（key.properties 已指向 ${e.display}，可在打包区对 APK 直接签名）');
+    // 即使 gradle 没改成也算成功：钥匙已经接上，产物签名仍然可用。
+    return _finishSign(true, '已切换到「${e.display}」。\n${log.join('\n')}');
+  }
+
+  /// 导入一份外部 keystore：选文件 → 填名字与口令 → 读别名 → 入库。
+  Future<void> _importKeystore() async {
+    setState(() {
+      _signBusy = true;
+      _signResult = null;
+    });
+    try {
+      final picked = await FileBrowserBridge().pickImport();
+      if (!picked.ok || picked.path == null) {
+        return _finishSign(false, picked.error ?? '未选择文件');
+      }
+      if (!mounted) return;
+      final plan = await showKeystoreImportDialog(
+        context,
+        defaultLabel: '导入${_store.length + 1}',
+      );
+      if (plan == null || !mounted) {
+        setState(() => _signBusy = false);
+        return;
+      }
+      final st = KeystoreStore(ProotBridge());
+      final id = _uniqueId(KeystoreStore.safeId(plan.label));
+
+      // 1) 拷进签名库
+      final imp = await st.importFile(src: picked.path!, id: id);
+      if (!imp.ok) return _finishSign(false, imp.msg);
+      final path = imp.msg;
+
+      // 2) 用口令去读别名（顺带验证口令对不对）
+      final al = await st.aliases(
+          keystorePath: path, storePass: plan.storePass);
+      if (!al.ok) {
+        // 文件已经拷进来了，口令错了用户可以再来一次——但要把这次
+        // 拷进去的垃圾清掉，否则签名库里会躺一个打不开的条目。
+        await KeystoreStore(ProotBridge()).delete(path);
+        return _finishSign(false, al.msg);
+      }
+      var alias = plan.alias;
+      if (al.aliases.isNotEmpty) {
+        if (al.aliases.length == 1) {
+          alias = al.aliases.first;
+        } else if (mounted) {
+          final chosen = await _pickAliasDialog(al.aliases);
+          if (chosen == null) {
+            await KeystoreStore(ProotBridge()).delete(path);
+            setState(() => _signBusy = false);
+            return;
+          }
+          alias = chosen;
+        }
+      }
+      // 3) 读证书主体（让用户以后能认出这是谁的钥匙）
+      final subj = await st.subject(
+          keystorePath: path, alias: alias, storePass: plan.storePass);
+      final entry = KeystoreEntry(
+        id: id,
+        label: plan.label,
+        path: path,
+        alias: alias,
+        storePass: plan.storePass,
+        keyPass: plan.keyPass,
+        subject: subj,
+        imported: true,
+      );
+      final next = <KeystoreEntry>[
+        ..._store.where((e) => e.id != id),
+        entry,
+      ];
+      final saved = await st.save(next);
+      if (!saved.ok) return _finishSign(false, saved.msg);
+      return _finishSign(true,
+          '已导入「${entry.display}」（别名 $alias${subj.isEmpty ? '' : '，$subj'}）。\n'
+          '它还没接到这个工程——点它右边的「使用」才会写进 key.properties。');
+    } catch (e) {
+      return _finishSign(false, '导入失败：$e');
+    }
+  }
+
+  /// 从库里移除（只删库里的副本与登记，不动工程）。
+  Future<void> _removeKeystore(KeystoreEntry e) async {
+    final inUse = _signCfg?.storeFile == e.path;
+    final ok = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('从签名库移除？'),
+            content: Text(
+              '会删掉 ${e.path} 以及它在库里的登记。\n'
+              '${inUse ? '⚠️ 这个工程正在用它——移除后 key.properties 会指向一个不存在的文件，'
+                      'release 构建会失败（除非再选一把或重新生成）。'
+                    : '这个工程当前没用它，移除不影响构建。'}',
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('取消')),
+              TextButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: const Text('移除')),
+            ],
+          ),
+        ) ??
+        false;
+    if (!ok) return;
+    setState(() {
+      _signBusy = true;
+      _signResult = null;
+    });
+    final st = KeystoreStore(ProotBridge());
+    final d = await st.delete(e.path);
+    if (!d.ok) return _finishSign(false, d.msg);
+    final next = _store.where((x) => x.id != e.id).toList();
+    final s = await st.save(next);
+    return _finishSign(s.ok, s.ok ? '已从签名库移除「${e.display}」。' : s.msg);
+  }
+
+  /// 库里已有同名 id 时往后顺延（覆盖别人的钥匙是不可逆的，绝不自动做）。
+  String _uniqueId(String base) {
+    final taken = _store.map((e) => e.id).toSet();
+    if (!taken.contains(base)) return base;
+    var i = 2;
+    while (taken.contains('${base}_$i')) {
+      i++;
+    }
+    return '${base}_$i';
+  }
+
+  /// 一个 keystore 里有多个别名时让用户挑（挑错会签不出来）。
+  Future<String?> _pickAliasDialog(List<String> aliases) {
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('用哪个别名签名？'),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Text(
+              '这个文件里有 ${aliases.length} 个条目。签名用的必须是'
+              '**私钥**条目（keytool -list 里带 PrivateKeyEntry 的那些）。',
+              style: TextStyle(
+                  fontSize: 11, color: FoaColors.of(context).muted),
+            ),
+          ),
+          ...aliases.map((a) => SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, a),
+                child: Text(a, style: const TextStyle(fontSize: 12)),
+              )),
+        ],
+      ),
+    );
+  }
+
+  void _finishSign(bool ok, String msg) {
+    if (!mounted) return;
+    setState(() {
+      _signBusy = false;
+      _signOk = ok;
+      _signResult = msg;
+    });
+    _load(); // 重读，让卡片状态跟上
+  }
+
+  /// 把 keystore 通过系统保存对话框导出（丢了就发不了升级包）。
+  Future<void> _exportKeystore() async {
+    final cfg = _signCfg;
+    if (cfg == null) return;
+    final name = cfg.storeFile.split('/').last;
+    final r = await FileBrowserBridge().export(cfg.storeFile, name);
+    if (!mounted) return;
+    _toast(r.ok ? '已导出 $name（请妥善保管）' : '导出失败：${r.error}');
   }
 
   // ---------- 卡片 6：构建高级 ----------
@@ -1122,7 +1950,16 @@ class ManifestPageState extends State<ManifestPage> {
           ),
           dense: true,
         ),
-        if (d.minify) _hint('将与当前设置相反：现在为 ${_disk.minify ? "开启" : "关闭"}'),
+        // ⚠️ 这段话必须区分「文件里真写了」和「文件里没有、靠 AGP 默认」。
+        // 官方模板的 buildTypes.release 里**根本没有** minifyEnabled 这一行，
+        // 而 AGP 对 release 的默认就是开启 —— 所以缺省时磁盘上的真实状态是
+        // 「开启」，但写的是「这一行不存在」。含糊成一句「现在为开启」会让
+        // 用户以为文件里已经有 false/true 可改，翻到 gradle 里找不到就懵了。
+        if (d.minify)
+          _hint(_minifyExplicit
+              ? '将与当前设置相反：现在为 ${_disk.minify ? "开启" : "关闭"}'
+              : 'gradle 里原本没有 minifyEnabled 这一行（AGP 对 release 默认开启）；'
+                  '保存后会写进 buildTypes.release'),
         const Divider(height: 20),
         ListTile(
           contentPadding: EdgeInsets.zero,
@@ -1130,7 +1967,8 @@ class ManifestPageState extends State<ManifestPage> {
           leading: const Icon(Icons.description_outlined, size: 18),
           title: const Text('pubspec.yaml（描述 / 版本 / 依赖）',
               style: TextStyle(fontSize: 13)),
-          subtitle: Text('当前描述：${_disk.description.isEmpty ? "（空）" : _disk.description}',
+          subtitle: Text(
+              '当前描述：${_disk.description.isEmpty ? "（空）" : _disk.description}',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 10)),
@@ -1195,7 +2033,8 @@ class ManifestPageState extends State<ManifestPage> {
             Padding(
               padding: const EdgeInsets.only(left: 26),
               child: Text(subtitle,
-                  style: TextStyle(fontSize: 11, color: FoaColors.of(context).muted)),
+                  style: TextStyle(
+                      fontSize: 11, color: FoaColors.of(context).muted)),
             ),
             const Divider(height: 22),
             ...children,
@@ -1211,14 +2050,16 @@ class ManifestPageState extends State<ManifestPage> {
       child: Row(
         children: [
           Text(s,
-              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+              style:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
           if (hint != null) ...[
             const SizedBox(width: 8),
             Expanded(
               child: Text(hint,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 10, color: FoaColors.of(context).muted)),
+                  style: TextStyle(
+                      fontSize: 10, color: FoaColors.of(context).muted)),
             ),
           ],
         ],

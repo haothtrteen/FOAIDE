@@ -22,8 +22,10 @@ void main() {
   // ---------------- ① 主题 → 系统栏同步 ----------------
 
   group('Bug 464 · 主题同步契约', () {
-    const darkHex = 0xFF101418;
-    const lightHex = 0xFFF5F7F8;
+    // alpha.92：系统栏改用 panelBg（深色 #14181E / 浅色 #FBFCFD），
+    // 与 AppBar 背景同源 —— 详见 `FoaTheme.overlayFor` 的注释。
+    const darkHex = 0xFF14181E;
+    const lightHex = 0xFFFBFCFD;
 
     test('overlayFor 深色：状态栏与导航栏同色且为深底', () {
       final s = FoaTheme.overlayFor(Brightness.dark);
@@ -46,9 +48,9 @@ void main() {
         'android/app/src/main/kotlin/dev/foa/flutter_on_android/MainActivity.kt',
       ).readAsStringSync();
       // applySystemBarColors 里的两个字面量必须与 Dart 侧一致
-      expect(kt.contains('0xFF101418.toInt()'), isTrue,
+      expect(kt.contains('0xFF14181E.toInt()'), isTrue,
           reason: 'Kotlin 兜底缺深色值——Android 15+ 上系统栏会回落默认色');
-      expect(kt.contains('0xFFF5F7F8.toInt()'), isTrue,
+      expect(kt.contains('0xFFFBFCFD.toInt()'), isTrue,
           reason: 'Kotlin 兜底缺浅色值');
     });
 
@@ -238,12 +240,16 @@ void main() {
   // ---------------- ④ proroot 一键拉取 ----------------
 
   group('Bug 464 · proroot 一键拉取契约', () {
-    test('资产清单恰好 5 个文件，且与 ProrootOption.soFiles 同名', () {
-      expect(ProrootOption.soAssets.length, 5);
+    test('资产清单已清空（alpha.69 方案 A：不代分发，两条清单必须一致）', () {
+      // 原断言是"恰好 5 个且与 soFiles 同名"。上游许可禁止再分发后
+      // 五件套已从 APK 移除，两条清单都应为空 **且仍然一致** ——
+      // "一致"这个不变式保留下来，防止将来只改一处。
+      expect(ProrootOption.soAssets, isEmpty);
       final fromAssets = ProrootOption.soAssets.map((e) => e.name).toSet();
       final fromOption = ProrootOption.soFiles.toSet();
       expect(fromAssets, equals(fromOption),
           reason: '两边不一致会导致"下载了但落位说缺文件"');
+      expect(fromOption, isEmpty, reason: '不应再有内置二进制');
     });
 
     test('每个资产都有正字节数与合法 sha256（钉死内容）', () {
@@ -252,6 +258,14 @@ void main() {
         expect(RegExp(r'^[0-9a-f]{64}$').hasMatch(a.sha256), isTrue,
             reason: '${a.name} 的 sha256 非法');
       }
+    });
+
+    test('不再提供下载入口（不代分发的直接体现）', () {
+      // alpha.69：清单为空 → 没有任何可下载的资产。
+      // 这条替代了原本"每个文件都配了多个镜像"的断言 ——
+      // 那个不变式在不再分发的前提下已无意义。
+      expect(ProrootOption.soAssets, isEmpty);
+      expect(ProrootOption.totalBytes, 0);
     });
 
     test('下载地址走 raw 域名（避开 GitHub API 的速率限制）', () {
@@ -264,6 +278,9 @@ void main() {
     });
 
     test('每个文件都配了多个镜像（国内可达性波动大）', () {
+      // × 空清单下本循环不执行；保留它是因为 `mirrorsFor` 仍在
+      // （将来许可口径变化时复原用），这里守住"每个镜像的 URL
+      // 文件名与资产名一致"这个不变式仍然有意义。
       for (final a in ProrootOption.soAssets) {
         final ms = ProrootOption.mirrorsFor(a.name);
         expect(ms.length, greaterThanOrEqualTo(3),
@@ -273,6 +290,21 @@ void main() {
               reason: '${m.name} 的 URL 文件名对不上');
         }
       }
+    });
+
+    test('UI 不再暴露「一键下载」入口（点了必然失败的按钮不该留）', () {
+      final card = File('lib/toolchain/proroot_option.dart').readAsStringSync();
+      // _download() 方法体保留（便于许可口径变化时复原），
+      // 但它**不能有按钮绑定** —— 否则用户会点到一个必然失败的按钮
+      // （fetchAll 因 isKnownUnusable() 在首个网络请求前就抛异常）。
+      expect(card.contains('onPressed: _busy ? null : _download'), isFalse,
+          reason: '一键下载按钮已下架，不应再有绑定');
+      expect(card.contains("label: Text(\n                      installed"),
+          isFalse,
+          reason: '按钮 label 里的 installed ? 三元是原按钮的指纹');
+      // 但方法本体要留着（与"Java 层逻辑与卡片暂时保留"同一原则）
+      expect(card.contains('Future<void> _download() async'), isTrue,
+          reason: '方法体应保留以备许可口径变化，只是不暴露入口');
     });
 
     test('Kotlin 侧注册了 prorootInstallFromDir（复用落位逻辑）', () {

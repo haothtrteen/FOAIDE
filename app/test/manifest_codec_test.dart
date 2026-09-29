@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:foaide/project/manifest_codec.dart';
 
@@ -48,6 +50,7 @@ dev_dependencies:
 
   const gradle = '''
 android {
+    namespace = "dev.foa.flutter_on_android"
     defaultConfig {
         applicationId = "dev.foa.flutter_on_android"
         minSdk = 26
@@ -279,21 +282,250 @@ dev_dependencies:
   group('setMinify', () {
     test('关闭 R8', () {
       final out = ManifestCodec.setMinify(gradle, false);
-      expect(ManifestCodec.parseGradle(out).minify, isFalse);
-      expect(out.contains('isShrinkResources = true'), isTrue,
-          reason: '不应误伤相邻的 isShrinkResources（前缀重叠）');
+      expect(ManifestCodec.parseGradle(out.code).minify, isFalse);
+      expect(out.inserted, isFalse, reason: '原地改写，不算插入');
+    });
+
+    // Bug 635：AGP 硬校验"资源缩减必须配合代码缩减"，只要
+    // isShrinkResources 还是 true 而 isMinifyEnabled 变成 false，
+    // 连 debug 构建都会在配置阶段就失败：
+    //   > Removing unused resources requires unused code shrinking ...
+    // 也就是说"关掉 R8"这个开关以前会把整个工程搞成构建不了的状态。
+    group('Bug 635 · 关混淆必须同步关资源缩减', () {
+      test('两者都置 false', () {
+        const src = ''
+            'buildTypes {\n'
+            '    release {\n'
+            '        isMinifyEnabled = true\n'
+            '        isShrinkResources = true\n'
+            '    }\n'
+            '}\n';
+        final out = ManifestCodec.setMinify(src, false);
+        expect(out.code, contains('isMinifyEnabled = false'));
+        expect(out.code, contains('isShrinkResources = false'),
+            reason: '不改的话 AGP 会拒绝配置工程，构建直接失败');
+      });
+
+      test('开启时不反向改动资源缩减', () {
+        const src = 'isMinifyEnabled = false\nisShrinkResources = false\n';
+        final out = ManifestCodec.setMinify(src, true);
+        expect(out.code, contains('isMinifyEnabled = true'));
+        expect(out.code, contains('isShrinkResources = false'),
+            reason: '开混淆没有"必须配套"的约束，不替用户决定资源缩减');
+      });
+
+      test('Groovy 写法的分隔符同样保留', () {
+        const src = 'minifyEnabled true\nshrinkResources true\n';
+        final out = ManifestCodec.setMinify(src, false);
+        expect(out.code, contains('minifyEnabled false'));
+        expect(out.code, contains('shrinkResources false'));
+        expect(out.code.contains('='), isFalse,
+            reason: 'Groovy 写法不该被塞进 = 号');
+      });
+
+      test('原文没有 shrinkResources 就不插', () {
+        final out = ManifestCodec.setMinify('isMinifyEnabled = true', false);
+        expect(out.code, isNot(contains('ShrinkResources')),
+            reason: '资源缩减是独立开关，没写就别替用户决定');
+      });
     });
 
     test('开启 R8', () {
       final out = ManifestCodec.setMinify(
           'isMinifyEnabled = false', true);
-      expect(ManifestCodec.parseGradle(out).minify, isTrue);
+      expect(ManifestCodec.parseGradle(out.code).minify, isTrue);
+      expect(out.inserted, isFalse);
     });
 
     test('Groovy 写法的分隔符被保留', () {
       final out = ManifestCodec.setMinify('minifyEnabled true', false);
-      expect(out, contains('minifyEnabled false'));
-      expect(out.contains('='), isFalse, reason: 'Groovy 写法不该被塞进 = 号');
+      expect(out.code, contains('minifyEnabled false'));
+      expect(out.code.contains('='), isFalse, reason: 'Groovy 写法不该被塞进 = 号');
+    });
+
+    // 官方模板的 buildTypes.release 里**根本没有** minifyEnabled ——
+    // 这就是"r8无法关闭"的根因。这一组用**真实模板文件**做夹具，
+    // 保证"自动插入一行"在真文件上成立，而不只是在我手写的样张上成立。
+    group('（真实 Flutter 模板）缺行时自动插入', () {
+      File template() => File('/opt/flutter/packages/flutter_tools/templates/'
+          'app/android-kotlin.tmpl/app/build.gradle.kts.tmpl');
+
+      test('插入后解析回来真的是关的，且幂等', () {
+        final src = template().readAsStringSync();
+        // 前提：模板里确实没有这一行（模板一变，这条会先炸，提示夹具失效）
+        expect(ManifestCodec.parseGradle(src).minifyExplicit, isFalse,
+            reason: '上游模板新增了 minifyEnabled，本夹具需要重写');
+
+        final r = ManifestCodec.setMinify(src, false);
+        expect(r.inserted, isTrue);
+        expect(r.code, contains('isMinifyEnabled = false'));
+        expect(ManifestCodec.parseGradle(r.code).minify, isFalse);
+        expect(ManifestCodec.parseGradle(r.code).minifyExplicit, isTrue);
+
+        // 幂等：再来一次不该多插一行
+        final r2 = ManifestCodec.setMinify(r.code, false);
+        expect(r2.inserted, isFalse);
+        expect(r2.code, r.code);
+
+        // 还能开回去
+        final r3 = ManifestCodec.setMinify(r.code, true);
+        expect(r3.inserted, isFalse, reason: '已有该行，走原地改写');
+        expect(ManifestCodec.parseGradle(r3.code).minify, isTrue);
+      });
+
+      test('插入的缩进对得上（写进 release 块里，不是顶格）', () {
+        final src = template().readAsStringSync();
+        final code = ManifestCodec.setMinify(src, false).code;
+        final line = code
+            .split('\n')
+            .firstWhere((l) => l.contains('isMinifyEnabled'));
+        expect(line, matches(RegExp(r'^ +isMinifyEnabled = false$')),
+            reason: '要有前导缩进且不留尾随空白');
+        expect(code, isNot(contains('\n\n\n')), reason: '不要插出多余空行');
+      });
+
+      test('没有 release 块时补一个，按 DSL 风格选对键名', () {
+        // Kotlin DSL：赋值是 `键 = 值`
+        const kts = 'android {\n'
+            '    compileSdk = 36\n'
+            '    buildTypes {\n'
+            '    }\n'
+            '}\n';
+        final r = ManifestCodec.setMinify(kts, false);
+        expect(r.inserted, isTrue);
+        expect(r.code, contains('isMinifyEnabled = false'));
+        expect(r.code, isNot(contains('minifyEnabled = false')));
+
+        // Groovy DSL：赋值是 `键 值`（无 = 号）
+        const groovy = 'android {\n'
+            '    compileSdk 36\n'
+            '    buildTypes {\n'
+            '    }\n'
+            '}\n';
+        final g = ManifestCodec.setMinify(groovy, false);
+        expect(g.inserted, isTrue);
+        expect(g.code, contains('minifyEnabled = false'));
+      });
+
+      test('连 buildTypes 都没有时如实返回没改，不硬拗', () {
+        const weird = 'plugins {\n    id "com.android.application"\n}\n';
+        final r = ManifestCodec.setMinify(weird, false);
+        expect(r.inserted, isFalse);
+        expect(r.code, weird, reason: '不能改坏用户文件');
+      });
+    });
+  });
+
+  group('parseGradle · minifyExplicit', () {
+    test('有这一行时为 true，读到的是什么就是什么', () {
+      expect(ManifestCodec.parseGradle('isMinifyEnabled = false').minifyExplicit,
+          isTrue);
+      expect(ManifestCodec.parseGradle('isMinifyEnabled = true').minifyExplicit,
+          isTrue);
+    });
+
+    test('没这一行时为 false，但 minify 兜底为 true（AGP 默认）', () {
+      final r = ManifestCodec.parseGradle('android { }\n');
+      expect(r.minifyExplicit, isFalse);
+      expect(r.minify, isTrue);
+    });
+  });
+
+  group('setAppId', () {
+    test('Groovy：只改 applicationId，不凭空插入 namespace', () {
+      // 这一段是 Groovy 风格 —— 模板里所有可识别的赋值都是 `键 值` 形式，
+      // 没有任何 `键 = 值`，此时单方改写是对的（不要无中生有加 namespace）。
+      const groovyGradle = '''
+android {
+    defaultConfig {
+        applicationId "dev.foa.flutter_on_android"
+        minSdk 26
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+        }
+    }
+}
+''';
+      final r = ManifestCodec.setAppId(groovyGradle, 'com.acme.newapp');
+      expect(r.changed, isTrue);
+      expect(r.code, contains('applicationId "com.acme.newapp"'));
+      expect(r.code, isNot(contains('namespace')),
+          reason: '原文没有 namespace 就不该被插进去');
+    });
+
+    test('Kotlin DSL：namespace 与 applicationId 一起改', () {
+      final r = ManifestCodec.setAppId(gradle, 'com.acme.newapp');
+      expect(r.changed, isTrue);
+      expect(ManifestCodec.parseGradle(r.code).appId, 'com.acme.newapp');
+      expect(r.code, contains('namespace = "com.acme.newapp"'));
+      expect(r.code, contains('applicationId = "com.acme.newapp"'));
+    });
+
+    test('真实模板：两处都改，且不误伤注释里的 URL', () {
+      final src = File('/opt/flutter/packages/flutter_tools/templates/app/'
+              'android-kotlin.tmpl/app/build.gradle.kts.tmpl')
+          .readAsStringSync();
+      final r = ManifestCodec.setAppId(src, 'com.acme.newapp');
+      expect(r.changed, isTrue);
+      expect(ManifestCodec.parseGradle(r.code).appId, 'com.acme.newapp');
+      expect(r.code, contains('namespace = "com.acme.newapp"'));
+      expect(r.code, contains('applicationId = "com.acme.newapp"'));
+      expect(r.code, contains('developer.android.com'),
+          reason: '注释里那句 TODO 的 URL 不该被误伤');
+    });
+
+    test('Groovy 写法（无 = 号）也能改', () {
+      final r = ManifestCodec.setAppId(
+          'applicationId "com.old.app"\n', 'com.new.app');
+      expect(r.changed, isTrue);
+      expect(r.code, contains('applicationId "com.new.app"'));
+    });
+
+    test('一处都没有时如实返回没改', () {
+      final r = ManifestCodec.setAppId('android { }\n', 'com.a.b');
+      expect(r.changed, isFalse);
+    });
+  });
+
+  group('setManifestPackage', () {
+    test('只改已有的 package 属性，不新插', () {
+      final r = ManifestCodec.setManifestPackage(
+          '<manifest package="com.old.app"><application/></manifest>',
+          'com.new.app');
+      expect(r.changed, isTrue);
+      expect(r.code, contains('package="com.new.app"'));
+      expect(r.code, isNot(contains('com.old.app')));
+    });
+
+    test('没有 package 属性时原样返回（AGP 8 已移除该属性）', () {
+      const src =
+          '<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
+          '<application/></manifest>';
+      final r = ManifestCodec.setManifestPackage(src, 'com.a.b');
+      expect(r.changed, isFalse);
+      expect(r.code, src);
+    });
+  });
+
+  group('validAppId', () {
+    test('接受常规包名', () {
+      expect(ManifestCodec.validAppId('com.example.app'), isTrue);
+      expect(ManifestCodec.validAppId('dev.foa.flutter_on_android'), isTrue);
+      expect(ManifestCodec.validAppId('a.b'), isTrue);
+    });
+
+    test('拒绝段数不足 / 非法字符 / 数字或下划线开头', () {
+      expect(ManifestCodec.validAppId('com'), isFalse, reason: '至少两段');
+      expect(ManifestCodec.validAppId(''), isFalse);
+      expect(ManifestCodec.validAppId('com.example.my app'), isFalse);
+      expect(ManifestCodec.validAppId('com.例子.app'), isFalse);
+      expect(ManifestCodec.validAppId('Com.Example.App'), isFalse,
+          reason: '大写字母不能用');
+      expect(ManifestCodec.validAppId('com.1app'), isFalse);
+      expect(ManifestCodec.validAppId('com..app'), isFalse, reason: '空段');
+      expect(ManifestCodec.validAppId('com.example.app.'), isFalse);
     });
   });
 
@@ -341,7 +573,7 @@ dev_dependencies:
       mf = ManifestCodec.setLabel(mf, 'FOAIDE 演示');
       mf = ManifestCodec.applyPermissions(mf,
           toAdd: {'android.permission.CAMERA'}, toRemove: {});
-      gr = ManifestCodec.setMinify(gr, false);
+      gr = ManifestCodec.setMinify(gr, false).code;
 
       expect(ManifestCodec.parsePubspec(pub).name, 'foaide');
       expect(ManifestCodec.parsePubspec(pub).description, 'FOAIDE 演示工程');
@@ -351,6 +583,184 @@ dev_dependencies:
       expect(ManifestCodec.parseManifest(mf).permissions,
           contains('android.permission.CAMERA'));
       expect(ManifestCodec.parseGradle(gr).minify, isFalse);
+    });
+  });
+
+  group('Bug 636 · 非法 shrink 组合（AGP 会拒绝配置工程）', () {
+    // 真机报错（alpha.97 用户现场，连 debug 构建都炸）：
+    //   A problem occurred configuring project ':app'.
+    //   > Removing unused resources requires unused code shrinking to be
+    //     turned on.
+    //
+    // 机制（AGP gradle-8.13.1.jar 反编译实证，非推测）：
+    //   getResourcesShrink()==true 且 getMinifiedEnabled()==false
+    //     → issueReporter.reportError(...) → 配置期致命失败
+    //
+    // 为什么会波及 debug：Flutter Gradle 插件（FlutterPlugin.kt:216）
+    // 对 release 无条件设 isMinifyEnabled=true + isShrinkResources=true，
+    // debug 变体通过 buildType 继承拿到同一组属性。
+
+    test('explicitShrinkResources：没写时返回 null（不是 false）', () {
+      const t = 'buildTypes { release { isMinifyEnabled = true } }';
+      expect(ManifestCodec.explicitShrinkResources(t), isNull);
+      // 这个区分很重要：null=走默认值、我们读到的未必是真实生效值，
+      // 拿它当判据会误改用户工程。
+    });
+
+    test('explicitShrinkResources：显式 false 与 true 都能读出来', () {
+      expect(ManifestCodec.explicitShrinkResources('isShrinkResources = true'),
+          isTrue);
+      expect(ManifestCodec.explicitShrinkResources('isShrinkResources = false'),
+          isFalse);
+      // Groovy 形态
+      expect(ManifestCodec.explicitShrinkResources('shrinkResources true'),
+          isTrue);
+    });
+
+    test('explicitMinify：没写时返回 null', () {
+      expect(ManifestCodec.explicitMinify('isShrinkResources = true'), isNull);
+      expect(ManifestCodec.explicitMinify('isMinifyEnabled = false'), isFalse);
+      expect(ManifestCodec.explicitMinify('minifyEnabled true'), isTrue);
+    });
+
+    test('检出非法组合：shrink=true 且 minify=false（都显式）', () {
+      const bad = """
+buildTypes {
+    release {
+        isMinifyEnabled = false
+        isShrinkResources = true
+    }
+}
+""";
+      expect(ManifestCodec.hasIllegalShrinkCombo(bad), isTrue);
+    });
+
+    test('不误报：只有 shrink=true、minify 没写（走插件默认，合法）', () {
+      // Flutter 插件会给 release 同时设 true/true，是合法状态。
+      // 若拿"读到的 minify=null"当 false 处理，就会误改用户工程。
+      const ok = """
+buildTypes {
+    release {
+        isShrinkResources = true
+    }
+}
+""";
+      expect(ManifestCodec.hasIllegalShrinkCombo(ok), isFalse);
+    });
+
+    test('不误报：shrink=true 且 minify=true（Flutter 插件默认形态）', () {
+      const ok = """
+buildTypes {
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true
+    }
+}
+""";
+      expect(ManifestCodec.hasIllegalShrinkCombo(ok), isFalse);
+    });
+
+    test('不误报：shrink 没写（官方模板形态）', () {
+      const ok = """
+buildTypes {
+    release {
+        isMinifyEnabled = false
+    }
+}
+""";
+      expect(ManifestCodec.hasIllegalShrinkCombo(ok), isFalse);
+    });
+
+    test('不误报：shrink=false 且 minify=false（合法）', () {
+      const ok = """
+buildTypes {
+    release {
+        isMinifyEnabled = false
+        isShrinkResources = false
+    }
+}
+""";
+      expect(ManifestCodec.hasIllegalShrinkCombo(ok), isFalse);
+    });
+
+    test('修复：把 isShrinkResources 改成 false，不碰 minify', () {
+      const bad = """
+buildTypes {
+    release {
+        isMinifyEnabled = false
+        isShrinkResources = true
+    }
+}
+""";
+      final r = ManifestCodec.fixIllegalShrinkCombo(bad);
+      expect(r.changed, isTrue);
+      expect(r.code.contains('isShrinkResources = false'), isTrue);
+      // minify 是用户刚手动设的明确意图 —— 绝不能推翻
+      expect(r.code.contains('isMinifyEnabled = false'), isTrue);
+      // 修完必须变合法
+      expect(ManifestCodec.hasIllegalShrinkCombo(r.code), isFalse);
+    });
+
+    test('修复 Groovy 形态（shrinkResources true）', () {
+      const bad = """
+buildTypes {
+    release {
+        minifyEnabled false
+        shrinkResources true
+    }
+}
+""";
+      final r = ManifestCodec.fixIllegalShrinkCombo(bad);
+      expect(r.changed, isTrue);
+      expect(r.code.contains('shrinkResources false'), isTrue);
+      expect(ManifestCodec.hasIllegalShrinkCombo(r.code), isFalse);
+    });
+
+    test('修复幂等：合法输入原样返回、changed=false', () {
+      const ok = """
+buildTypes {
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true
+    }
+}
+""";
+      final r = ManifestCodec.fixIllegalShrinkCombo(ok);
+      expect(r.changed, isFalse);
+      expect(r.code, ok);
+      // 再修一次仍然不动
+      expect(ManifestCodec.fixIllegalShrinkCombo(r.code).changed, isFalse);
+    });
+
+    test('修复后能读通：parseGradle 仍认得出 minify', () {
+      const bad = """
+buildTypes {
+    release {
+        isMinifyEnabled = false
+        isShrinkResources = true
+    }
+}
+""";
+      final r = ManifestCodec.fixIllegalShrinkCombo(bad);
+      final p = ManifestCodec.parseGradle(r.code);
+      expect(p.minify, isFalse);
+      expect(p.minifyExplicit, isTrue);
+    });
+
+    test('接进构建流程：构建前检查 + 修复接线都在', () {
+      // 这条是"代码写了但没接进去"的护栏 —— 与 signing_test 的
+      // UI 接线断言同一思路。
+      final src = File('lib/toolchain/build_runner.dart').readAsStringSync();
+      expect(src.contains('ManifestCodec.hasIllegalShrinkCombo'), isTrue);
+      expect(src.contains('ManifestCodec.fixIllegalShrinkCombo'), isTrue);
+      expect(src.contains('_fixIllegalShrinkCombo'), isTrue);
+      // Bug 636 的报错原文要点出来，用户才能对上号
+      expect(src.contains('Removing unused resources'), isTrue);
+      // 必须在 build 命令发出**之前**修（否则等于没修）
+      final fixAt = src.indexOf('await _fixIllegalShrinkCombo(');
+      final buildAt = src.indexOf('execStream(cmd');
+      expect(fixAt > 0 && buildAt > 0 && fixAt < buildAt, isTrue,
+          reason: '修 shrink 组合必须在启动构建之前 —— 晚了 AGP 已经拒绝了');
     });
   });
 }

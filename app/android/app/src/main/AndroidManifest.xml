@@ -4,8 +4,20 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- alpha.31 构建前台服务：退到桌面/锁屏构建继续（保活 proot/gradle/dart 进程树） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- 通知栏构建进度（Android 13+ 运行时权限；targetSdk<33 由系统自动授予） -->
+    <!-- 通知栏构建进度（Android 13+ 运行时权限）。
+         ⚠️ 这句话原先写的是"targetSdk<33 由系统自动授予"，只对**设备升级**
+         场景成立：Android 13+ **新装**的应用通知默认是关的。而且 targetSdk<33
+         时判定权在系统手里（见 REQUEST_INSTALL_PACKAGES 下方说明），
+         应用无法主动弹框，只能检查 + 引导去设置页。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- alpha.72 安装构建产物：从系统安装器拉起 APK。
+         之前**整条缺失** —— 连系统设置里「安装未知应用」的列表中都找不到本应用，
+         于是构建完点「安装」必被系统拦下，且用户无处可开。
+         targetSdk=28 ≥ 26，所以这道 AppOps 闸门（OP_REQUEST_INSTALL_PACKAGES）
+         对我们是**生效**的：必须声明 + 用 canRequestPackageInstalls() 检查 +
+         在未开启时跳 ACTION_MANAGE_UNKNOWN_APP_SOURCES（引导页第 3 页负责）。
+         注意它不是危险权限，没有运行时弹框，requestPermissions() 对它无效。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name="${applicationName}"

@@ -45,6 +45,34 @@ class ProrootDownload {
     required EnvInfo env,
     void Function(String)? onLog,
   }) async {
+    // Bug 471（**已修正**）：**先做组合级兼容性判定**，再决定要不要花流量下载。
+    //
+    // 逐文件 sha256 只能证明"字节没被改动"，证明不了"这些字节合在一起
+    // 能跑"。这一点当初判断对了，但**判据选错了**：
+    //
+    //  · 一开始只查 glibc 符号依赖 → 拦住了 v1.2.8（需 2.38，报
+    //    `reloc: unresolved`），但**放过了 v1.2.5**（只需 2.34，
+    //    纸面满足）—— 真机实测 v1.2.5 同样崩：`no offset table for
+    //    glibc 2.36` → SIGSEGV → code 139。
+    //
+    //  · 教训：**符号依赖满足 ≠ 能跑**。linker 还需要为目标 glibc
+    //    准备内部结构体偏移表，这个信息完全不在 ELF 符号表里，
+    //    `readelf -V` 看不到，只能靠真机跑。
+    //
+    // 所以现在改成查 [isKnownUnusable]（真机实测结论），而不是
+    // 查"版本号算得过来"。宁可多劝退，也不要让用户走完
+    // "预检通过 → 下载 → 冒烟 → 崩溃 → 白折腾"这一整轮。
+    if (ProrootOption.isKnownUnusable()) {
+      final msg = ProrootOption.knownUnusableMessage();
+      onLog?.call('[预检] 该组合已被真机证实不可用，跳过下载');
+      throw DownloadException(msg);
+    }
+    if (!ProrootOption.isGlibcCompatible()) {
+      final msg = ProrootOption.glibcMismatchMessage();
+      onLog?.call('[预检] 不兼容，跳过下载');
+      throw DownloadException(msg);
+    }
+
     final staging = '${env.rootfsPath}/$stagingRelDir';
     final dir = Directory(staging);
     if (!dir.existsSync()) dir.createSync(recursive: true);
@@ -73,8 +101,7 @@ class ProrootDownload {
           onMirrorUsed: (m) => onLog?.call('$tag 使用镜像：${m.name}'),
         );
       } catch (e) {
-        throw DownloadException(
-            '${a.name} 下载失败：$e\n可稍后重试（已下载的文件会保留，重试只补缺的）。');
+        throw DownloadException('${a.name} 下载失败：$e\n可稍后重试（已下载的文件会保留，重试只补缺的）。');
       }
 
       if (!await _verify(dst, a.size, a.sha256)) {
@@ -82,7 +109,7 @@ class ProrootDownload {
         throw DownloadException(
             '${a.name} 校验失败：期望 ${a.size}B / ${a.sha256.substring(0, 12)}…，'
             '实际 ${got}B。\n'
-            '可能原因：上游已发新版（本 App 钉死了 v1.2.8 的文件）、'
+            '可能原因：上游已发新版（本 App 曾钉死特定版本的文件）、'
             '或镜像返回了错误内容。已保留文件供排查，不会静默装上。');
       }
       onLog?.call('$tag ${a.name} ✓');
@@ -106,7 +133,7 @@ class ProrootDownload {
     if (dir.existsSync()) dir.deleteSync(recursive: true);
   }
 
-  static String _kb(int bytes) =>
-      bytes < 1024 * 1024 ? '${(bytes / 1024).toStringAsFixed(0)}KB'
-                          : '${(bytes / 1024 / 1024).toStringAsFixed(1)}MB';
+  static String _kb(int bytes) => bytes < 1024 * 1024
+      ? '${(bytes / 1024).toStringAsFixed(0)}KB'
+      : '${(bytes / 1024 / 1024).toStringAsFixed(1)}MB';
 }

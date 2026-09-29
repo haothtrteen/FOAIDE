@@ -77,15 +77,23 @@ final List<(RegExp, BuildStage)> _rules = [
   // ---- gradle / agp 侧 ----
   (RegExp(r'> Task .*compileFlutterBuild', caseSensitive: false),
       BuildStages.compileKernel),
-  (RegExp(r'> Task .*(mergeReleaseResources|processReleaseResources)',
+  // ⚠️ alpha.93：下面几条**必须同时匹配 Release 与 Debug 变体**。
+  //   原先只写了 `mergeReleaseResources` / `compileReleaseKotlin` /
+  //   `packageRelease` / `assembleRelease`，而 debug 构建产出的是
+  //   `mergeDebugResources` / `compileDebugKotlin` / `assembleDebug`——
+  //   一条都匹配不上，进度会从「编译 Dart 内核」(40%) 一路卡死到构建结束
+  //   才突然 100%，看起来就像卡住。这是加 debug 档时最容易漏的地方。
+  (RegExp(r'> Task .*(merge(?:Release|Debug)Resources'
+          r'|process(?:Release|Debug)Resources)',
           caseSensitive: false),
       BuildStages.resources),
-  (RegExp(r'> Task .*(compileReleaseKotlin|compileReleaseJavaWithJavac|'
-          r'dexBuilder|dexing|minifyReleaseWithR8|shrink)',
+  (RegExp(r'> Task .*(compile(?:Release|Debug)Kotlin'
+          r'|compile(?:Release|Debug)JavaWithJavac|'
+          r'dexBuilder|dexing|minify(?:Release|Debug)WithR8|shrink)',
           caseSensitive: false),
       BuildStages.dex),
-  (RegExp(r'> Task .*(packageRelease|assembleRelease|signingConfigWriter|'
-          r'validateSigning)',
+  (RegExp(r'> Task .*(package(?:Release|Debug)|assemble(?:Release|Debug)'
+          r'|signingConfigWriter|validateSigning)',
           caseSensitive: false),
       BuildStages.packageApk),
   (RegExp(r'Built build/app/outputs|BUILD SUCCESS', caseSensitive: false),
@@ -116,6 +124,17 @@ class BuildProgressTracker {
   /// 是否冻结（失败/取消后不再爬升，避免骗用户"还在动"）。
   bool _halted = false;
 
+  /// alpha.93：debug 档跳过 AOT 段。
+  ///
+  /// debug 构建不走 gen_snapshot，[BuildStages.aot] 那一段（40%~58%）
+  /// 永远不会到达。若不处理，进度会从 40% 直接跳到 58%——不算致命，
+  /// 但用户能看到明显的跳变。置为 true 时会把 [aotEnd, 1.0] **拉伸**到
+  /// [aotStart, 1.0]，进度条保持连续。
+  ///
+  /// 由 BuildRunner.start(flavor:) 在构建开始前设置，reset() 不重置它
+  /// （它是"这次构建是什么类型"的属性，不是进度状态）。
+  bool skipAot = false;
+
   /// 当前阶段。
   BuildStage get stage => BuildStages.ordered[_rank];
 
@@ -125,7 +144,14 @@ class BuildProgressTracker {
   double get progress {
     if (_done) return 1.0;
     final s = stage;
-    return (s.start + (s.end - s.start) * _intraStage).clamp(0.0, 1.0);
+    final p = (s.start + (s.end - s.start) * _intraStage).clamp(0.0, 1.0);
+    if (!skipAot) return p;
+    // debug 档：把 AOT 段（[aot.end, 1.0]）拉伸到 [aot.start, 1.0]，
+    // 消掉那 18% 的空档，让进度条连续。
+    const a = BuildStages.aot;
+    if (p <= a.start) return p;
+    final t = (p - a.end) / (1.0 - a.end);
+    return (a.start + (1.0 - a.start) * t.clamp(0.0, 1.0)).clamp(0.0, 1.0);
   }
 
   /// 显示用百分比整数。
@@ -144,6 +170,13 @@ class BuildProgressTracker {
 
   /// 推进到指定阶段（只前进，不后退）。
   void _advanceTo(BuildStage target) {
+    // debug 档下 AOT 段不该出现（不走 gen_snapshot）。万一日志里真冒出来
+    // （比如 flutter 改版），也别停在一段永不推进的空档上——直接落到
+    // 它后面的「编译资源」。
+    if (skipAot && target == BuildStages.aot) {
+      _advanceTo(BuildStages.resources);
+      return;
+    }
     final idx = BuildStages.ordered.indexOf(target);
     if (idx <= _rank) return;
     _rank = idx;

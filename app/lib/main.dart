@@ -7,10 +7,11 @@ import 'editor/web_preview_page.dart';
 import 'editor/web_preview_service.dart';
 import 'env/env_installer.dart';
 import 'env/proot_bridge.dart';
+import 'events/native_events.dart';
 import 'mcp/remote_takeover_page.dart';
 import 'toolchain/build_notify.dart';
 import 'toolchain/build_page.dart';
-import 'ui/home_page.dart';
+import 'ui/onboarding_gate.dart';
 
 /// 全局导航钥匙：通知点击回构建页（BuildNotify.onNavigate）用，
 /// BuildRunner 与通知路径不持有 BuildContext，只能走根 navigator。
@@ -48,7 +49,12 @@ class _FoaAppState extends State<FoaApp> {
     // 两条路径：① App 前台，原生 onNewIntent 反向 invoke「navigate」；
     // ② 冷启动点通知，Dart handler 未注册时原生先存 pendingNavigate，
     //    这里首帧后主动拉取一次（takeNavigate）。
-    BuildNotify.ensureHandler();
+    //
+    // alpha.91：反向 handler 统一由 NativeEvents 注册（全项目唯一一处
+    // setMethodCallHandler）。此前是 BuildNotify.ensureHandler 自己注册，
+    // 现在新增了 fsChange（文件变更推送），同一个通道再注册第二个 handler
+    // 会把 navigate 静默顶掉 —— 详见 native_events.dart 类注释。
+    NativeEvents.ensureHandler();
     // alpha.59：通知点击按最近启动的前台任务分流（构建页 / Web 预览控制台）
     BuildNotify.onNavigate = _openNotifyTarget;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -59,7 +65,7 @@ class _FoaAppState extends State<FoaApp> {
   void _openNotifyTarget() {
     // 按「最近启动的任务」分流（原生回发不带类别，见 BuildNotify.lastRoute）：
     // - preview  → Web 预览控制台（项目根由会话单例还原）
-    // - takeover → 远程接管页（MCP + 隧道状态）
+    // - takeover → 远程协助页（MCP + 隧道状态）
     // - 其余     → 构建页（含冷启动兜底：会话不在了也回构建页看日志）
     if (BuildNotify.lastRoute == 'preview') {
       final proj = WebPreviewService.I.projName;
@@ -93,7 +99,10 @@ class _FoaAppState extends State<FoaApp> {
     return MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => EnvState()..bootstrap()),
-        ChangeNotifierProvider(create: (_) => ThemeController()),
+        // alpha.69：主题默认跟随系统，用户改过的选择由 ThemePrefs 持久化。
+        // `..load()` 异步补齐（构造时已是 system），不阻塞首帧 ——
+        // 详见 ThemeController.load 的注释。
+        ChangeNotifierProvider(create: (_) => ThemeController()..load()),
       ],
       child: Consumer<ThemeController>(
         builder: (context, tc, _) => MaterialApp(
@@ -122,7 +131,12 @@ class _FoaAppState extends State<FoaApp> {
               child: child ?? const SizedBox.shrink(),
             );
           },
-          home: const HomePage(),
+          // alpha.72：home 从 HomePage 换成 OnboardingGate ——
+          // 首启先判定「这一版引导看过没有」，没看过就显示引导页。
+          // 判定本身异步走平台通道，但**不阻塞首帧**（闸门先渲染一个
+          // 与主页同底色的占位，首帧后才去读标记文件）——
+          // 详见 onboarding_gate.dart 的类注释。
+          home: const OnboardingGate(),
         ),
       ),
     );

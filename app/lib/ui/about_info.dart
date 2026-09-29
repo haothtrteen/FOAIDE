@@ -5,6 +5,8 @@
 /// 这些都是"不写测试就一定会复发"的类型。
 library;
 
+import '../toolchain/proroot_option.dart';
+
 /// 作者信息与第三方组件清单。
 class AboutInfo {
   const AboutInfo._();
@@ -13,13 +15,23 @@ class AboutInfo {
   static const String appName = 'FOAIDE';
 
   /// 版本号。**必须与 pubspec.yaml 的 version 同步**（有单测守住）。
-  static const String version = 'v0.1.0-alpha.63+63';
+  static const String version = 'v0.1.0-alpha.98+98';
 
   /// 一句话说明（关于页副标题）。
   static const String tagline = '在 Android 上原生构建 Flutter 应用';
 
   /// 作者。
   static const String author = 'haothtrteen';
+
+  /// 作者 GitHub 主页（alpha.70 加，用户要求展示）。
+  ///
+  /// ⚠️ 拼写以 [author] 为准，这里必须与它一致。
+  /// 需求提出时写作 `/haothtrreen`（多一个 r），与 [author] 的
+  /// `haothtrteen` 不一致。取 [author] 的理由：它是本文件里作者名的
+  /// 唯一真源，且已被既有测试覆盖；手打时多按一次 r 的概率，
+  /// 远高于"存了两年的 author 字段是错的"。
+  /// 若日后确认是另一个账号，**两处一起改**（有单测盯着一致性）。
+  static const String authorRepo = 'https://github.com/haothtrteen';
 
   /// 联系方式（用户明确要求展示）。
   static const String email = '2557976190@qq.com';
@@ -87,7 +99,12 @@ class AboutInfo {
     ),
     AboutComponent(
       name: 'proroot',
-      version: 'v1.2.8',
+      // ⚠️ **不要写死版本号**，直接引用唯一真源。
+      // 曾经写死 'v1.2.8'：Bug 471 把钉的版本换成 v1.2.5 之后，这里没跟着改，
+      // About 页就一直向用户展示一个**已经不用了的**版本号。
+      // 这类"同一事实存两份"的地方迟早打架（Bug 474 的参数名 cmd/command
+      // 是同一个病），所以这里改成引用常量。
+      version: ProrootOption.pinnedVersion,
       license: 'Proprietary',
       repoUrl: 'https://github.com/coderredlab/proroot',
       usage: '可选的容器层加速：用 LD_PRELOAD + 二进制补丁替代 proot 的 '

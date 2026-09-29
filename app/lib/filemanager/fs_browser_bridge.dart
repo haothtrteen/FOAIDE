@@ -220,6 +220,36 @@ class FileBrowserBridge {
     return FsOpResult.fromMap((raw as Map<Object?, Object?>?) ?? {});
   }
 
+  /// 能否安装未知来源应用（系统设置里的「安装未知应用」开关）。
+  ///
+  /// ⚠️ 异常一律返回 **true**：这是"保守地让流程继续"。查不到状态时，
+  /// 若返回 false 会把用户拦在一个可能并不存在的问题前面；让他去装，
+  /// 失败了系统安装器会给明确反馈 —— 那比在这里误报好。
+  /// （同 `BuildNotify.enabled` 的取舍：查不到就别拦路。）
+  ///
+  /// API < 26 没有这道闸门，原生侧直接返回 true。
+  Future<bool> canInstallPackages() async {
+    try {
+      return await _channel.invokeMethod<bool>('canInstallPackages') ?? true;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  /// 跳系统「安装未知应用」设置页（直达本应用那一项）。返回是否成功拉起。
+  ///
+  /// 不等待用户操作结果：引导页在 resume 时会重新查一次
+  /// [canInstallPackages]，比等 onActivityResult 可靠（用户可能按返回键、
+  /// 也可能从最近任务切回来）。
+  Future<bool> openInstallUnknownSources() async {
+    try {
+      return await _channel.invokeMethod<bool>('openInstallUnknownSources') ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// 系统文件选择器导入任意文件到容器 /root/imports，返回容器路径。
   Future<ImportedFile> pickImport() async {
     try {

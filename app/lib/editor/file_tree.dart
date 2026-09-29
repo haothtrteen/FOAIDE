@@ -88,7 +88,8 @@ class FileTreeState extends State<FileTree> {
   ///（项目根）——抽屉里不允许浏览到项目外。
   String get _root =>
       widget.minimal && _hasInit ? widget.initialDir! : kProjectsRoot;
-  bool get _hasInit => widget.initialDir != null && widget.initialDir!.isNotEmpty;
+  bool get _hasInit =>
+      widget.initialDir != null && widget.initialDir!.isNotEmpty;
 
   bool get _canGoUp => _dir != _root;
 
@@ -469,7 +470,8 @@ class FileTreeState extends State<FileTree> {
             const SizedBox(height: 8),
             Text(
               '（空文件夹）',
-              style: TextStyle(color: FoaColors.of(context).muted, fontSize: 13),
+              style:
+                  TextStyle(color: FoaColors.of(context).muted, fontSize: 13),
             ),
           ],
         ),
@@ -512,10 +514,8 @@ class FileTreeState extends State<FileTree> {
               tooltip: '更多操作（重命名 / 删除）',
               visualDensity: VisualDensity.compact,
               padding: EdgeInsets.zero,
-              constraints:
-                  const BoxConstraints(minWidth: 32, minHeight: 32),
-              icon: const Icon(Icons.more_vert,
-                  size: 16, color: Colors.grey),
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              icon: const Icon(Icons.more_vert, size: 16, color: Colors.grey),
               onPressed: () => _showMenu(e),
             ),
           ],

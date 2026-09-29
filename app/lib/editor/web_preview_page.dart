@@ -58,8 +58,7 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
     super.initState();
     _scroll.addListener(() {
       if (!_scroll.hasClients) return;
-      final atBottom =
-          _scroll.offset >= _scroll.position.maxScrollExtent - 24;
+      final atBottom = _scroll.offset >= _scroll.position.maxScrollExtent - 24;
       if (atBottom != _autoScroll) {
         setState(() => _autoScroll = atBottom);
       }
@@ -126,8 +125,7 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
             return NavigationDecision.navigate;
           }
           if (req.url.startsWith('http')) {
-            launchUrl(Uri.parse(req.url),
-                mode: LaunchMode.externalApplication);
+            launchUrl(Uri.parse(req.url), mode: LaunchMode.externalApplication);
           }
           return NavigationDecision.prevent;
         },
@@ -327,11 +325,7 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
     final startingText = WebPreviewService.stageLabel(
         portOpen: s.portOpen, elapsedSec: s.elapsedSec);
     final (icon, color, text) = switch (st) {
-      WebPreviewStatus.idle => (
-          Icons.stop_circle_outlined,
-          Colors.grey,
-          '未启动'
-        ),
+      WebPreviewStatus.idle => (Icons.stop_circle_outlined, Colors.grey, '未启动'),
       WebPreviewStatus.starting => (
           Icons.hourglass_top,
           const Color(0xFFFFA000),
@@ -382,13 +376,14 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
             Text(
               '项目：${s.projName ?? widget.projectRoot.split('/').last}'
               ' · ${WebPreviewService.url}',
-              style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
+              style:
+                  TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
             ),
             if (s.error != null) ...[
               const SizedBox(height: 4),
               Text('错误：${s.error}',
-                  style: const TextStyle(
-                      fontSize: 12, color: Color(0xFFCF6679))),
+                  style:
+                      const TextStyle(fontSize: 12, color: Color(0xFFCF6679))),
             ],
             const SizedBox(height: 10),
             _actions(st),
@@ -488,7 +483,9 @@ class _WebPreviewPageState extends State<WebPreviewPage> {
 
   Widget _logView() {
     return Container(
-      color: FoaTheme.consoleBg,
+      // alpha.69：日志区原本固定 `FoaTheme.consoleBg` 深色，
+      // 浅色主题下整块日志是黑的。改走语义位（深色值不变）。
+      color: FoaColors.of(context).codeBg,
       child: s.lines.isEmpty
           ? Center(
               child: Column(

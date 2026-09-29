@@ -42,18 +42,33 @@ class AboutPage extends StatelessWidget {
   // ---------------- 头部：图标 + 名称 + 版本 ----------------
 
   Widget _header(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
     return Column(
       children: [
-        Container(
-          width: 84,
-          height: 84,
-          decoration: BoxDecoration(
-            color: cs.primaryContainer,
-            borderRadius: BorderRadius.circular(20),
+        // alpha.70：原为 `Icon(Icons.flutter_dash)`，那是 Flutter 官方
+        // logo——放在"关于 FOAIDE"页里，读者会以为是本项目的图标，
+        // 也就是用户说的"图标还没改"。
+        //
+        // 直接复用启动器那张源图（assets/icon/app_icon.png），不另画一份：
+        // 两份几何一定会漂移，最后变成"关于页图标和桌面图标不一样"。
+        // 也去掉了外层 primaryContainer 底 —— 图标自带 #101418 深底，
+        // 再套一层主题容器会在浅色主题下露出一圈浅色边。
+        ClipRRect(
+          borderRadius: BorderRadius.circular(20),
+          child: Image.asset(
+            'assets/icon/app_icon.png',
+            width: 84,
+            height: 84,
+            fit: BoxFit.cover,
+            // 图标缺失不能白屏整页（asset 拼错是运行时才发现的那类错误）。
+            errorBuilder: (context, error, stack) => Container(
+              width: 84,
+              height: 84,
+              color: FoaColors.of(context).panelBg,
+              alignment: Alignment.center,
+              child: Icon(Icons.terminal,
+                  size: 40, color: FoaColors.of(context).muted),
+            ),
           ),
-          child: Icon(Icons.flutter_dash,
-              size: 46, color: cs.onPrimaryContainer),
         ),
         const SizedBox(height: 14),
         const Text(AboutInfo.appName,
@@ -89,6 +104,17 @@ class AboutPage extends StatelessWidget {
               label: '联系方式',
               value: AboutInfo.email,
               tooltip: '复制邮箱',
+            ),
+            const SizedBox(height: 8),
+            // alpha.70：用户要求展示作者仓库。
+            // 用 _copyRow 而非 _row：地址是要粘到浏览器里的，
+            // 长按选中的体验远不如一键复制。
+            _copyRow(
+              context: context,
+              icon: Icons.code,
+              label: 'GitHub',
+              value: AboutInfo.authorRepo,
+              tooltip: '复制仓库地址',
             ),
           ],
         ),

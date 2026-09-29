@@ -67,6 +67,14 @@ class CodeField extends StatefulWidget {
   final bool lineNumbers;
   final bool horizontalScroll;
 
+  /// FOA（Bug 609 补全浮层）：代码区纵向滚动控制器就绪后回调。
+  ///
+  /// 代码区 TextField 的纵向滚动由内部的 [_codeScroll] 驱动，外部拿不到；
+  /// 补全浮层要把「光标所在行的文本坐标」换算成视口坐标就需要它。
+  /// 在 initState 建好 controller 后回调一次；dispose 前不置空（调用方
+  /// 须自行判 hasClients）。
+  final ValueChanged<ScrollController?>? onScrollControllerReady;
+
   const CodeField({
     Key? key,
     required this.controller,
@@ -93,6 +101,7 @@ class CodeField extends StatefulWidget {
     this.lineNumbers = true,
     this.horizontalScroll = true,
     this.selectionControls,
+    this.onScrollControllerReady,
   }) : super(key: key);
 
   @override
@@ -117,6 +126,8 @@ class _CodeFieldState extends State<CodeField> {
     _controllers = LinkedScrollControllerGroup();
     _numberScroll = _controllers?.addAndGet();
     _codeScroll = _controllers?.addAndGet();
+    // FOA（Bug 609）：建好即回调，供外部（补全浮层）读滚动偏移。
+    widget.onScrollControllerReady?.call(_codeScroll);
     _numberController = LineNumberController(widget.lineNumberBuilder);
     widget.controller.addListener(_onTextChanged);
     _focusNode = widget.focusNode ?? FocusNode();

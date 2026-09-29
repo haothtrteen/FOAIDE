@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:foaide/toolchain/build_runner.dart';
 import 'package:foaide/toolchain/qemu_compat.dart';
@@ -121,6 +123,62 @@ void main() {
       r.debugFeedForTest(
           "Shader compilation of 'ink_sparkle.frag' failed with exit code -4");
       expect(r.hints.any((h) => h.contains('Bug 428')), isTrue);
+    });
+  });
+
+  // ==========================================================================
+  // Bug 637（alpha.98 回归实测）：debug 档"pub get 之后 reassert 消失"
+  // ==========================================================================
+  //
+  // 真机现象：alpha.98 的 debug 构建报
+  //   `Removing unused resources requires unused code shrinking`
+  // 而 alpha.97 同样的工程能过。用户以为是 shrink 检查改坏了东西。
+  //
+  // 真因**与 shrink 无关**：debug 档的 `pub get` 与 `reassert` 之间少了
+  // 一个 `echo` 之外的实质动作 —— 不对，真因是**档位分支**：
+  // 见下面 [debug 档] 组的断言。
+  group('Bug 637 · debug 档 reassert 必须仍然执行', () {
+    String cmdFor(BuildFlavor f) => BuildRunner.buildCommand(
+          proj: '/root/projects/demo',
+          flutterCmd: 'flutter',
+          envPart: 'SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt ',
+          aapt2Override: '',
+          flavor: f,
+          prootFlutterProbeNeeded: true,
+        );
+
+    test('alpha.97 的核心不变量：reassert 段必须在 flutter build 之前', () {
+      for (final f in BuildFlavor.values) {
+        final c = cmdFor(f);
+        final rAt = c.indexOf('REASSERT_DART'); // reassert 脚本体内的唯一标记
+        final bAt = c.indexOf('build apk --no-shrink');
+        expect(rAt > 0, isTrue, reason: '$f：reassert 脚本整段不见了');
+        expect(bAt > 0, isTrue, reason: '$f：没找到 build 命令');
+        expect(rAt < bAt, isTrue,
+            reason: '$f：reassert 必须在 build 之前 —— 晚了转发层可能已被覆盖');
+      }
+    });
+
+    test('debug 档也必须带 reassert（不能因为跳过 precache 就漏掉它）', () {
+      // alpha.97 把 precache 做成 debug 档可跳过（`needsAot=false`）。
+      // 危险点：若将来有人把 reassert 与 precache **合并成同一分支**，
+      // debug 档就会连 reassert 一起失去 —— 那正是 Bug 637 的翻车方式。
+      final dbg = cmdFor(BuildFlavor.debug);
+      expect(dbg.contains('REASSERT_DART'), isTrue,
+          reason: 'debug 档丢了 reassert → 转发层无人重建 → SIGILL 家族回归');
+      // precache 段确实应被跳过（这是 alpha.93 的刻意设计）
+      expect(dbg.contains('跳过 AOT 工具链预取'), isTrue,
+          reason: 'debug 档应跳过 precache —— 与 reassert 的存在互不冲突');
+    });
+
+    test('两档的命令都必须能过 bash -n（脚本只经 Dart 拼接，没人看过成品）', () {
+      for (final f in BuildFlavor.values) {
+        final c = cmdFor(f);
+        final r = Process.runSync('bash', ['-n', '-c', c]);
+        expect(r.exitCode, 0,
+            reason: '$f：生成命令有 shell 语法错误 → '
+                '${r.stderr.toString().split('\n').take(3).join(' | ')}');
+      }
     });
   });
 }

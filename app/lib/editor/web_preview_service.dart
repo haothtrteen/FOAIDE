@@ -93,10 +93,13 @@ class WebPreviewService {
   // ---- Bug 454（alpha.60）：三段式就绪判定的运行时状态 ----
   /// 端口探测结果（true = 8090 已在监听）。
   bool portOpen = false;
+
   /// 上次端口探测时刻（节流用）。
   DateTime? _lastProbeAt;
+
   /// 是否已放行（ready / degrade 都算），防止重复触发。
   bool _released = false;
+
   /// 首次就绪耗时（秒）——埋点：用于后续决定是否投入「预热」优化。
   int? firstReadySec;
 
@@ -229,8 +232,7 @@ class WebPreviewService {
   }
 
   /// 静默期心跳行（纯函数，便于单测）。
-  static String heartbeatLine(int elapsedSec) =>
-      '· 已等待 ${fmtDur(elapsedSec)}'
+  static String heartbeatLine(int elapsedSec) => '· 已等待 ${fmtDur(elapsedSec)}'
       '（${elapsedSec >= 60 ? 'DDC 编译中' : '启动中'}，无输出属正常）';
 
   /// 端口探测：返回 true = 开发服务器已在 8090 监听。
@@ -579,9 +581,7 @@ class WebPreviewService {
         BuildNotify.finish('✗ Web 预览已退出');
         return error;
       }
-      lines.add('↻ 已触发$label（${DateTime.now()
-          .toString()
-          .substring(11, 19)}）');
+      lines.add('↻ 已触发$label（${DateTime.now().toString().substring(11, 19)}）');
       _ui();
       _scroll();
       return null;

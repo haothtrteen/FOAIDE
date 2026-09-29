@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../env/models.dart';
 import '../env/proot_bridge.dart';
+import 'artifact_prefetch.dart';
 import 'jdk_installer.dart';
 import 'local_install_picker.dart';
 import 'native_arm64.dart';
@@ -28,7 +29,17 @@ import '../core/theme.dart';
 /// - x64 兼容层(QEMU)：idle → apt → engine → sdk → validating
 ///   → installed；失败 → error（apt/预下载阶段为不确定进度条，无取消）。
 class ToolchainPage extends StatefulWidget {
-  const ToolchainPage({super.key});
+  /// 从引导页跳来时置 true。
+  ///
+  /// 它改变了**首次进入的交互**：正常情况下后端偏好为 null 会弹一个
+  /// 「选哪个后端」对话框，不选完进不去内容。但从引导页来的用户
+  /// 刚刚被告知"全自动装完了/去手动装"，迎面撞上一个他没听说过的
+  /// 选择题是很糟的体验 —— 此时静默用 proot（引导页已经写好偏好了）。
+  ///
+  /// 默认 false 保证既有调用点（主页「配置」→ 工具链）行为完全不变。
+  final bool autoStart;
+
+  const ToolchainPage({super.key, this.autoStart = false});
 
   @override
   State<ToolchainPage> createState() => _ToolchainPageState();
@@ -187,10 +198,17 @@ class _ToolchainPageState extends State<ToolchainPage> {
       if (!mounted) return;
       setState(() => _backend = b);
       if (b == null) {
-        // 首次进入：问一次用哪个后端（给推荐），不选完不进页面内容
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _showBackendChoiceDialog(firstRun: true);
-        });
+        if (widget.autoStart) {
+          // 从引导页来：不弹选择题，直接用推荐后端（proot），
+          // 并顺手把偏好落盘，免得下次又走到这个分支。
+          await BackendPrefs.save(env, BuildBackend.proot);
+          if (mounted) setState(() => _backend = BuildBackend.proot);
+        } else {
+          // 首次进入：问一次用哪个后端（给推荐），不选完不进页面内容
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _showBackendChoiceDialog(firstRun: true);
+          });
+        }
       }
     } catch (_) {}
     await _refreshAll();
@@ -1510,17 +1528,6 @@ class _ToolchainPageState extends State<ToolchainPage> {
                     onUninstall: _qemuUninstall,
                   ),
                   const SizedBox(height: 12),
-                  // 容器层加速（proroot）：alpha.61 起真正可启用。
-                  // 放在「x64 兼容层」之后——两者都作用于容器层，
-                  // 读者心智上属于同一块。
-                  ProrootCard(
-                    enabled: _layer == ContainerLayer.proroot,
-                    onChanged: _layer == null
-                        ? null
-                        : (v) => _setLayer(
-                            v ? ContainerLayer.proroot : ContainerLayer.proot),
-                  ),
-                  const SizedBox(height: 12),
                   _NativeCard(
                     phase: _nativePhase,
                     audit: _nativeAudit,
@@ -1598,12 +1605,36 @@ class _ToolchainPageState extends State<ToolchainPage> {
                     onCancel: _mirrorCancel,
                   ),
                   const SizedBox(height: 12),
+                  // alpha.94：引擎构件预取。放在镜像卡之后——两者都服务于
+                  // "把构建时的下载提前"，读者顺着看下来是连贯的。
+                  const _PrefetchCard(),
+                  const SizedBox(height: 12),
                   _AvfCard(env: _env),
+                  const SizedBox(height: 12),
+                  // 容器层加速（proroot）：alpha.61 引入，alpha.70 移到这里。
+                  //
+                  // **为什么在最后**：alpha.61~69 它紧跟在「x64 兼容层」后面，
+                  // 理由是"两者都作用于容器层"。但那个位置传达了一个错误暗示——
+                  // 读者会把它当成"和 QEMU 平级的必经步骤"，而它实际是**可选优化**：
+                  // 默认关闭、要用户自备二进制、上游许可禁止我们代为分发。
+                  // 用户反馈"容易被误判优先级"，就是这条暗示的后果。
+                  // 放到分支末尾 = 视觉上表达"该装的都装完了、还想再快一点再看这个"。
+                  //
+                  // ⚠️ 不要再往上移。位置本身就是它的"优先级声明"。
+                  // 注：仅 proot 后端显示——termux 后端不经容器层，
+                  // 没有可优化的对象，显示出来只会让人困惑。
+                  ProrootCard(
+                    enabled: _layer == ContainerLayer.proroot,
+                    onChanged: _layer == null
+                        ? null
+                        : (v) => _setLayer(
+                            v ? ContainerLayer.proroot : ContainerLayer.proot),
+                  ),
                 ],
                 // 故障诊断（alpha.59 引入，alpha.60 更名）：两种后端通用——
                 // 命令走 proot 容器普通通道，只读探测，不与构建/预览抢
-                // Flutter 启动锁。注意与「远程接管」区分：本项是**本机采集**
-                // 信息给 AI 看；远程接管是把设备交给远程 AI 执行。
+                // Flutter 启动锁。注意与「远程协助」区分：本项是**本机采集**
+                // 信息给 AI 看；远程协助是把设备交给远程 AI 执行。
                 const SizedBox(height: 12),
                 Card(
                   child: ListTile(
@@ -3038,6 +3069,206 @@ class _MirrorCard extends StatelessWidget {
               child: Text(k,
                   style: TextStyle(
                       color: Colors.grey.shade400, fontSize: 13)),
+            ),
+            Expanded(
+                child: Text(v,
+                    style: const TextStyle(
+                        fontSize: 12, fontFamily: 'monospace'))),
+          ],
+        ),
+      );
+}
+
+// ============================ 引擎构件预取（alpha.94） ============================
+
+/// 把「构建时才会发生的引擎构件下载」提前做掉。
+///
+/// 为什么要单独一张卡：默认档位改成 debug 之后（alpha.94），第一次打 debug
+/// 包要现拉 182MB（`io.flutter:arm64_v8a_debug`），而这段下载发生在
+/// gradle 内部——用户只看到进度条不动，不知道是在下东西还是卡死了。
+/// 预取把它变成一个**可见、可取消、能看日志**的独立动作。
+///
+/// 只做 proot 后端：termux 裸模式下 Gradle 缓存与 dist 都在 prefix 下另一套
+/// 路径，本卡的 gradle 探测路径（/root/.gradle/...）不适用，显示了反而是误导。
+class _PrefetchCard extends StatefulWidget {
+  const _PrefetchCard();
+
+  @override
+  State<_PrefetchCard> createState() => _PrefetchCardState();
+}
+
+class _PrefetchCardState extends State<_PrefetchCard> {
+  final PrefetchJob _job = PrefetchJob(ProotBridge());
+  PrefetchMode? _lastMode;
+
+  @override
+  void initState() {
+    super.initState();
+    _job.onChanged = () {
+      if (mounted) setState(() {});
+    };
+  }
+
+  @override
+  void dispose() {
+    _job.dispose();
+    super.dispose();
+  }
+
+  Future<void> _start(PrefetchMode mode) async {
+    _lastMode = mode;
+    await _job.start(mode);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final running = _job.running;
+    // 只显示最后 8 行：gradle 的下载日志一行一个构件，全留会把卡片撑爆，
+    // 而用户真正需要看的是"有没有报错"——错误都在末尾。
+    final tail = _job.lines.length <= 8
+        ? _job.lines
+        : _job.lines.sublist(_job.lines.length - 8);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  running
+                      ? Icons.downloading
+                      : (_job.ok
+                          ? Icons.check_circle
+                          : Icons.cloud_download_outlined),
+                  color: running
+                      ? Colors.orangeAccent
+                      : (_job.ok
+                          ? const Color(0xFF3DDC84)
+                          : Colors.orangeAccent),
+                ),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    '引擎构件预取',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 20),
+            _kv('debug 档', 'arm64_v8a_debug + flutter_embedding_debug · 约 182 MB'),
+            _kv('release 档', 'arm64_v8a_release + flutter_embedding_release · 约 44 MB'),
+            _kv('存放位置', 'Gradle 缓存（~/.gradle/caches/modules-2）· 全工程共用'),
+            const SizedBox(height: 12),
+            Text(
+              'Flutter 的 Gradle 插件在构建期从 download.flutter.io 拉 '
+              'io.flutter:* 构件——这两批文件不在本地 SDK 缓存里，'
+              '第一次打某个档位的包必然要联网下。预取 = 提前跑一次'
+              '只解析依赖的 gradle 任务，把文件灌进 Gradle 缓存，'
+              '之后构建就不再触发下载了（换 SDK 版本会换构件版本，需重新预取）。\n'
+              '⚠️ 官方为此提供的 `flutter precache --android_maven` 在 '
+              'Flutter 3.47.4 上是空操作（沙箱实测 exit 0、零输出），'
+              '它依赖的 `gradle -b` 调用方式也被 Gradle 9 删掉了，'
+              '所以这里用的是等价的自建脚本，只拉 arm64 一个 ABI。',
+              style: TextStyle(fontSize: 12, color: FoaColors.of(context).muted),
+            ),
+            if (tail.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.25),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: SelectableText(
+                  tail.join('\n'),
+                  style: const TextStyle(
+                      fontSize: 11, fontFamily: 'monospace', height: 1.45),
+                ),
+              ),
+            ],
+            if (_job.error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SelectableText(_job.error,
+                  style: const TextStyle(
+                      fontSize: 12, color: Color(0xFFFF7A7A))),
+            ],
+            if (_job.ok) ...[
+              const SizedBox(height: 8),
+              Text(
+                '预取完成${_lastMode == null ? '' : '（${_lastMode!.label}）'}，'
+                '之后构建不会再下载这批构件。',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF3DDC84)),
+              ),
+            ],
+            const SizedBox(height: 16),
+            if (running)
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.tonalIcon(
+                  onPressed: _job.stop,
+                  icon: const Icon(Icons.stop, size: 18),
+                  label: const Text('取消'),
+                ),
+              )
+            else
+              // ⚠️ 按钮文案**必须短**（alpha.95 修）：原来叫「预取 debug」
+              // 「预取 release」「两档都取」，三个一行时中文按**字**换行，
+              // 被挤成「预 / 取 / deb / ug」这种竖直堆叠，非常难看。
+              // 现在：主按钮用完整的「预取 debug 构件」，两个次选只留
+              // 档位名（靠卡片标题「引擎构件预取」提供上下文），
+              // 并显式加 maxLines/ellipsis 兜底，宁可省略号也不竖排。
+              Column(
+                children: [
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: () => _start(PrefetchMode.debug),
+                      icon: const Icon(Icons.download_outlined, size: 18),
+                      label: const Text('预取 debug 构件',
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _start(PrefetchMode.release),
+                          child: const Text('仅 release',
+                              maxLines: 1, overflow: TextOverflow.ellipsis),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _start(PrefetchMode.both),
+                          child: const Text('两档都取',
+                              maxLines: 1, overflow: TextOverflow.ellipsis),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(
+              width: 90,
+              child: Text(k,
+                  style: TextStyle(color: Colors.grey.shade400, fontSize: 13)),
             ),
             Expanded(
                 child: Text(v,

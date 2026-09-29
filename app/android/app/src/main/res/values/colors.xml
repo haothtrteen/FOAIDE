@@ -14,6 +14,7 @@
          foa_bg_light——否则浅色顶栏底下压着一条深色状态栏。
          系统栏初始色由 styles.xml 按 night 限定符分别声明。 -->
     <color name="foa_bg">#FF101418</color>
-    <!-- 浅色主题的窗口/系统栏底色（与 FoaTheme.lightSurface 一致） -->
-    <color name="foa_bg_light">#FFF5F7F8</color>
+    <!-- 浅色主题的窗口/系统栏底色（与 FoaTheme.lightSurface / panelBg(light) 一致） -->
+    <color name="foa_bg_light">#FFFBFCFD</color>
+	<color name="ic_launcher_background">#101418</color>
 </resources>

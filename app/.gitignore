@@ -7,7 +7,15 @@
 .pub/
 build/
 *.dart_tool
+# ⚠️ Flutter 模板自带的通配规则。它会吃掉任何 `flutter_*.png`，
+# 所以 App 图标源图（assets/icon/*.png）与生成的 mipmap 都刻意
+# **避开 `flutter_` 前缀** —— 撞上就被忽略、进不了仓库。
+# 见 tools/gen_icon.py 的模块说明。
 flutter_*.png
+# 例外：flutter_launcher_icons 生成的启动图（各 mipmap 密度目录）
+# 里有几个文件名以 `flutter_` 开头，必须显式放行，否则
+# `flutter_launcher_icons` 生成完在 git status 里看不见、容易漏提交。
+!android/app/src/main/res/mipmap-*/flutter_*.png
 # pub get 自动生成（记录插件依赖解析结果，随构建变化）
 .flutter-plugins-dependencies
 
@@ -17,6 +25,11 @@ flutter_*.png
 android/.gradle/
 android/local.properties
 android/key.properties
+# 离线构建兜底仓库（Bug 616）：沙箱断网时把本机 Gradle 缓存里的
+# io.flutter engine 构件摊成 file:// maven 布局，绕开下载。
+# 里面是 42MB 的 aar，只该按需生成，绝不入库；
+# 生成脚本与说明见 android/local-maven/README.md。
+android/local-maven/io/
 *.iml
 *.ipr
 *.iws
@@ -37,6 +50,12 @@ assets/rootfs/*.tar.*
 assets/rootfs/*.tgz
 # jniLibs 中的 proot（由 setup_android.sh 从 assets 生成，不重复入库）
 android/app/src/main/jniLibs/arm64-v8a/libproot.so
+# jniLibs 中的 proroot 五件套（**已停止内置**，alpha.69）。
+# 上游许可（Proprietary）禁止再分发二进制，故不再随 APK 打包，
+# 也不再提供下载入口（tools/verify_apk.sh 第 4/4 项强制检查 APK 内无 proroot）。
+# 保留本通配规则是为了兜住**用户自行导入**落到这里的文件，避免误入库；
+# 用户导入步骤见 PROROOT-许可与分发决策.md 的方案 A。
+android/app/src/main/jniLibs/arm64-v8a/libproroot*.so
 !assets/tools/.gitkeep
 !assets/rootfs/.gitkeep
 

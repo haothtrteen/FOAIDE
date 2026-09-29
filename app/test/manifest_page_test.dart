@@ -8,8 +8,8 @@ import 'package:flutter_test/flutter_test.dart';
 /// 这一组守的是**页面层的约定**——那些"写错了也能编译、但会让用户
 /// 困惑或造成实际损失"的东西：
 ///
-/// 1. 包名（applicationId）必须只读 + 可复制。改它会让已装应用无法升级，
-///    所以页面上不能出现可编辑入口。
+/// 1. 包名（applicationId）**可编辑**，但必须带齐"改它的代价"的说明
+///    （改它会让已装应用无法升级），并且要有重置回磁盘值的出口。
 /// 2. 保存必须写**全部三类文件**（pubspec / Manifest / gradle），
 ///    不能只写一个然后告诉用户"已保存"。
 /// 3. 底部悬浮保存按钮必须真的接在 Stack 上（只在 dirty 时出现），
@@ -17,22 +17,43 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   final src = File('lib/project/manifest_page.dart').readAsStringSync();
 
-  group('清单页 · 包名只读', () {
-    test('applicationId 没有绑到任何 TextEditingController', () {
-      // 包名用的是 _disk.appId（只读快照），不是 controller。
-      expect(src.contains('_disk.appId'), isTrue);
-      // 反面：不能出现 "appIdCtl" 这类东西
-      expect(src.contains('appIdCtl'), isFalse,
-          reason: '包名一改已装应用就无法升级，页面不该给编辑入口');
+  group('清单页 · 包名可编辑', () {
+    test('applicationId 绑到了 controller（不再是只读快照）', () {
+      expect(src.contains('_pkgCtl'), isTrue);
+      expect(src.contains('_pkgCtl.text = appId'), isTrue,
+          reason: '读盘后要把磁盘值灌进输入框');
     });
 
-    test('包名旁边有复制按钮（用户真正的需求是粘贴到别处）', () {
-      expect(src.contains("_copy('包名', _disk.appId)"), isTrue);
+    test('包名旁边保留复制按钮（只是不再需要"粘贴到别处"这个唯一出口）', () {
+      expect(src.contains("_copy('包名', _pkgCtl.text.trim())"), isTrue);
     });
 
-    test('页面文案解释了"为什么不能改"（否则用户会去找）', () {
-      expect(src.contains('为什么不能改'), isTrue);
+    test('有"重置回磁盘值"的出口（改错了不能只能靠手打回去）', () {
+      expect(src.contains('_pkgCtl.text = _disk.appId'), isTrue,
+          reason: '要有一键还原成当前工程真实包名的入口');
+    });
+
+    test('页面文案说清了改包名的代价（否则用户会随手改完再装机）', () {
       expect(src.contains('唯一标识'), isTrue);
+      expect(src.contains('装机后不可更换'), isTrue);
+    });
+
+    test('明确声明**不会**移动 Kotlin 源码目录', () {
+      // 这是用户选定的范围（"只改 gradle + Manifest"）。
+      // 不写清楚的话，用户改完包名发现 .kt 里的 package 还是旧的，
+      // 会以为是工具没改干净。
+      expect(src.contains('package') || src.contains('源码目录'), isTrue);
+    });
+
+    test('保存前校验包名格式，并且失败时**不写文件**', () {
+      expect(src.contains('ManifestCodec.validAppId'), isTrue,
+          reason: '要挡在写文件之前，不能写进去再报错');
+      // 校验失败分支里必须 return，否则会带着非法值继续往下写
+      final i = src.indexOf('ManifestCodec.validAppId');
+      expect(i, greaterThan(0));
+      final after = src.substring(i, i + 400);
+      expect(after.contains('return'), isTrue,
+          reason: '校验不过必须提前返回，不能继续写盘');
     });
   });
 
@@ -117,8 +138,14 @@ void main() {
           reason: '取消勾选已声明的权限必须能写回（移除），不能只支持新增');
     });
 
-    test('图标卡说明了正规做法（flutter_launcher_icons）', () {
-      expect(src.contains('flutter_launcher_icons'), isTrue);
+    test('图标卡既说明正规做法，也给了能直接用的替换入口', () {
+      // alpha.93 之前这张卡只有一句"把 png 覆盖到 mipmap-*"的提示，
+      // 用户看完还得自己去文件管理器里操作，等于没做。
+      expect(src.contains('flutter_launcher_icons'), isTrue,
+          reason: '电脑上生成图标的标准做法要保留——用户会拿工程回电脑上继续做');
+      expect(src.contains('_replaceIcon'), isTrue);
+      expect(src.contains('选择图片替换'), isTrue);
+      expect(src.contains('IconReplacer.apply'), isTrue);
     });
 
     test('签名卡区分"未配置"与"已配置"两种状态', () {
@@ -146,7 +173,9 @@ void main() {
       const keys = <String>[
         '_buildOverview()',
         'EditorPage(',
+        'DesignPage(',
         'ManifestPage(',
+        'GitPanel(',
         '_buildPanel()',
         'AiTakeoverPanel(',
       ];

@@ -1,0 +1,32 @@
+# FOAIDE App 图标配置（alpha.69）
+#
+# 源图由 tools/gen_icon.py 生成（Pillow 画的「绿色终端提示符」），
+# 不依赖任何外部素材。重新生成全套资源：
+#
+#     python3 tools/gen_icon.py && dart run flutter_launcher_icons
+#
+# ⚠️ 改完记得看一眼 git status：`.gitignore` 有一条 Flutter 模板自带的
+# `flutter_*.png`，会吃掉本工具生成的部分启动图文件名 ——
+# 那里已针对 `mipmap-*/flutter_*.png` 开了例外，如果将来新增了别的
+# 输出路径（比如 iOS 或 web），要同步补例外，否则生成物悄悄进不了仓库。
+
+flutter_launcher_icons:
+  android: "ic_launcher"
+  ios: false
+  image_path: "assets/icon/app_icon.png"
+
+  # adaptive icon 是「背景层 + 前景层」两张图，系统按 OEM 遮罩裁切。
+  # 前景层不能用满幅图 —— 详见 tools/gen_icon.py 里 SAFE_SCALE 的说明。
+  adaptive_icon_background: "#101418"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+
+  # 关掉这几个我们不生成的平台/变体，避免留下半成品目录
+  web:
+    generate: false
+  windows:
+    generate: false
+  macos:
+    generate: false
+
+  # 保留 Android 的 minSdk 自适应（低版本自动退回传统 ic_launcher.png）
+  min_sdk_android: 21

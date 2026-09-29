@@ -51,6 +51,44 @@ void main() {
         isTrue,
       );
     });
+
+    // alpha.70：用户要求展示作者 GitHub，并提出时写作 `/haothtrreen`
+    // （比 author 字段多一个 r）。这条断言把"两处拼写必须一致"
+    // 钉死——否则哪天有人只改了一边，页面就会指向一个不存在的账号，
+    // 而这种错**编译、测试、运行全都不会报**。
+    test('authorRepo 是合法 GitHub 地址，且用户名与 author 同源', () {
+      expect(AboutInfo.authorRepo.startsWith('https://github.com/'), isTrue,
+          reason: '必须是完整 https 地址（要能直接粘进浏览器）');
+      expect(AboutInfo.authorRepo.endsWith('/${AboutInfo.author}'), isTrue,
+          reason: 'authorRepo 的用户名必须等于 AboutInfo.author —— '
+              '两处拼写不一致会指向不存在的账号，且没有任何东西会报错');
+      expect(AboutInfo.authorRepo.endsWith('/'), isFalse,
+          reason: '结尾多余斜杠会让复制出来的地址不干净');
+    });
+
+    test('关于页确实渲染了 authorRepo（不只是定义了常量）', () {
+      final page = File('lib/ui/about_page.dart').readAsStringSync();
+      expect(page.contains('AboutInfo.authorRepo'), isTrue,
+          reason: '定义了常量却没接进页面 = 用户看不到');
+    });
+
+    test('关于页不再用 Flutter 官方 logo（alpha.70 需求）', () {
+      final page = File('lib/ui/about_page.dart').readAsLinesSync()
+          .where((l) => !l.trimLeft().startsWith('//'))
+          .join('\n');
+      expect(page.contains('Icons.flutter_dash'), isFalse,
+          reason: '关于页头部要用本项目图标（assets/icon/app_icon.png），'
+              '不能是 Flutter 官方 logo —— 那会让人以为是本项目图标');
+      expect(page.contains("assets/icon/app_icon.png"), isTrue);
+    });
+
+    test('关于页用到的图标资产已在 pubspec 声明', () {
+      final pub = File('pubspec.yaml').readAsStringSync();
+      final assetsBlock = pub.substring(pub.indexOf('assets:'));
+      expect(assetsBlock.contains('- assets/icon/'), isTrue,
+          reason: '没在 pubspec 声明 assets/icon/ 的话，'
+              'Image.asset 会在**运行时**才报错 —— 编译期完全看不出来');
+    });
   });
 
   group('第三方组件清单', () {
