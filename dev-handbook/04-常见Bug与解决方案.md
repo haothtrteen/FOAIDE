@@ -418,6 +418,2487 @@ No space left on device
 
 ---
 
+### Bug 604 · `Failed to create MD5 hash for file .../libapp.so` —— 真凶是**没设 `FLUTTER_STORAGE_BASE_URL`**，不是空 ABI 目录、不是权限、不是缓存（2026-09-25，alpha.74 发现 / alpha.77 二修 / **alpha.78 三修定论**）
+
+> ⚠️ **本节被修正过两次，请直接看文末「三修修正」。**
+> - 第一版结论："overlayfs EIO 坏副本" → 当天被**推翻**。
+> - 第二版结论："`flutter/release/` 下的**空 ABI 目录**" → alpha.78 又被**推翻**。
+> - **第三版（当前结论）：根因是 `FLUTTER_STORAGE_BASE_URL` 未设置**，
+>   引擎构件 URL 被拼成 `dl.google.com`（本环境 TLS 阻断）→ 依赖解析失败
+>   → 下游 task 状态不一致 → 报出这个极具误导性的 MD5 错误。
+>
+> 前两版内容保留，用于记录误判过程 —— **它们的共同错误是：把"次生现象"
+> 当成了根因。**
+
+**症状**（`flutter build apk --no-shrink --release --target-platform=android-arm64`）：
+
+```
+Execution failed for task ':app:mergeReleaseJniLibFolders'.
+> Cannot access output property 'outputDir' of task ':app:mergeReleaseJniLibFolders'.
+  Accessing unreadable inputs or outputs is not supported.
+   > Failed to create MD5 hash for file: .../merged_jni_libs/release/
+     mergeReleaseJniLibFolders/out/arm64-v8a/libapp.so
+```
+
+**三个错误假设**（都实测推翻了，别重走）：
+
+| # | 假设 | 实测反证 |
+|---|---|---|
+| 1 | `libapp.so` 权限坏了 | `stat` 显示 `0644`；`sudo -u nobody md5sum` **成功**算出正确摘要 |
+| 2 | 旁边 `libproot.so` 是 `0711`（`rwx--x--x`，别人不可读）拖垮任务 | 改成 `0644` 后**仍报同样错**。**这个权限确实该修**（见下），但不是本次根因 |
+| 3 | Gradle 文件哈希缓存命中坏条目（清目录无用因为 `(path,len,mtime)` 没变） | 清目录 + 改权限后重跑，**文件名却变了**（arm64-v8a → armeabi-v7a）——说明不是一个固定文件的问题 |
+
+**真凶（`--stacktrace` 才能看到，主输出只有一句含糊话）**：
+
+```
+Caused by: java.io.UncheckedIOException: Failed to create MD5 hash for file: .../armeabi-v7a/libapp.so
+	at org.gradle.internal.hash.DefaultFileHasher.hash(DefaultFileHasher.java:43)
+	...
+Caused by: java.io.IOException: Input/output error
+	at org.gradle.internal.hash.DefaultStreamHasher.doHash(DefaultStreamHasher.java:47)
+```
+
+**`java.io.IOException: Input/output error`（EIO）** —— 文件系统层面的**真实读错误**，
+不是权限（那是 `AccessDeniedException`）。Gradle 的措辞 `unreadable inputs or outputs`
+会把 EIO 和权限错误混在一起说，极具误导性。
+
+**取证判据**（决定性，一条命令区分）：
+
+```bash
+dd if=<疑似坏文件> of=/dev/null bs=1M   # EIO → 真损坏；静默成功 → 是权限/缓存问题
+```
+
+本次实测：`merged_jni_libs/.../armeabi-v7a/libapp.so` → **EIO**；
+而其**源文件** `intermediates/flutter/release/armeabi-v7a/app.so` → **可读**。
+→ 结论：**坏在"复制到 merged_jni_libs 之后"，是副本损坏**，不是源文件坏。
+环境特征：根文件系统是 **overlayfs**（`metacopy=off`，容器内），
+`mergeReleaseJniLibFolders` 的复制步骤在此类挂载上会偶发产生读不出的副本。
+
+**解决**（两条一起做）：
+
+1. **清掉被污染的合并目录**：`rm -rf build/app/intermediates/merged_jni_libs`；
+2. **清掉多余 ABI 的 AOT 产物**（本例的真正触发条件）：
+   ```bash
+   rm -rf build/app/intermediates/flutter/release/{armeabi-v7a,x86_64}
+   ```
+   `abiFilters += listOf("arm64-v8a")` 只要 arm64，但 Flutter 的 AOT 阶段
+   仍产出了三套 `app.so`（共 119MB）；`mergeReleaseJniLibFolders` 会把它们
+   **全部**合并再交给 AGP 过滤，于是白白多复制两份、多两个撞 EIO 的机会。
+   删掉后只剩 arm64 的 14MB，构建 **141.6s** 通过。
+
+**顺带修掉的隐患**：`android/app/src/main/jniLibs/arm64-v8a/libproot.so`
+自 2026-09-16 起权限是 `0711`（`rwx--x--x`）——**其他用户只能执行不能读**，
+Gradle 算 MD5 必须读 → 迟早报错（本次虽非主因，但它是同一报错文案的
+另一个真实来源）。已 `chmod 644`。**判据**：`jniLibs` 下的 `.so` 必须
+对非 owner 可读（`0644`），不要留 `0711` 这种"可执行但不可读"的权限。
+
+**教训**：
+- **`unreadable inputs or outputs` 是一句歧义词**，至少对应三种根因（权限 / 哈希缓存 / 文件系统 EIO）。必须先 `--stacktrace` 拿最底层 `Caused by`，再用 `dd` 二分"源文件 vs 副本"，别凭文案猜。
+- **报错里点名的文件可能不是坏文件**：Gradle 遍历目录时整个任务失败，报的第一个文件名有随机性（本次 arm64-v8a → armeabi-v7a 变了两次），**"文件名每次都不同"本身就是"环境级/随机性故障"的强信号**，而不是"某个文件坏了"。
+- **与 `abiFilters` 配套清理**：凡 `abiFilters` 收敛到单 ABI，构建前顺手删掉其它 ABI 的 `intermediates/flutter/release/*/`，省复制、省体积、少一类随机失败。
+
+#### ⚠️ 二修修正（2026-09-25 当天，alpha.77 出包时复发）
+
+**上面第一版的"EIO 坏副本"结论不完整，必须按本节执行。** 复发时的实测证据链：
+
+| 实验 | 结果 | 推翻/确认了什么 |
+|---|---|---|
+| `dd if=merged_jni_libs/.../arm64-v8a/libapp.so of=/dev/null bs=1M` | **顺利读完 14MB，45.3 MB/s，无 EIO** | ❌ 推翻"副本一定损坏"——文件本身好得很 |
+| `gradlew --stop` 后重跑 | 11s **同样挂** | ❌ 推翻"daemon 状态缓存" |
+| 清 `merged_jni_libs` 后构建（第 1 次） | ✅ 成功 **139.1s** | 看似有效 |
+| 清 `merged_jni_libs` 后构建（第 2 次） | ❌ 挂 **5.9s** | ❌ 推翻"清目录是稳定解法"——纯属撞运气 |
+| 清 `merged_jni_libs` 后构建（第 3 次） | ❌ 挂 **1s** | 同上 |
+
+**关键判据是耗时**：成功的第 1 次跑了 **139 秒**（真的重编了 AOT）；失败的第 2、3 次都是**秒挂**（AOT 被增量跳过，`libapp.so` 没重新生成）。
+
+**真正的触发条件**（本次找到）：
+
+```bash
+ls -la build/app/intermediates/flutter/release/
+# arm64-v8a/      ← 有 app.so
+# armeabi-v7a/    ← **空目录**（0 字节）
+# x86_64/         ← **空目录**（0 字节）
+```
+
+`flutter build --target-platform=android-arm64` 只编 arm64，但 **Flutter 的 Gradle 插件仍会为
+v7a / x86_64 建出目录**（只建目录、不产文件）。`mergeReleaseJniLibFolders` 合并时遇到这两个
+**空目录**，按"预期该有文件却没有"处理 → 报 `unreadable` / 算不出 MD5。
+
+> 所以第一版把根因记成"overlayfs 复制出坏副本"是**误判**：那次清完目录恰好成功，
+> 被当成了因果。EIO 可能在**某些**场景真实存在，但它**不是**本 bug 的稳定触发因。
+
+**正确的解法（顺序敏感，必须照做）**：
+
+```bash
+# 1. 清合并产物
+rm -rf build/app/intermediates/merged_jni_libs
+# 2. 删掉多余 ABI 的**空目录**（这才是真正的触发条件）
+rm -rf build/app/intermediates/flutter/release/{armeabi-v7a,x86_64}
+# 注意：-rf 而不是 rmdir —— 有的环境里这些目录里会残留旧 .so
+```
+
+实测：清完后构建 **125.3s 一次通过**，六项验证全绿。
+
+**⚠️ 不要尝试的两种解法（已实测无效，别浪费时间）**：
+
+1. `gradlew --stop` 停 daemon 重跑 —— 无效，11s 仍挂。不是状态缓存问题。
+2. 在 `build.gradle.kts` 里给 `mergeReleaseJniLibFolders` 加
+   `doNotTrackState(...)` —— **反而更糟**：报错会从 `Cannot access output property`
+   变成 `Changes are not tracked, unable determine incremental changes`
+   （`ResolveInputChangesStep` 直接抛 `IllegalStateException`），
+   因为 AGP 的该 task **本身就是增量 task**，Gradle 9 里关掉状态跟踪就
+   等于"没法算输入变更"。加 `outputs.upToDateWhen { false }` 也救不回来
+   （2s 挂）。**这条路是死的，已回退该改动，勿重试。**
+
+**根治方向（未做，供后续）**：在 `android/app/build.gradle.kts` 里显式声明
+`ndk { abiFilters.clear(); abiFilters += "arm64-v8a" }` 之外，可考虑让 Flutter
+不要建多余 ABI 目录（`--target-platform` 已是 arm64 却仍建，属 Flutter 插件行为）。
+当前用构建前清理脚本兜住即可 —— 已固化进 `SKILL.md` 第 3 步。
+
+**新增教训**：
+- **"清理后成功"极易被误认为因果**。判定一个操作是否真的有效，必须**连续重复至少两次**（本次第 2 次就打脸）。单次成功永远不能作为"解法"的证据。
+- **报错耗时是重要信号**：秒挂 = 失败发生在早期阶段（增量跳过导致前置产物缺失）；跑满时长才挂 = 失败发生在该阶段真实执行中。两者根因通常不同。
+- **报错点名的路径可能是表象**：`libapp.so` 每次都被正常生成（14MB），真正让任务失败的是同级的**空目录**。看到 `unreadable` 要检查**整个目录结构**，不只看点名那个文件。
+
+#### ⚠️ 三修修正（同日晚，alpha.78 出包时复发，真因这才定论）
+
+**alpha.78 出包时照二修正解做了预清理，同一个错误再次出现** —— "空 ABI 目录"
+结论被推翻。这轮拿到了一整套可复现的证据链：
+
+| # | 实验 | 结果 |
+|---|---|---|
+| 1 | **完整执行二修正解**（清 `merged_jni_libs` + 清空 ABI 目录）再构建 | ❌ **32.4s 同样报错** → 清理不是充分解法 |
+| 2 | 检查 `flutter/release/` | **只剩 `arm64-v8a`**，没有空目录 → 预清理本身生效了，但没用 |
+| 3 | 检查报错点名的 `libapp.so` | 存在、14,316,440 B、刚生成 |
+| 4 | `dd` 读全文件 + `md5sum` + **Java（Gradle 同款 API）算 MD5** | **全部成功**（`a7c0f14e…`，2.9 GB/s）→ 文件没坏、读得了 |
+| 5 | 单独跑 `gradlew :app:mergeReleaseJniLibFolders` | ✅ **BUILD SUCCESSFUL**（UP-TO-DATE）→ task 本身没病 |
+| 6 | 复跑 `flutter build apk` 抓全量日志 | 露出**真实错误**：`Could not resolve io.flutter:arm64_v8a_release … Could not HEAD 'https://dl.google.com/…' … Remote host terminated the handshake` |
+| 7 | `curl` 自检 | `dl.google.com` / `storage.googleapis.com` **TLS 阻断**；`storage.flutter-io.cn` 200；**`FLUTTER_STORAGE_BASE_URL` 未设** |
+| 8 | `export FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn` + 预清理再构建 | ✅ **BUILD SUCCESSFUL 164.2s**，日志出现 `Flutter assets will be downloaded from https://storage.flutter-io.cn` |
+
+**三修结论（当前）**：根因是 **`FLUTTER_STORAGE_BASE_URL` 未设置（或新会话里丢了）**。
+引擎构件（`flutter_embedding_release` / `arm64_v8a_release`）只发布在 Flutter 官方仓，
+URL 由这个环境变量拼出；未设 = `dl.google.com` = 本环境 TLS 阻断 = 依赖解析失败。
+那个吓人的 `Failed to create MD5 hash` 是**次生现象**：依赖解析失败 →
+`releaseRuntimeClasspath` 不完整 → Flutter 复制 task 与 merge task 的输入输出
+状态不一致 → Gradle 9 做快照时报"无法访问输出 / 算不出 MD5"。
+
+> **为什么二修会误判**：alpha.77 那次"清理后成功"时，引擎构件**在本地缓存里**
+> 可直接满足解析，网络根本没被触碰 —— 清理与成功只是**相关**不是**因果**。
+> 这恰好印证了二修自己写的教训："清理后成功"极易被误认为因果。
+> 空目录是否在**某些**场景也有影响，本轮无法证明也无法证伪 ——
+> **预清理照做**（无害的保险），但它**不是**稳定解。
+
+**修正后的正解（第 1 步换人）**：
+
+```bash
+# 1️⃣ 先查环境变量（这才是命门，见 SKILL.md 第 1 步 / Bug 419）
+echo $FLUTTER_STORAGE_BASE_URL    # 必须是 https://storage.flutter-io.cn
+export FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn
+export PUB_HOSTED_URL=https://pub.flutter-io.cn
+
+# 2️⃣ 预清理照旧（保险，不是解药）
+rm -rf build/app/intermediates/merged_jni_libs
+rm -rf build/app/intermediates/flutter/release/{armeabi-v7a,x86_64}
+
+# 3️⃣ 正常构建；日志开头必须看到
+#    "Flutter assets will be downloaded from https://storage.flutter-io.cn"
+```
+
+**判据更新**：看到 `Could not HEAD/GET 'https://dl.google.com/…' …
+Remote host terminated the handshake`（或 `The server may not support the client's
+requested TLS protocol versions`）= **网络被阻断，先查环境变量**，
+别再追那个 MD5。
+
+**三修新增教训**：
+- **同一个报错文本可能由多个不同根因触发**，修好一次不代表这个报错从此只有一个解。复发时**先怀疑上次的结论**，重新取证。
+- **报错点名的文件要亲手读一遍**：这轮 `dd` / `md5sum` / **Java**（Gradle 同款 API）三路验证都正常 —— 文件没毛病，就该怀疑**报错本身在撒谎**（它是次生现象）。
+- **抓全量日志比看 tail 尾巴重要**：`tail -40` 只看得到 MD5 错误，全量日志里才有真正的 `Could not resolve … dl.google.com`。二修时代只看尾部，错过了真凶。
+- **环境变量是会话级的**：上个会话设了，这个会话可能就没 —— **构建脚本的成败不能依赖"上次设过"**，第一步永远是自检（skill 里那 4 条 curl + 2 个 echo）。
+
+---
+
+### Bug 605 · 设计器预览"黄框没了但啥都不显示"（2026-09-25，alpha.78）
+
+**症状**：导入自己的 `main.dart` 后，设计器预览区**一片空白** —— 既没有内容，也没有之前的黄色"未识别"提示框。用户原话：「黄框确实没了，但是啥都不显示了」。
+
+**真因**：`_unknownApprox` 里的 `Stack` 缺一个**定尺寸的孩子**。
+
+```dart
+// ❌ 旧代码
+child: Stack(
+  clipBehavior: Clip.none,
+  children: [
+    if (inner != null) inner,   // ← inner 为 null 时，Stack 一个非 positioned 孩子都没有
+    Positioned(...),            // ← 问号角标是 positioned，不参与定尺寸
+  ],
+),
+```
+
+`Stack` 的尺寸由**非 positioned 的孩子**决定。问号角标是 `Positioned`，不算；一旦 `inner` 为 null（既没子节点也没认出的图标），`Stack` 就量不出大小。在 `Column` 这类**不约束孩子**的父级里，`performLayout` 直接断言失败：
+
+```
+A Stack requires bounded constraints from its parent.
+Failed assertion: 'size.isFinite'
+```
+
+**崩在预览区 = 整棵预览树渲染不出来** —— 这就是"啥都不显示"。
+
+**修法**：
+
+```dart
+// ✅ 给一个保底的可见尺寸，保证 Stack 永远量得出大小
+inner ??= SizedBox(
+  width: vis.width ?? 80,
+  height: vis.height ?? 32,
+);
+```
+
+**新增教训（本 Bug 最贵的一课）**：
+
+- ⛔ **我写了两版回归测试，两版都是绿的，而真机上照样崩。**
+  - **第 1 版**：用"没有 `children` **字段**"的节点 —— `children` 为 null 根本走不到出问题的分支，**加不加修复都绿**。
+  - **第 2 版**：改用 `children: const <DesignNode>[]`（空列表），构造没问题了，但测试只调了 `renderPreview(node)` —— 而崩溃分支 `_previewShell` **只有 `node == _root` 才会走**！传进去的不是 `_root`，于是**又绿了**。
+  - ✅ **解法**：给 `DesignPage` 加 `@visibleForTesting debugSetRoot()`，让测试能把待测节点**真的设成 `_root`**，走真机同一条路。
+- ✅ **唯一有效的测试有效性检验：写完防崩溃测试后，把修复回退一次，看它变不变红。**
+  这个动作不能省。本次一验就发现前两版全是假测试。
+- 📌 **手造最小节点可能"构造上就崩不了"**：外层 `Container` 恰好能拿到尺寸时，那条路径永远不崩。真正崩的是**用户真实文件**那条路（`GridView.count` 展开 6 个 `_buildActionButton`，层层叠下来才出现无尺寸的 `Stack`）。**回归测试必须包含一条用真实文件跑的**。
+- 📌 **探针报的异常要溯源到具体行**：曾有个探针报"崩溃"，实际是探针**自己的错** —— 它在 `pumpWidget` 之后又 `pumpWidget` 了一次，`state` 已 unmount，再调 `renderPreview` 会在 `_theme` 里抛 `This widget has been unmounted`。别把探针的 bug 当成产品的 bug。
+
+---
+
+### Bug 606 · 预览里横着一大坨源码文本（2026-09-25，alpha.78）
+
+**症状**：设计器预览正中央出现一大段源码原文：
+
+```
+// 使用 GridView 替代复杂的 Row/Column 嵌套，更灵活
+            GridView.count(
+              shrinkWrap: true,
+              ...
+```
+
+版面被撑爆，用户观感就是"界面没出来 / 啥都不显示"。这个 Bug 和 Bug 605 是**同一个用户反馈的两个叠加成因** —— 只有两个都修掉，预览才真的正常。
+
+**真因**：`_unknownPlaceholder` 判定"纯注释节点"的规则太松。
+
+```dart
+// ❌ 旧代码：只看开头是不是 //
+final isComment = rawStr.trimLeft().startsWith('//');
+```
+
+而用户最常见的写法是 **`// 注释` 紧跟组件**（注释说明这个组件为什么这么写）。旧判定把这个**组件节点**误判成注释节点，于是把**整段源码当文字吐了出来**。
+
+**修法**：判据改成「**删掉所有 `//` 行注释后，还剩不剩代码**」。
+
+```dart
+bool isPureCommentSource(String raw) {
+  for (final line in raw.split('\n')) {
+    final t = line.trim();
+    if (t.isEmpty || t.startsWith('//')) continue;
+    return false; // 有代码 → 不是纯注释
+  }
+  return true;
+}
+```
+
+**新增教训**：
+- **"以某个字符开头"这类判据，几乎总是不够的**。判"是不是纯 X"要**排除掉 X 的成分后再看剩什么**，而不是只看开头。
+- **测试要用真实数据**：这条 bug 用手造节点很难想到（谁会想到给 unknown 节点塞一段带前导注释的源码？），是**把用户真实文件跑一遍**才暴露的。
+
+---
+
+### Bug 607 · `Icon` 的 `color:` 被当成子组件（2026-09-25，alpha.78）
+
+**症状**：`Icon(Icons.check_circle, color: Color(0xFF10B981))` 在预览里，**图标下面多出一个色块**。
+
+**真因**：`_innerChildren` 在拿不到 `child:` / `children:` 时，会**扫所有参数**找第一个能解析成 widget 的：
+
+```dart
+// ❌ 旧代码
+for (final a in call._args) {
+  final found = _firstWidgetIn(a.argumentExpression);
+  if (found != null) return found;   // ← 扫到 color: Color(...)，认了
+}
+```
+
+而 `Color(...)` / `BoxDecoration(...)` 这些**属性值构造**长得和 widget 一模一样（有名字、有括号、参数还能嵌套），`_asWidgetCall` 完全分不出来 —— 于是**参数值被当成了子组件**。
+
+**修法**：加一张「参数值类型」黑名单，扫参时跳过：
+
+```dart
+const Set<String> kNonWidgetTypeNames = {
+  'Color', 'BoxDecoration', 'EdgeInsets', 'TextStyle', 'Duration', ...
+};
+// 扫参时：
+if (_isValueTypeCall(v)) continue;
+```
+
+**新增教训**：
+- **"看起来像"不等于"是"**：`Color(...)` 和 `Container(...)` 在语法树上完全同类。靠**结构**判别不了，必须靠**语义白/黑名单**。
+- 这个 bug 之前一直**被 Bug 605 的崩溃掩盖着**（树根本渲染不出来，自然看不到多出来的色块）。**修完崩溃类 bug 后要重新看一遍渲染结果**，可能露出下一层问题。
+
+---
+
+### Bug 608 · `Failed to create MD5 hash .../libapp.so` 又来了——环境变量没问题，真凶是 **Gradle VFS watching 在沙箱 overlay fs 上干扰快照读**（2026-09-25，alpha.79 出包，一修误判 / 二修定论）
+
+**症状**：`flutter build apk` 挂在 `:app:mergeReleaseJniLibFolders`：
+
+```
+> Cannot access output property 'outputDir' of task ':app:mergeReleaseJniLibFolders'.
+  Accessing unreadable inputs or outputs is not supported. Declare the task as
+  untracked by using Task.doNotTrackState().
+   > Failed to create MD5 hash for file: .../merged_jni_libs/release/
+     mergeReleaseJniLibFolders/out/arm64-v8a/libapp.so
+```
+
+报错文本与 **Bug 604 一模一样**——但这次 `FLUTTER_STORAGE_BASE_URL` 已设
+（构建日志两处出现 `storage.flutter-io.cn`）。**同报错文本的第三个根因登场**。
+
+**定性：不是网络**。`--stacktrace` 拿到底层异常：
+
+```
+Caused by: java.io.IOException: Input/output error          ← EIO，内核级读错误
+	at org.gradle.internal.hash.DefaultStreamHasher.doHash
+	...
+	at org.gradle.internal.execution.impl.DefaultOutputSnapshotter$1.visitOutputProperty
+```
+
+EIO 发生在 Gradle 给 task **输出做状态快照**（MD5 hash）读文件时——网络/resolve
+阶段根本没到。
+
+**排除链**（每步亲手做过，全部正常）：
+
+| 实验 | 结果 | 排除了什么 |
+|---|---|---|
+| 原样重跑（604 判据：偶发先重跑） | 再挂，4.6s，同位置 | 偶发抖动 |
+| `dd` + `md5sum` 全文读报错文件 | 正常，可算 MD5 | 文件损坏 / 权限 |
+| `./gradlew --stop` 后重建 | 仍挂 | daemon VFS 缓存脏状态 |
+| `flutter clean` 全新 build 重建 | 仍挂 | 半成品 intermediates |
+| shell 写 14MB 后立刻读 ×5 轮 | 全过 | 「写后立刻读」竞态 |
+| **Java**（`FileInputStream`+`MessageDigest`，Gradle 同款 API）全文读 | **正常**，MD5 与 shell 一致 | Java 进程读不出 |
+| `org.gradle.parallel` | 项目本来就是 `false` | 多 task 并行竞态 |
+
+磁盘 242G、内存充足、dmesg 无 I/O error。**文件没毛病，任何进程任何时刻都读得出，
+唯独 daemon 的快照读 EIO**——挂点文件还会漂移（arm64-v8a ↔ armeabi-v7a），但总是
+当场刚写完的 libapp.so。
+
+**一修（误判）：`doNotTrackState()`**。报错信息自己给了"官方逃生门"，试了：
+
+```kotlin
+tasks.matching { it.name.endsWith("JniLibFolders") }.configureEach {
+    doNotTrackState("...")   // Gradle 9 此方法必须带 reason 参数
+}
+```
+
+结果换了个错：**`Changes are not tracked, unable determine incremental changes.`**
+—— `MergeSourceSetFolders`（mergeReleaseJniLibFolders 的真身）继承 AGP 的
+`NewIncrementalTask`，增量逻辑**依赖先前状态**，与 doNotTrackState 天然不兼容。
+此路不通，**撤回**。
+
+**二修（定论）：`org.gradle.vfs.watch=false`**。在 `gradle.properties` 加一行：
+
+```properties
+org.gradle.vfs.watch=false
+```
+
+撤掉 doNotTrackState、保留正常状态跟踪 → **一次过，BUILD SUCCESSFUL 203.2s**。
+
+根因解释：Gradle 的 VFS 层默认用 inotify 监听构建输出目录。**inotify 与 overlayfs
+（lowerdir/upperdir 多层叠合）的组合有历史雷区**：监听状态与真实文件状态错位后，
+快照读取拿到坏句柄/坏页 → EIO。这不是文件、不是网络、不是 Gradle 逻辑 bug，
+是**文件系统观察器在容器 overlay 上不可靠**。关掉 watching 后 Gradle 每次构建
+重新快照（代价：增量判断变保守，构建稍慢，本项目 203s 正常范围）。
+
+**⚠️ 与 alpha.78 成功构建的矛盾**：同一沙箱 alpha.78（当天早些时候）构建成功。
+推断 overlay 层状态在两次构建之间发生了变化（沙箱休眠恢复/存储层迁移），
+使 inotify 行为由"侥幸正常"变为"稳定出错"。**这类"昨天能跑今天不能"的环境差异，
+多数不是项目代码问题，别在代码里找。**
+
+**新增教训**：
+- **同报错文本第三个根因**（604: 未设环境变量；608: VFS watching EIO）。判据要记
+  **底层异常类型**：`--stacktrace` 的 `Caused by` 一眼定性——`handshake`/`resolve`
+  是网络，`Input/output error` 是读文件，两码事。
+- **报错信息末尾的"官方建议"未必可用**：`doNotTrackState()` 对普通 task 是逃生门，
+  对 AGP 增量 task 是另一个坑。**AGP task 是 IncrementalTask 家族，跳过状态跟踪
+  会被增量逻辑反杀**。
+- **排除链做完（6 项全正常）仍找不到根因时，换"变量二分"**：这次唯一的自由变量
+  是 Gradle 的文件监听开关——一开关、一变量、一次构建，因果立刻清晰。
+- **与项目强相关的配置（gradle.properties）是环境类问题的第一嫌疑人**：它不在
+  版本库 diff 里显眼处，出了问题也不会报错，只默默改变 daemon 行为。
+
+---
+
+### Bug 609 · 补全浮层定位常量 `_kTextTopInset` 拍脑袋写 20，渲染校准实测 **8**——浮层会整体偏下 12px（2026-09-25，alpha.80 出包前被测试拦住）
+
+**背景**：alpha.80 给编辑器做了补全浮层（替代贴底建议条），浮层 Y 定位公式：
+
+```dart
+top = _kTextTopInset + line × lineHeight − scrollY
+```
+
+`_kTextTopInset` 当时按"Flutter InputDecoration 默认 contentPadding top"的
+记忆写了 **20**，并配了"校准测试锁值"的计划。
+
+**发现过程**：校准测试（真 pump vendored CodeField + 量 `getTopLeft`）一跑：
+
+```
+Expected: a numeric value within <1.0> of <20.0>
+  Actual: <8.0>          ← 差 12px，浮层会压在光标行下半部
+```
+
+**根因**：vendored CodeField 的代码列 TextField 用的是
+`InputDecoration(border: InputBorder.none, isDense: false)`——
+**M3 下 InputBorder.none 的 contentPadding 是 `fromLTRB(12, 8, 12, 8)`**，
+top = 8。"20"的记忆来自 M2 有 border/label 的场景，**抄错了场景**。
+app 与测试环境同为 `useMaterial3: true`，实测值即真机值。
+
+**修复**：`_kTextTopInset = 8`，校准测试从源码动态提取声明值与实测比对，
+之后 vendored/Flutter 升级布局一变测试即红。
+
+**⚠️ 顺带钉死的三个测量事实**（写校准测试时踩的坑，以后写编辑器类 UI 测试必看）：
+
+1. **EditableText 内部自带 Scrollable，且它是 EditableText 的后代**——
+   TextField 把 scrollController 透传给 EditableText，后者在 build 里
+   `Scrollable(controller: ... → _Editable)`。所以
+   `find.ancestor(of: EditableText, matching: Scrollable)` 找不到它
+   （只会撞上 `_wrapInScrollView` 的横向 SingleChildScrollView，
+   controller=null），要用 **`find.descendant`**。
+2. **滚动不动 EditableText 的 box**：滚动在 RenderEditable 绘制层平移
+   （内部 `_paintOffset`），`getTopLeft(EditableText)` 恒为
+   `CodeField顶 + 8`。想验证"滚动跟随"，验证 offset 本身 + 合成公式，
+   别指望 box 位移。
+3. **`getLocalRectForCaret()` 返回的坐标已含滚动偏移**（`+ _paintOffset`
+   已在内部应用）。拿它合成视口 y 时**不要再减 scrollY**——否则差值恰好
+   等于 scrollOffset，一眼就能看出"扣了两次"（本轮：期望 −13 实测 −76，
+   差 63 = jumpTo 的 63px）。
+
+**新增教训**：
+- **像素级 UI 常量（inset/行高/间距）禁止拍脑袋**：写死常量必须配渲染校准
+  测试（声明值 vs 真实渲染实测值），两边任何一边动过都会红。"我记得 Flutter
+  默认是 20"不算证据——先分清场景（M2/M3、border 有无、isDense、label 有无）。
+- **校准测试用"源码动态提取声明值"而非再写死一份**：`RegExp(r'_kTextTopInset
+  = ([\d.]+)')` 从源码读，断言"声明 == 实测"。若测试里再写死 20，常量改对
+  了测试反而还挂着，误导排查。
+- 测试文件：`test/editor_completion_test.dart`（25 条：逻辑 14 + 渲染校准
+  3 + 源码断言 8）。
+
+---
+
+### Bug 610 · `dart format` 一折行，"源码断言"测试就崩在 `substring(-1)`（2026-09-25，alpha.81 出包前暴露）
+
+**症状**：上一轮整目录跑过一次 `dart format` 后，全量测试冒出一条
+**和本次改动毫无关系**的失败：
+
+```
+RangeError (start): Invalid value: Not in inclusive range 0..42863: -1
+  dart:core                          _StringBase.substring
+  test/build_panel_test.dart 251:24
+```
+
+**原因**：测试是这么写的——
+
+```dart
+final i = src.indexOf('if (otherBuilding) _otherBuildingCard()');
+final body = src.substring(i, src.indexOf('// ---------- 别人的构建占着'));
+```
+
+`dart format` 把源码里那行 collection-if（超 80 列）折成了两行：
+
+```dart
+if (otherBuilding)
+  _otherBuildingCard()
+else ...[
+```
+
+于是 `indexOf` 返回 **-1**，`substring(-1, ...)` 直接抛 RangeError。
+测试断言的是**源码排版**，而 format 唯一干的事就是改排版。
+
+**⚠️ 附带教训（同一次的第二个代价）**：那次 format 是**整目录**跑的
+（`dart format lib/ai/ lib/editor/ lib/project/ lib/mcp/`），一共动了
+34 个文件、26 个有变更，其中**约 18 个是本次根本没改的既有文件**（纯空白）。
+这些空白 diff 混在改动里，既污染 review，也埋了这次的雷。
+
+**解决**：
+1. 断言改成**容空白的正则**，并**先断言"找到了"再取子串**：
+   ```dart
+   final m = RegExp(r'if\s*\(otherBuilding\)\s*_otherBuildingCard\(\)')
+       .firstMatch(src);
+   expect(m, isNotNull, reason: '找不到"别人在构建"的分支');
+   final body = src.substring(m!.start, src.indexOf('// ---------- 别人的构建占着'));
+   ```
+2. 之后 `dart format` **只对自己实际改动的文件**跑。
+
+**验证**：`flutter test test/build_panel_test.dart` 39 条全绿；
+`git diff --stat lib/project/build_panel.dart` 显示 52 增 48 删**全是空白**；
+全量 **1271** 绿。
+
+**新增教训**：
+- **源码断言守住的是"接线不回潮"，不是"这行代码长什么样"**。断言串里
+  别塞可折行的完整语句；要么用 `\s*` 容错，要么只断言**不可折行的短标记**
+  （方法名 / 常量名 / 字符串字面量）。
+- **`indexOf` 的 -1 不许直接喂给 `substring`**：失配时报出来的是
+  RangeError + 一串无意义的下标，把人往"文件怎么变短了"的方向带。
+  先 `expect(m, isNotNull)`，报错才是人话。
+- **`dart format` 之后必须跑全量测试**：它只改空白，但空白能改掉源码断言，
+  而这类失败**不会**体现在 analyze 里（两个都合法）。
+
+---
+
+### Bug 611 · AI 模块三个纯函数"写得太自信"：硬转 / 判据太窄 / "空"的语义反了（2026-09-25，alpha.81，全被测试抓出来）
+
+**症状**（三个互不相关、同一天被测试各抓一次）：
+
+1. `AiConfig.fromJson({'baseUrl': 42})` 抛
+   `type 'int' is not a subtype of type 'String?' in type cast`
+2. `looksLikeCode('final a = 1;')` 返回 **false** —— 内置 LLM 返回的**正确
+   代码**被预览标上"疑似不是代码"
+3. `lineDiff('a\nb', 'a\nb\n')` 报**有差异**（2 行 same），因为 `isEmpty`
+   被定义成 `lines.isEmpty`
+
+**原因**：
+
+1. `fromJson` 里写的是 `(raw['baseUrl'] as String?) ?? ''`——**硬转**。
+   字段类型不对（旧版本写的文件、手改过、别的 App 写过同名文件）就直接进
+   异常分支。外层 `load()` 有 try/catch 兜得住，但**公共入口不该靠调用方兜**，
+   而且兜住的结果是"整份配置作废"，本可以只废那一个字段。
+2. `looksLikeCode` 的判据只认几种**开头**（`//`、`import `、
+   `标识符+({=`、单行 `}`），漏了"带关键字的声明行"——`final a = 1;`
+   一条都不匹配，于是被判成聊天腔。
+3. `isEmpty` 我按数据结构随手定义成了"没有行"。可调用方真正要问的是
+   **"有没有改动"**——内容相同时快路径返回空列表，而带一堆 same 行时
+   （如只差末尾换行）根本"没有行"可言。
+
+**解决**：
+
+1. 逐字段降级：`static String _str(Object? v) => v is String ? v : '';`
+   ——能救回的字段照常救回，坏字段退化空串。
+2. 判据改成 **"代码行占比 ≥ 一半" + 聊天腔特征词一票否决**，
+   并把"像代码"放宽到关键字 / 赋值 / 收尾括号 / 代码标点收尾 / 箭头：
+   ```dart
+   if (nonEmpty.any((l) => _kChatty.hasMatch(l))) return false; // 裹了解说
+   final codeish = nonEmpty.where((l) => _kCodeLine.hasMatch(l.trimLeft())).length;
+   return codeish * 2 >= nonEmpty.length;
+   ```
+3. `isEmpty => added == 0 && removed == 0`；并且**行序列相同也走空差异快路径**
+   （`_sameLines(la, lb)`），`'a\nb'` 与 `'a\nb\n'` 从此算同一份内容。
+
+**验证**：新增 5 个测试文件（`ai_config` / `ai_llm_client` / `ai_dispatch` /
+`ai_diff` / `ai_editor_wiring`）共 77 条，全量 **1271** 绿。
+
+**新增教训**：
+- **纯函数不是"写得短就对"**：边界要在测试里**枚举**（脏类型、空串、单行、
+  超阈值、首/末位置），这类函数没有 UI 能替你兜底。
+- **启发式判据宁可漏标、不可误标**：`looksLikeCode` 误标会让"补全"这个功能
+  看起来是坏的（明明返回了代码却警告"这可能不是代码"）；漏标只让用户多点
+  一下预览。**凡"警示类"判据，出错方向要选对用户代价小的那边。**
+- **"空"的语义先问调用方想问什么**，不要按数据结构的形状随手定义
+  （`lines.isEmpty` ≠ 无改动）。
+
+---
+
+### Bug 612 · AI 设置里输入 API Key 闪屏、打不进字 —— 主因是**异步回填竞态**，输入法只是次要嫌疑（2026-09-26，alpha.82）
+
+**症状**：真机进「AI 后端」选「内置 LLM」，在 API Key 输入框里打字会**闪屏**、
+已输内容丢失、根本打不进去。用户第一反应是"安全键盘输入法冲突"。
+
+**排查顺序**（先排除、再定位，别一上来就改 obscureText）：
+
+1. 怀疑"父级高频重建把输入框带走了"——查了两个可能的源头，**都排除**：
+   - 隧道 `TunnelService.onUiChanged` 只在启停隧道时 `_ui()`；
+   - `project_page` 的 500ms 定时器只在 `_section == _Section.build && building`
+     时启动，**AI 区根本不跑**。
+2. 于是转去看**回填时序**，才抓到真凶。
+
+**根因（我方确证，不用真机就能坐实）**：`_loadCfg()` 是异步的——
+`await ProotBridge().envInfo()` 走 MethodChannel。用户在它返回之前选了
+「内置 LLM」并开始敲 key，它回来后无条件 `setState` 用**磁盘旧值**覆盖：
+
+```dart
+setState(() {
+  _cfg = c;                    // kind 被改回 remoteMcp
+  _keyCtl.text = c.apiKey;     // 正在敲的内容被冲掉
+});
+```
+
+`kind` 一变，`if (llm) ...[三个输入框]` 整块条件渲染**瞬间消失**。
+观感就是"闪一下、字没了"——**不崩溃、不报错**，只能靠时序推理抓出来。
+
+**次要嫌疑（沙箱复现不了）**：`obscureText: true` 会让国产输入法切
+「安全键盘」，Flutter 上已知反复重建 InputConnection。用户猜的就是这个，
+方向没错，但它**不是本例的主因**——主因修掉后若还闪，才是它。
+
+**解决**（四条一起上，都是无害改动）：
+
+1. **`_edited` 守卫**：`_loadCfg()` 开头 `if (!mounted || _edited) return;`
+   ——任何输入（含"清空密钥"）都置 `_edited = true`，之后异步回来的配置
+   **一律不回填**。
+2. **密钥默认明文**（`_showKey = true`）+ 眼睛按钮切换；键盘类型用
+   `TextInputType.visiblePassword`（告诉输入法"是密码但用普通键盘"）。
+3. **去掉 `onEditingComplete` 自动保存**（它在部分输入法上会触发收键盘），
+   改成停手 600ms 静默写（`_markEdited` + Timer，dispose 里取消）。
+4. **给 TextField 稳定 key**（`ValueKey('ai-field-$label')`），父级重建时
+   不丢 Element 身份；并关掉 `enableSuggestions / autocorrect /
+   enableIMEPersonalizedLearning`（候选栏高度抖动也会带动布局跳）。
+
+**验证**：新增 `test/ai_panel_input_test.dart` **10 条**（回填守卫生效、
+默认明文、visiblePassword、无 onEditingComplete、timer 有取消）；
+全量 **1294** 绿。⚠️ **输入法那半边沙箱测不了**，需要真机确认。
+
+**新增教训**：
+- **`await` 之后无条件 `setState` 覆盖输入框 = 定时炸弹**：任何"异步加载
+  配置再回填 UI"的地方，回填前先问一句"用户此刻是不是正在编辑"。
+- **条件渲染的输入区（`if (x) ... [TextField]`）一旦被父级 setState 带走，
+  用户看到的就只是"闪"**——这类 bug 不报错、不留栈，只能靠守卫预防。
+- **真机问题要把"我方确证的部分"和"对症下药的部分"分开记录**：测试只守
+  前者。写在一起会让人误以为"有测试 = 整体验证过了"，反而更危险。
+
+---
+
+### Bug 613 · 键盘一弹，侧栏闪出又收回、AI 设置"模式自己跳回 MCP"、输入的 key 全丢 —— 真凶是 `OrientationBuilder`（2026-09-26，alpha.83）
+
+**真机观察**（用户原话，这条 bug 完全靠它定位）：
+> 点击 key 输入栏后突然闪出侧边栏然后收回，然后模式自动切换了 mcp 然后又
+> 切回来了，然后键盘回收，输入栏选中状态消失，无法正常输入
+
+**排查**：第一轮怀疑输入法（用户也是这么猜的）——合理但**错了**。四个现象
+同时出现，说明不是键盘层的事，而是**组件树被换掉了**。顺着"什么会让整块
+UI 重建"找，在 `project_page.dart` 的 `body` 上抓到：
+
+```dart
+OrientationBuilder(builder: (context, orientation) {
+  final landscape = orientation == Orientation.landscape;   // ← 只看长宽比
+  final sections = _buildSections();
+  if (!landscape) return sections;                          // 竖屏：裸树
+  return Row([SizedBox(width:280, tree), ..., Expanded(sections)]); // 横屏：包一层
+})
+```
+
+**根因链**（一步都不能少，全在真机反馈里对得上）：
+
+1. App 的 `android:windowSoftInputMode="adjustResize"` → 键盘弹起时**窗口
+   本身被 resize**，`MediaQuery.size` 的高度跟着变小；
+2. `OrientationBuilder` 的 orientation 就是**由约束长宽比推的** → body 高度
+   被键盘压到小于宽度 → **误判成 landscape** → 280px 侧栏"闪出"；
+3. 键盘高度回升 / 收起 → 判回 portrait → 侧栏"收回"；
+4. **最致命的一步**：body 的返回值在 `sections` 与 `Row(...sections...)`
+   之间切换 → `IndexedStack` 在 Element 树里的**位置变了** → Flutter 认为
+   是新 widget，**六个区的 State 全部销毁重建**：
+   - `AiTakeoverPanel._cfg == null` → 单选组显示默认 `remoteMcp`
+     （"**模式自动切换了 mcp**"）；
+   - `_loadCfg()` 异步回来回填磁盘值（"**然后又切回来了**"）；
+   - 焦点所在的 `TextField` 的 Element 被销毁 → 注意力被系统收回
+     （"**键盘回收、输入栏选中状态消失**"）；
+   - 正在敲的内容全丢（"**无法正常输入**"）。
+
+**为什么 alpha.82 的修复没用**：那一轮加的 `_edited` 守卫是防"异步回填
+覆盖用户输入"的，但这里 **State 本身都没了**——守卫随 State 一起被销毁，
+自然守不住。教训：**怀疑"界面被重建"时，先查组件树结构是否稳定，再查
+状态时序**。顺序反了会像本轮一样，先修一个真实但不相干的问题。
+
+**为什么"换输入法"一定没用**：这不是输入法层的事。用户提出的这条建议是
+合理的试探，但现象里的"侧栏闪出"已经指向布局层——**遇到多现象并发时，
+先找能一次解释全部现象的那个原因**（这里四个现象全由第 4 步解释）。
+
+**解决**（两道，缺一不可）：
+
+1. **判定改宽度阈值**：`MediaQuery.sizeOf(context).width >= 600`。
+   键盘只压高度不压宽度 → 对键盘**天然免疫**；真机旋转时宽度确实会变，
+   仍然正确。`editor_page` 独立模式的 `Drawer`/常驻左栏同病同治。
+2. **树结构恒定**：`Row(children: [if (wide) 侧栏, if (wide) 分隔线,
+   Expanded(sections)])` —— `sections` 的位置**永远是 Row→Expanded→child**，
+   旋转时只是增删兄弟节点，不换父节点 → **State 保活**。
+   > 顺带修掉一个此前没人报的 bug：**旋转屏幕会丢全部未保存内容**，
+   > 成因与键盘闪侧栏**完全一样**（树被换掉），只是触发条件更少见。
+
+**验证**：`test/layout_keyboard_orientation_test.dart` **7 条**，其中两条是
+真 pump 的**不变式测试**：
+- 只压高度（模拟键盘）→ 侧栏不出现；
+- **旧写法会翻车**：同尺寸下 `OrientationBuilder` 确实从"竖"翻成"横"
+  ——这条故意保留失败路径，让后来者一眼看到判据为什么必须换。
+全量 **1308** 绿。
+
+**新增教训**：
+- **`OrientationBuilder` / `MediaQuery.orientation` 在 `adjustResize` 的
+  App 里不可用于布局分支判定**，因为键盘会改变约束长宽比。要判"够不够宽
+  就上侧栏"，直接用**宽度阈值**。（若非要按方向，得读
+  `MediaQuery.of(context).orientation` 之外的真实设备方向，或改用
+  `MediaQuery.orientationOf` 配合忽略 viewInsets 的尺寸——都不如宽度阈值直接。）
+- **"三元/if 换整棵树"是 State 杀手**：`if (x) return A; return Row([B])`
+  这种写法在条件翻转时会重建整棵子树。**改成 Row + 条件 children**，
+  位置恒定即 State 恒定。
+- **多现象并发时，先找那个能一次解释全部现象的原因**——只解释一部分的
+  假设（输入法）再合理也要先放一放。
+- 源码断言要**剥掉注释**再匹配：本轮两个文件里到处是"为什么不能用
+  `OrientationBuilder`"的说明，直接 `contains` 会把解释当成违规命中。
+
+---
+
+### Bug 614 · 派活后"还要手动从磁盘重新载入" —— 基线取错，假报警把真改动吃掉了（2026-09-26，alpha.84）
+
+**用户反馈**（附截图，截图里那句 toast 还是 alpha.82 的文案）：
+> 怎么还是要手动"从磁盘重新载入"
+
+**先排掉的**：`_startDiskWatch` 确实接上了 dispatched 分支（grep 确认），
+watcher 也确实在轮询。**接线没问题，问题在语义**。
+
+**根因**：alpha.83 把基线定义成"**派活那一刻编辑器里的内容**"，注释还写了
+理由——"用户自己未保存的改动不算外部变更"。听起来对，实际会**彻底废掉监听**：
+
+```dart
+// alpha.83（错）
+_startDiskWatch(req.path, before);   // before = _content（编辑器内容）
+```
+
+```dart
+Future<void> _poll() async {
+  if (!r.ok || r.content == _baseline) return;
+  _reported = true;                    // ← 一旦置位
+  stop();                              // ← 监听就此结束
+  onChanged?.call(r.content);
+}
+```
+
+用户**只要有未保存改动**（改代码时这是常态），`编辑器内容 ≠ 磁盘内容` →
+**第一次轮询（2.5s 后）就判定"磁盘变了"** → 弹一个假报警 → `_reported = true`
++ `stop()` → **之后外部 AI 真改了也永远不会再报**。用户看到的就是"功能没生效，
+还得手动重载"，而实际是**假报警把真改动吃掉了**。
+
+**为什么容易写错**：把"编辑器脏不脏"这件事**混进了"磁盘变没变"的判断**。
+这是两个正交的问题，硬凑在一起就必然错一边：
+
+| 问题 | 正确的信息源 |
+| --- | --- |
+| 磁盘被外部改了吗？ | **磁盘的**上一个已知内容 |
+| 用户的改动会丢吗？ | 编辑器的内容 vs 磁盘内容（在**弹窗里**再比） |
+
+**解决**（`lib/ai/ai_file_watch.dart`）：
+1. `start()` 变成 `Future<void>`，**自己读一次磁盘**当基线（`baseline` 参数
+   降级为仅供测试注入的可选值）；
+2. 读不到盘 → `_baselineKnown = false` → **干脆不启动**。"没有可信基线就开
+   监听"必然首轮误报，宁可完全不报（用户仍有手动重载），也不要弹假报警；
+3. `_poll` 里补一道 `if (!r.ok) return;` —— 单次读失败（写入过程中的 0 字节
+   中间态）不该算变更；
+4. 上报前把基线推到刚读到的内容，避免回调没处理时连环弹。
+
+**顺带修掉的一处"改了行为没改提示"**（`lib/ai/ai_backend.dart`）：派活提示
+仍写着"用编辑器的「从磁盘重新载入」查看结果"——**用户截图里那句就是它**。
+alpha.83 明明已经自动盯盘，提示却还在教人手动操作，用户自然以为功能没做。
+改成"它改完文件后**会自动弹窗给你看差异**，也可以随时点「更多 → 从磁盘重新载入」"。
+
+**教训**：
+- **改了行为就必须改提示**。提示是用户判断"功能有没有生效"的唯一依据，
+  提示过期 = 功能在用户眼里不存在。这一条是纯疏忽，没有技术难点。
+- **基线/去重这类"上次已知值"，语义必须和触发条件同源**。判断"磁盘变了"，
+  基线就只能是磁盘内容；拿编辑器内容当基线，等于拿尺子量温度。
+- 监听类功能的失败模式要专门想一遍：**"永远不报"和"乱报"哪个更糟？**
+  这里是"假报警导致永久静音"，比单纯不报更难发现——**自停（`stop()`）的
+  触发条件必须是最可靠的那一个**。
+
+**验证**：`test/ai_file_watch_test.dart` 增到 **13 条**，新增"基线语义
+（alpha.84 回归）"组，其中两条直接盯着这个病灶：
+- **用户的未保存改动 ≠ 外部变更（不许误报）** —— 且断言 `w.active` 仍为真
+  （"关键：监听必须还活着"）；
+- **有未保存改动时，外部真改了仍然能报出来** —— 注释里写明"旧实现会在这里
+  误报并自停"。
+`test/ai_editor_wiring_test.dart` 加源码断言守住 `_startDiskWatch(String path)`
+单参数 + 派活提示新文案。全量 **1339** 绿。
+
+---
+
+### Bug 615 · 派活链路是黑盒：用户"不确定外部 AI 干了什么"（2026-09-26，alpha.84）
+
+**用户反馈**（澄清问答里的回答）：
+> 不确定外部 AI 干了什么
+
+**问题不在功能，在**可观测性**。alpha.81 把派活设计成"异步无回执"（协议上
+最稳，见 `mcp_dispatch.dart` 的说明），但对用户是个黑盒——派完之后只有一句
+toast，接下来一个问题都答不上来：作业写进去了吗？有 AI 来领过吗？它改的是
+我打开的那个文件吗？它是改了但改错了，还是压根没动？
+
+**解决**：`lib/ai/ai_inbox_view.dart`（新）+ 编辑器"更多 → **AI 作业收件箱**"。
+
+- 只读 `loadAiInbox()`：读 `.foa/ai-inbox.md`（索引）+ `list` 作业目录列出
+  最近 20 条作业，正文里出现 `status: done` 才算"对方回执过"；
+- 任何一步失败都**降级为"看不到"而不抛异常**——诊断入口自己崩掉比看不到更糟；
+- 判定逻辑全在纯函数里（`parseJobFileName` / `jobMarkedDone` / `describeJob`），
+  因此完全可测；
+- **不在弹窗里"标记完成 / 删作业"**：判断权在外部 AI 手里，App 代它标 done
+  就是撒谎。同时如实告知"⏳ 也可能是改了但没写回执"，所以仍保留自动 diff 预览。
+
+**顺带抓到的一个真 bug**：初版排序用 `b.name.compareTo(a.name)`（文件名倒序，
+理由"前缀是毫秒时间戳"）。但时间戳是**变长整数**，字符串比较会得出
+`'900' > '3000'` 这种荒谬结论，把最旧的顶到最前。改为按 `parseJobFileName`
+解析出的 `DateTime` 数值排序，解析不出的排最后。**这条是写测试时被抓出来的**
+（`maxJobs 截断` 那条断言"截断也要保住最新的"直接失败）。
+
+**教训**：
+- **"异步无回执"是协议约束，不是体验借口**。协议不能给你回执，但磁盘上
+  的痕迹（inbox 索引 + `status: done`）本来就在那里——**把它们摊开给用户看，
+  成本极低，收益是"从猜变成看"**。
+- **凡是"等对方"的流程，都要给用户一个能自己查的地方**。否则用户唯一能做的
+  就是反复试、反复猜，然后把"其实在正常工作"的功能当成坏的。
+- **数字型字符串不许用字典序比较**。变长时间戳、版本号、`file1/file10`
+  全是同一个坑。要么解析成数值，要么**零填充到定长**。
+
+---
+
+### Bug 616 · 出包卡在 `Could not resolve io.flutter:*_release` —— 是**网络**，不是 Bug 608；且镜像其实从没生效过（2026-09-26，alpha.84）
+
+**现象**：alpha.84 出包连挂 3 次，两次报网络错（35s / 1m3s）：
+
+```
+> Could not resolve io.flutter:arm64_v8a_release:1.0.0-06a2e2a1...
+> Could not resolve io.flutter:flutter_embedding_release:1.0.0-06a2e2a1...
+   > Could not HEAD 'https://download.flutter.io/...'
+      > The server may not support the client's requested TLS protocol versions
+         > Remote host terminated the handshake
+```
+
+**第一件事：分诊，别再套 Bug 608 的招**。判据见 SKILL 里的构建分诊表：
+- 报 `Could not resolve ... Maven` / `terminated the handshake` → **网络问题**；
+- 报 `Gradle build daemon disappeared` / 秒挂 → Bug 608（杀 daemon + 预清理）。
+
+> ⚠️ 本轮我自己踩了：看到"挂"就先按旧经验重跑 + 预清理，**前两次纯属白跑**。
+> 错误文本第一眼就该看，它会直接告诉你是哪一类。
+
+**关键排查：镜像根本没被用过**
+
+```bash
+grep -c "maven.aliyun.com" /tmp/b.log   # → 0
+```
+
+日志里**一条阿里云记录都没有**。原因：Flutter 的 `FlutterPlugin` 会往项目
+仓库列表**注入官方地址**（`download.flutter.io` / `dl.google.com` /
+`repo.maven.apache.org`），而这些注入项的优先级**高于**
+`android/build.gradle.kts` 里写的国内镜像。
+
+**而且镜像配置本来就是废的**：Flutter 自带的
+`flutter_tools/gradle/settings.gradle.kts` 里写着
+```kotlin
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { google(); mavenCentral() }
+}
+```
+`FAIL_ON_PROJECT_REPOS` 会让**所有 project 级仓库直接报错**。也就是说本项目
+`allprojects { repositories { maven { aliyun } ... } }` 那几行**从来没生效过**
+——以前构建能过，纯粹是官方源碰巧通。**这是一个潜伏很久、直到断网才暴露的问题。**
+
+**验证三个源的可达性**：
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" --max-time 20 \
+  https://download.flutter.io/io/flutter/.../x.pom       # → 000（连证书都不给）
+curl -s -o /dev/null -w "%{http_code}\n" \
+  https://maven.aliyun.com/repository/google/            # → 404（可达）
+# 但阿里云里没有 io.flutter:arm64_v8a_release → Flutter engine 只在官方源分发
+```
+
+**解法：把本机 Gradle 缓存做成 `file://` 仓库，彻底绕开网络。**
+
+```bash
+M2=android/local-maven
+for art in arm64_v8a_release flutter_embedding_release; do
+  ver=1.0.0-06a2e2a110089dff50fe635cffd2a61e1b24fbcd
+  mkdir -p "$M2/io/flutter/$art/$ver"
+  find /root/.gradle/caches/modules-2/files-2.1/io.flutter/$art/$ver \
+    -type f -exec cp {} "$M2/io/flutter/$art/$ver/" \;
+done
+```
+
+```kotlin
+// android/settings.gradle.kts
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)   // 必须改
+    repositories {
+        maven { url = uri("https://maven.aliyun.com/repository/google") }
+        maven { url = uri("https://maven.aliyun.com/repository/central") }
+        google(); mavenCentral()
+        maven { url = uri("${rootDir}/local-maven") }
+    }
+}
+```
+
+**三个坑（全部实测踩过）**：
+
+1. **不能用 `~/.gradle/init.d/*.gradle`**。写 `beforeProject { repositories {} }`
+   会被 `FAIL_ON_PROJECT_REPOS` 拒：
+   `Build was configured to prefer settings repositories over project repositories`。
+   **只能改 settings，不能改 project。**
+2. **`flutter build apk` 没有 `--offline`**（`EXIT=64 / Could not find an
+   option named "--offline"`）。Gradle 层的 `--offline` 也救不了：缓存在
+   `files-2.1` 里，但离线模式还要求"该构件归属于某个已配置仓库"，会报
+   `No cached version of io.flutter:... available for offline mode`。
+   **`file://` 仓库是唯一可行的路。**
+3. 顺手把 `repositoriesMode` 从 `FAIL_ON_PROJECT_REPOS` 调成 `PREFER_SETTINGS`
+   ——否则 `build.gradle.kts` 里那两行镜像**永远是错的**（同一个错误），
+   有网时也一直没走镜像。
+
+**教训**：
+- **构建失败先读错误文本再动手**。"网络"和"daemon 状态坏"的修法完全相反，
+  套错招只会浪费两轮时间。
+- **"以前能过"不等于"配置是对的"**：镜像配置在有网时被官方源的成功掩盖了，
+  断网才把它暴露出来。**排查网络问题时，先确认你配的镜像到底有没有被打到**
+  （`grep -c` 一条就行），而不是假设它在生效。
+- **本地缓存可以当仓库**：能联网构建过一次，就说明依赖都在本地了；
+  把 `files-2.1` 里的 `pom/jar` 按 `groupId/artifactId/version` 摊成
+  `file://` maven 布局，是最不依赖外部条件的兜底手段。
+
+#### 补丁（alpha.86）：`--target-platform` 才是首选解，local-maven 只是兜底
+
+alpha.86 出包时**同一个错误又犯了一次，但这次 local-maven 救不了**：
+它只摊了 `arm64_v8a_release` + `flutter_embedding_release`，而 Gradle 要的是
+**`x86_64_release`**，缓存里根本没有这个构件，报错变成：
+
+```
+> Could not resolve io.flutter:x86_64_release:1.0.0-06a2e2a1...
+   > Could not GET 'https://dl.google.com/...'
+      > The server may not support the client's requested TLS protocol versions
+         > Remote host terminated the handshake
+```
+
+**为什么我们只出 arm64，Gradle 却要 x86_64？** 读
+`flutter_tools/gradle/src/main/kotlin` 源码，两个地方容易混淆：
+
+| 地方 | 作用 | 影响范围 |
+|---|---|---|
+| `FlutterPlugin.configureAbiWithoutSplits()` → `abiFilters` | **只控制打包**进 APK 哪些 so | 产物内容 |
+| `FlutterPluginUtils.getTargetPlatforms()` → `PLATFORM_ABI_LIST` | **决定依赖解析范围** | 要不要下载 |
+
+而 `PLATFORM_ABI_LIST` 来自 `DEFAULT_PLATFORMS`，是 **arm32 + arm64 + x86_64
+三个**。所以**只要不传 `target-platform`，Gradle 就会去解析三个引擎构件**——
+`abiFilters += listOf("arm64-v8a")` 拦不住它，因为它压根不在那条代码路径上。
+
+**正解：**
+
+```bash
+flutter build apk --release --target-platform android-arm64
+# 等价于 -Ptarget-platform=android-arm64
+```
+
+一次解决，**不需要预填充任何缓存**，比摊 local-maven 干净得多。
+（`getTargetPlatforms` 的实现就是读 `target-platform` 属性，逗号分隔。）
+
+**教训**：
+- **"打包过滤"和"依赖解析"是两件事**。看到项目里写了 `abiFilters`，不代表
+  Gradle 不会去下载别的 ABI 的构件。**构建配置要问"它作用在哪一层"。**
+- **兜底手段（local-maven）要写清它兜的是什么**。它兜的是"构件在本地缓存里、
+  只是没网"，**兜不了"构件根本不存在"**。alpha.84 写下 README 时没写这条边界，
+  alpha.86 就照着它排查了一圈才转向。
+- 优先用**官方参数**（`--target-platform`）而不是**自己搭基础设施**
+  （摊 maven 仓库）：前者一行、无状态；后者要维护版本号、要防缓存漂移。
+
+---
+
+### Bug 617 · "以前未连接会提示并跳设置，现在只会静静派活" —— 只有一条后端路径有前置检查（2026-09-26，alpha.85）
+
+**用户反馈**（附截图：派活 toast 正常弹出，但隧道根本没开）：
+> 之前会弹消息说未链接然后跳到设置页面的，现在只会这样了
+
+**根因**：两条后端路径的失败**长得一模一样**（都是"点了没反应/一句看不出
+所以然的提示"），但**只有一条有前置校验**：
+
+| 后端 | 前提 | 有没有前置检查 |
+| --- | --- | --- |
+| 内置 LLM | 填了地址 + 密钥 | ✅ 有（`AiOutcome.failure` + `project_page` 跳设置区） |
+| 远程 MCP | **隧道在跑**（否则没人能连进来领活） | ❌ **完全没有** |
+
+所以隧道没开时点 AI，App 老老实实把作业写进 inbox，然后显示
+"已投递到 .foa/ai-inbox.md，等已连隧道的 AI 客户端领取"——
+**这句话技术上真（确实写进去了）、实际上假（根本没有客户端连得进来）**。
+作业就烂在磁盘里，用户还以为是 AI 没干活。
+
+**修法**：编辑器页新增 `_ensureAiReady()`，**放在 `beginAiPlaceholder()` 之前**：
+
+```dart
+Future<void> _runAiFlow(EditorAiRequest req, String instruction) async {
+  if (widget.onRunAi == null || _aiBusy) return;
+  // 占位是"AI 正在写"的承诺；还没确定能跑就占位，失败了得先撤占位，
+  // 白白闪一下。所以检查必须在这之前。
+  if (!await _ensureAiReady()) return;
+  ...
+```
+
+- **内置 LLM** 缺地址/密钥 → `_showAiFailure` + 去 AI 设置区；
+- **远程 MCP** 且 `!tunnelReady(TunnelService.I.status)` → 三出口弹窗
+  **取消 / 仍然派活 / 去开启隧道**，默认停"取消"（点外部关掉不默默派活）。
+
+**为什么 MCP 是"提示 + 让你选"而不是硬拦**：派活本身有独立价值——用户可能
+打算**稍后**起隧道，或者会自己把作业文件拷给别的 AI。硬拦会砍掉这些用法。
+**不阻断，但绝不让人以为活已经有人接了。**
+而"去开启隧道"这一支**不放行派活**：用户点的是去开隧道，顺手把作业派了
+等于违他本意。
+
+**顺带修掉一个更隐蔽的设计缺陷 —— `AiRemedy` 枚举**
+
+原先跳转的唯一判据是字符串比对：
+
+```dart
+// project_page.dart（旧）
+if (out.kind == AiOutcomeKind.failure &&
+    out.message == kAiUnconfiguredMessage && mounted) { ... }
+```
+
+**改一个字，跳转就静默失效，且不会有任何测试变红。** 这正是 alpha.83
+"改了行为没改提示"的同一个病根。现在给一个显式枚举：
+
+```dart
+enum AiRemedy { configureLlm, startTunnel }
+```
+
+UI 只认 `out.remedy`，文案随便改都不影响导航，出口文案也跟着换
+（缺密钥 → "去设置"，缺隧道 → "去开启隧道"）——**文案说错地方，
+比没有出口更浪费时间**。
+
+> **通用教训：凡是"根据提示文案决定走哪条分支"，都是定时炸弹。**
+> 文案是给人看的、会变的；分支条件是给机器看的、要稳的。这两者一旦
+> 耦合，改文案的人不会知道自己在改逻辑。
+
+---
+
+### Bug 618 · 外部 AI 领了一条补全作业，把整个工程体检了一遍（2026-09-26，alpha.85）
+
+**真机实录**（用户截图）：
+> 这些都是同类「补全光标处代码」作业，光标都在 main.dart 偏移 ~11371 处。
+> 先读当前 main.dart 看真实现状。［执行 1 条命令］
+> 文件 360 行、12095 字节。读前半部分看整体结构和是否有未补全处。［执行 1 条命令］
+> …确认有没有额外要求。［执行 1 条命令］
+> 作业正文是「补全光标处代码」，但当前 main.dart 看起来已是完整文件。
+> 我需要先确认它是否真能编译——重点看 `cardTheme` … 先查 SDK 版本的 API 定义。
+
+一条"补全光标处代码"的作业，被扩散成了：通读全文 → 判断"文件已完整" →
+查 API 定义 → 准备验证能否编译。**用户要的是补几行，AI 在给项目做体检。**
+
+**根因不在于 AI 笨，而在于作业里没有"边界"**：`buildJobMarkdown` 只写了
+"要做什么"（要求 + 上下文），**完全没写"不要做什么"、"什么情况下该停下"、
+"改不动怎么办"**。LLM 在信息不足时的默认行为就是"多做一点显得尽责"。
+
+**修法：三处齐改，把边界写死在提示词里。**
+
+**① `tunnel_service.dart` 的 `buildHandoffPrompt` 新增【工作纪律】**
+
+```
+**只有两种情况你才动手：**
+1. 收件箱里有**未处理**的作业条目（没有 `status: done` 的）；
+2. 用户在本对话里**直接给了你**明确指令。
+
+**除此之外一律停下来等，不要自行发挥：**
+- 收件箱空 / 全 done → **只回一句"当前没有待处理作业"就结束**，
+  不要顺带看看项目、不要主动分析代码、不要跑 foa_diag。
+- 作业指向的文件看起来已经完整 → 这**不是**让你扩建范围的理由。
+- 作业要求含糊 → **问清楚再动**，不要用"顺便检查一下"来补全意图。
+
+**关于验证，默认克制：**
+- **不要**主动运行编译、构建、`flutter analyze`、测试套件。
+- 排查**该作业相关的**报错时读文件是可以的；但**不要**把一次补全作业
+  扩大成整个项目的健康检查。
+```
+
+并且**解释了代价**（"这是用户的真机，flutter/build 经 QEMU 转发，一次构建
+几分钟起、耗电且占满 CPU……**"多做一点"在这里是负分**"）。经验：给 LLM
+的约束带上理由，比干巴巴的命令执行率高得多——它需要知道"为什么"，才能在
+规则没覆盖到的角落做对判断。
+
+**开局指令也要改**：原文是
+`先调用 foa_info 建立环境认知；接着读 .foa/ai-inbox.md …`
+——**"先建立环境认知"本身就是在鼓励无作业时到处翻**。改成：
+
+```
+读 `.foa/ai-inbox.md`：
+- 有未处理作业 → 处理它；
+- 没有 → 回一句"当前没有待处理作业"，然后**停下等指令**。
+```
+
+**② `mcp_dispatch.dart` 的 `buildJobMarkdown` 新增【边界（请遵守）】**
+（作业文件是 AI 逐条真正要读的东西，光在接入说明里写不够）：
+- 只做「要求」里写的事；"看起来已完整"不是扩范围的理由；
+- 不要主动运行构建 / 测试 / analyze；
+- 不要为了"确认现状"通读整个文件再顺带分析；
+- **改不动或理解不了 → 直接说明卡在哪，保持文件原样，不要用猜测的改动顶上**。
+
+最后一条尤其重要：**"宁可不动，不要猜着改"**——猜错的改动会让用户以为
+AI 干完了，比明说"我卡住了"危害大得多。
+
+**③ inbox 表头**加一句"没有未处理条目时请停下等待，不要自行浏览项目或
+做健康检查"，兜住 AI 只读 inbox、没读接入说明的情况。
+
+**验证**：`test/ai_ready_guard_test.dart` **26 条**，其中作业边界 6 条、
+提示词纪律 7 条，逐句断言这些约束真的编进去了。全量 **1365** 绿。
+
+**通用教训**：
+- **给 AI 的任务书必须同时写"做什么"和"不做什么"**。只写前者，能力越强的
+  模型越容易越界——它不是不听话，是在按"帮助用户"的默认策略行事。
+- **"停下等"必须是一个明确的、被允许的动作**。原提示词通篇都在讲怎么干活，
+  从没说"可以什么都不做"，模型自然默认"总得干点什么"。
+- **约束要带上代价**。告诉它"真机上构建一次要几分钟"，比只说"别构建"有效。
+
+---
+
+### Bug 619 · 连点 AI 按钮派出多条重复作业 —— 闸门落在了 `await` 之后（2026-09-26，alpha.86）
+
+**用户报告**：
+> 如果同时点了好多次按钮好像会导致重复任务发送。
+
+**根因：闸门字段是"给用户看的"，不是"给防重入用的"。**
+
+旧代码只有一个 `_aiBusy`，检查写成 `if (widget.onRunAi == null || _aiBusy) return;`。
+看起来没问题，但 `_aiBusy` 要经过 `setState` 才置真，而它前面横着一个
+`await _ensureAiReady()`（读配置 + 可能弹对话框等用户点选）：
+
+```dart
+// ❌ 旧写法
+if (widget.onRunAi == null || _aiBusy) return;
+if (!await _ensureAiReady()) return;   // ← 第二次点击落在这里
+setState(() => _aiBusy = true);        // ← 到这里才置真，晚了
+```
+
+连点两下时，第二次点击正好落在那个 await 窗口里，读到的 `_aiBusy` **仍是
+false** → 两个流程并行跑到派活 → 磁盘上多出重复作业。
+
+而且这动作非常自然：**点了没反应会更用力点**。
+
+**修法：闸门必须是同步字段，且落在所有 `await` 之前，用 `try/finally` 保证
+任何出口都解锁。**
+
+```dart
+// ✅ 新写法
+if (widget.onRunAi == null) return;
+if (_aiRunning) return;   // 同步闸门，不依赖 setState
+_aiRunning = true;
+try {
+  if (!await _ensureAiReady()) return;   // 现在才轮到 await
+  ...
+} finally {
+  _aiRunning = false;   // 正常结束 / 提前 return / 内部抛异常，全都解锁
+}
+```
+
+两个字段分工明确、不可合并：
+
+| 字段 | 用途 | 时机 |
+|---|---|---|
+| `_aiRunning` | **同步防重入闸门** | 所有 await 之前 |
+| `_aiBusy` | 给用户看的状态（进度条、只读） | `setState` 之后 |
+
+**漏掉 `finally` 的后果同样是致命的**：`_showAiFailure` / `_askSaveAiChange`
+里任何一次抛异常，按钮就永久点不动了。
+
+**验证**：`test/ai_ready_guard_test.dart` 4 条（闸门存在且与 `_aiBusy` 分开 /
+落在所有 await 之前 / `finally` 里解锁 / 旧的 `|| _aiBusy` 短路写法没回潮）。
+
+**通用教训**：
+- **用于互斥的标志位，绝不能用"要等一次重绘才生效"的状态**。判断时机与写入
+  时机不同源，就会有一段谁都拦不住的窗口。
+- **凡是 `await` 之前就该校验的不变量，一个都不能放在 `await` 之后。**
+- 断言"闸门在 await 之前"时，**别直接搜 `await ` 字符串**——函数签名上方的
+  文档注释里往往就写着这个词（本次就命中注释导致假红）。要先定位函数体起点，
+  或以闸门语句为锚点往后找。
+
+---
+
+### Bug 620 · 测试连接报"地址可能不是合法的 http(s) 地址"，而地址完全正确（2026-09-26，alpha.86）
+
+**真机截图**：接口地址填的是 `https://api.deepseek.com/v1`（正确），
+点「测试连接」得到：
+
+> 失败：请求失败（接口地址可能不是合法的 http(s) 地址）
+
+用户于是去反复检查那个本来就没写错的地址。
+
+**根因有两层，缺一不可：**
+
+① **传输层把异常整个吞了**：
+
+```dart
+} catch (_) {
+  return const LlmResponse(-3, '');   // e 被丢掉，什么都没留下
+}
+```
+
+② **兜底文案拍脑袋写死了一个猜测**：`case -3: return '请求失败（接口地址可能
+不是合法的 http(s) 地址）'`。
+
+两层叠在一起：**内部什么都不知道 → 对外却给了一个很具体的错误指向**。
+真机上这个 -3 通常是 `api.deepseek.com` 解析成功但连接被重置 / TLS 被掐，
+跟"地址不合法"毫无关系。
+
+**修法：不确定就不要猜，改成"报事实 + 报分类"。**
+
+```dart
+// ① 传输层留下"最接近原因"的分类，而不是什么都不留
+catch (e) {
+  lastError = describeTransportError(e);   // 握手失败 / 证书 / 格式异常 / 网络层
+  return const LlmResponse(-3, '');
+}
+
+// ② 文案层：有真实分类就用它，没有就明说"原因未记录"
+case -3:
+  return detail.isEmpty ? '请求失败（原因未记录）' : detail;
+```
+
+**顺带堵住一个泄漏面**：写 `describeTransportError` 时我第一版搬运了
+`HttpException.message`，注释还写着"这是我们自己给的短句，不含 URL"——
+**这是错的**。它其实是任意字符串，真机上常常就是
+`failed for https://host/...?token=xxx`。测试当场抓出：
+
+> Expected: not contains 'sk-leak'
+> Actual: 'HTTP 层错误：failed for https://gw.internal/v1/...?token=sk-leak'
+
+改成只给分类、不搬运原文。同理 `SocketException` 只取 `osError.message`
+（系统短句，如 "Connection refused"），**不取** `exception.message`
+（形如 `Failed host lookup: 'host'`，会带出域名）。
+
+**通用教训**：
+- **"技术上真、实际上假"的错误提示比没有提示更坏**——它把用户引向错误方向，
+  且浪费的时间远超一句"我也不知道"。**不确定就说不确定。**
+- 错误处理里 `catch (_)` 是最贵的写法：**省下的一行，会在排障时翻倍偿还**。
+- **怀疑"是不是地址写错了"之前，先确认程序真的知道地址是错的。**
+- 断言"文案不含密钥"时，**注意别用自带真实感的字面量**——测试文件本身也会
+  被扫库。用拼接构造，别在源码里留一个 `sk-xxxxx`。
+
+---
+
+### Bug 621 · 接口地址用的是安全键盘（2026-09-26，alpha.86）
+
+**用户报告**：
+> 接口地址完全没必要用安全键盘吧
+
+**根因不是这里显式开了 `obscureText`，而是"哪个字段算密钥"这件事散落在
+调用点**：
+
+```dart
+_aiField(_baseUrlCtl, '接口地址', '...', TextInputType.url);            // 看不出安全与否
+_aiField(_keyCtl, 'API Key', '...', TextInputType.text, secret: true);  // 靠一个布尔
+```
+
+只要有人日后手滑写成 `_aiField(_baseUrlCtl, ..., secret: true)`，接口地址就
+会被当密钥处理 → 输入法切安全键盘 → **安全键盘常常不提供 `/` `:` `.`，
+地址根本打不全**。
+
+**修法：把语义收进枚举，`secureText` 与 `keyboardType` 成对定义。**
+
+```dart
+enum LlmFieldKind {
+  baseUrl,   // 普通键盘：安全键盘打不出 / : .
+  apiKey,    // visiblePassword + 遮挡：唯一需要 secureText 的字段
+  model;
+
+  bool get secureText => this == LlmFieldKind.apiKey;
+  TextInputType get keyboardType => switch (this) { ... };
+}
+```
+
+调用点变成 `_aiField(_ctl, '接口地址', '...', LlmFieldKind.baseUrl)`——
+**"能不能被标成密钥"从"调用者说了算"变成"类型说了算"**。
+
+> 注：`_showKey` 默认明文这条（Bug 612）**保持不变**。默认明文是为了先保证
+> 能输进去，眼睛按钮随时可点——这次的改动只是不再让遮挡外溢到非密钥字段。
+
+**通用教训**：
+- **当一个布尔参数决定"敏感与否"时，它就迟早会被传错。** 能合并成类型的语义，
+  就不要留给调用点。
+- 断言"旧写法已不存在"**必须先剥注释**：解释性注释里常常把旧写法原文抄一遍
+  当反面教材，直接搜全文就会把注释命中（Bug 610 的同类坑，本次实测复现两次）。
+
+---
+
+### Bug 622 · 测试连接报 `请求失败（ArgumentError）` —— 不可复现的错误，就让它自己说话（2026-09-26，alpha.87）
+
+**真机报错**：接口地址填 `https://api.deepseek.com/v1`，点「测试连接」得到
+
+> 失败：请求失败（ArgumentError）
+
+比上一版的"地址可能不合法"**信息量大一点，但仍然等于没说**。
+
+#### 第一步：先证伪"不是网络、不是证书"
+
+三条独立证据，缺一不可：
+
+| 证据 | 手段 | 结果 |
+|---|---|---|
+| 服务器可达 | 沙箱同代码路径发真实请求 | **HTTP 401**（请求到达了服务器） |
+| 证书链完整 | `openssl s_client -connect api.deepseek.com:443 -showcerts` | 3 层完整，`Verify return code: 0 (ok)` |
+| 根证书普及度 | 看 issuer | **DigiCert Global Root G2**（2013 老根，Android 7+ 全内置） |
+| 真机网络 | 用户手机浏览器直开该域名 | 拿到服务器返回的 JSON 错误 |
+
+**"证书缺失"这条线到此排除**。这里要记牢一个容易混淆的点：
+
+> Flutter 的 Dart 运行时用**自带的 BoringSSL** 直接读 `/system/etc/security/cacerts`，
+> **绕过 Android 的 Conscrypt**。所以 Chrome / 微信能打开的站，Flutter 里
+> 不一定能开——这是真坑，但**它有专属报错**：
+> `HandshakeException: CERTIFICATE_VERIFY_FAILED` 或
+> `Trust anchor for certification path not found`。
+> **看到 `ArgumentError` 就别往证书方向查了**，那不是这条路径的错。
+
+#### 第二步：用探针穷举，定位 `ArgumentError` 的触发条件
+
+写个独立 Dart 脚本，把各种非法输入逐个喂给 `HttpClient`，打印 `runtimeType`：
+
+```
+① 正常请求                    => 无异常
+② 非法 connectionTimeout      => SocketException
+③ 非法 scheme                 => ArgumentError   ← 唯一命中
+④ 空 header 名                => 无异常
+⑤ header 值含中文             => FormatException
+```
+
+**`ArgumentError` 只对应"URL 协议头不合法"。** 顺着这条线查 `_endpoint`，
+发现一个真 bug：
+
+```dart
+// ❌ 旧代码：只认小写
+if (!s.startsWith('http://') && !s.startsWith('https://')) s = 'https://$s';
+```
+
+用户填 `HTTPS://api.deepseek.com/v1`（大写）→ 被当成"没写协议头"→ 补成
+
+```
+https://https//api.deepseek.com/v1/chat/completions
+        ^^^^^^ 把协议头当成了域名
+```
+
+一个必挂的畸形 URL。**已改成大小写不敏感比较。**
+
+#### 但必须承认：没复现出用户的 `ArgumentError`
+
+穷举了八种 URL 形态（末尾斜杠 / 无协议头 / 前后空格 / 重复 `/v1` / 大写协议头 /
+含换行 / 中文冒号），**没有一种能产生 `ArgumentError`**。所以"大写协议头"
+只是**最合理的猜测，不是结论**。
+
+#### 第三步：与其继续猜，不如让异常自己说话
+
+这是本轮真正的产出。传输层把**脱敏后的原始异常详情**附到提示后面：
+
+```dart
+lastError = '${describeTransportError(e)}'
+    '｜详情：${safeErrorDetail(e)}'
+    '｜URL：${redactUrlForLog(url)}';
+```
+
+**脱敏不是可选项**——异常原文常常带完整 URL（`?token=xxx` 形态，我们自己的接入
+说明就是这么教的），直接显示等于把凭证抄进 UI。三层处理：
+
+1. `sk-***` / `Bearer ***` / `?token=***&api_key=***` 正则打码；
+2. URL 只留 `scheme://host/path`，**丢掉 query 与 fragment**；
+3. 折叠空白 + 截断 160 字（换行会把 UI 撑开）。
+
+**通用教训**：
+- **"复现不了"不代表"没法修"**。修不了根因，就先把**观测能力**补上——
+  让下一次报错自带定位信息，比再猜三轮强。
+- **诊断信息与泄漏面天然冲突，但可以两全**：先脱敏、再截断，而不是
+  "为了安全什么都别显示"。
+- 真机专属问题，**先做"能一次排除一整类原因"的检验**（这里是 openssl 看证书链 +
+  浏览器直连），别一上来就读代码。四条证据把"网络/证书"整类排除掉，
+  剩下的才是真该查的。
+- **穷举探针比读代码快**：写 20 行脚本把边界值全喂一遍，比盯着
+  `HttpClient` 源码猜哪个分支抛什么，效率高一个量级。
+
+---
+
+### Bug 623 · 「测试连接」必失败的真因是 **latin1 编码**，而 Bug 622 的结论是错的（2026-09-26，alpha.88）
+
+> ⚠️ **先读这条**：Bug 622 里我把 `ArgumentError` 归到"URL 协议头不合法"，
+> 并给用户写了句「多见于网络中间设备改写连接；可先试切换 Wi-Fi / 关代理后重试」。
+> **那是一句我编的、技术上站不住的话**，用户照做只会白折腾。本条是更正。
+
+#### 用户带着截图回来，一切就清楚了
+
+```
+失败：请求参数在传输层被拒（多见于网络中间设备改写连接；可先试切换 Wi-Fi / 关代理后重试）
+｜详情：Invalid argument (string): Contains invalid characters.:
+  "{\"model\":\"gpt-4o-mini\", \"messages\":[{\"role\":\"system\",
+   \"content\":\"你是嵌在手机 IDE 里的代码补全体。只输出要补写的… 
+｜URL：https://api.deepseek.com/v1/chat/completions
+```
+
+`{\"model\":\"gpt-4o-mini\"...` 是个 **JSON 请求体**。而这个报错的 `(string)`
+是 `ArgumentError.value()` 的 `name` 参数——全 Dart SDK 里只有两处这么写，
+其中一处就在 `lib/convert/ascii.dart`：
+
+```dart
+// lib/convert/ascii.dart:92  _UnicodeSubsetEncoder.convert()
+if ((codeUnit & ~_subsetMask) != 0) {
+  throw ArgumentError.value(string, "string", "Contains invalid characters.");
+}
+```
+
+**`latin1.encode(含中文的字符串)` 就是它。**
+
+#### 真凶：`HttpClientRequest` 的默认编码是 latin1
+
+```dart
+// dart:io http_impl.dart:1191  （旧版写法，新版同逻辑）
+Encoding get encoding {
+  var contentType = headers.contentType;
+  if (contentType != null && contentType.charset != null) {
+    charset = contentType.charset!;
+  } else {
+    charset = "iso-8859-1";        // ← content-type 没 charset 就回落 latin1
+  }
+  return Encoding.getByName(charset) ?? latin1;
+}
+
+void write(Object? obj) {
+  if (!_encodingSet) {
+    _encoding = encoding;          // ← 第一次 write 就把编码定死
+    _encodingSet = true;
+  }
+  super.write(obj);                // → latin1.encode(obj)
+}
+```
+
+我们的代码（错误版）：
+
+```dart
+req.headers.contentType = ContentType.json;  // "application/json"，无 charset
+req.write(body);                             // body 含中文 → latin1.encode → 💥
+```
+
+而 `body` 里的 system prompt 是**全中文**的（"你是嵌在手机 IDE 里的代码补全体…"），
+所以**只要点「测试连接」就必炸，和模型名、地址、密钥都无关**。
+
+#### 修复（三处顺序都有讲究）
+
+```dart
+headers.forEach((k, v) => req.headers.set(k, v));   // ① 先灌 headers
+req.headers.contentType =                           // ② 再覆盖成带 charset 的
+    ContentType('application', 'json', charset: 'utf-8');
+req.add(utf8.encode(body));                         // ③ 最后写字节
+```
+
+- **① 必须在 ② 之前**：`headers` 映射里有 `'Content-Type': 'application/json'`，
+  走 `headers.set` 是**同名覆盖**——写在 ② 之后会把 charset 冲掉，声明白写。
+- **③ 必须是 `add(bytes)`，不能是 `write(String)`**：`add` 收字节，**压根不经过
+  encoding getter**，这才是真正兜住的那行。charset 声明只是让对端知道怎么解。
+- **③ 必须在 ② 之后**：`add()` 调用后 headers 变为 **immutable**，再设任何
+  header 会抛 `HttpException: HTTP headers are not mutable`（实测，被新测试当场抓出）。
+
+#### 为什么五百行测试全绿却漏了它
+
+`test/ai_llm_client_test.dart` 原有 495 行，**`IoLlmTransport` 一次都没被测过**——
+全部走 `FakeLlmTransport`（直接返回预设响应）。**那条最容易写错、最脆弱的
+真实发送路径，恰好一行都没覆盖。**
+
+修法是加一组**真实 `HttpServer` echo 测试**：
+
+```dart
+server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+server.listen((req) async {
+  final bytes = <int>[];
+  await for (final chunk in req) { bytes.addAll(chunk); }
+  gotBody = utf8.decode(bytes, allowMalformed: true);
+  ...
+});
+```
+
+断言服务端收到的 body 与发出的**逐字节一致**、含中文字符串完整、
+字节长度 == `utf8.encode(body).length`、`content-type` 含 `utf-8`。
+
+**验证方式（重要）**：先把修复临时回退成旧写法，确认测试**变红**并复现出
+与用户截图**一字不差**的报错；再恢复修复确认变绿。**没有"先看到它红过"的
+回归测试不算回归测试。**
+
+```
+回退后：Actual: <-3>
+  lastError=编码错误：…｜详情：Invalid argument (string): Contains invalid
+  characters.: "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",
+  \"content\":\"你是嵌在手机 IDE 里的代码补全体。…
+✅ 与真机截图一致
+```
+
+#### 通用教训
+
+- **`catch (e) { 给一句猜的文案 }` 是毒药**。Bug 622 我专门写过这条，
+  自己转头又犯：`ArgumentError` 的兜底文案"多见于网络中间设备改写连接"
+  纯属虚构，把用户引向关代理 / 换 Wi-Fi。**认不出就认不出，把原文给出来。**
+- **异常 message 里有数据、没有调用点**。真机截图那条 message 只告诉我们
+  "某个含中文的字符串被拒"，判不出**是谁**编的码。所以 alpha.88 一并
+  `catch (e, st)`，从堆栈里摘 `package:` 帧附在详情后面——
+  **定位信息在堆栈里，不在 message 里**。
+- **`req.write()` + 中文 = 定时炸弹**。任何发给服务端的字符串，只要可能含
+  非 ASCII，就必须 `add(utf8.encode(...))`。这条对 `dart:io` 的所有
+  `IOSink` 子类都成立。
+- **手工复刻的"同款校验"会漏规则**。测试里的 `_FakeSettableHeaders` 是
+  照 `HttpHeaders.set` 的判据手写的，它复刻的只是我**以为**的规则。
+  凡是"编码 / 序列化 / 协议细节"，**至少留一个走真实实现的用例**。
+- **断言会固化错误结论**。Bug 622 的旧测试写的是
+  `expect(d, contains('网络中间设备'))` —— 它把我的错误文案钉死成"期望行为"，
+  于是真因查明后它反而成了阻力。**改文案时先问：这个断言是在保护什么？**
+  这里保护的是"别只报类型名"，不是"必须提网络"。
+
+---
+
+### Bug 632 · `CodeController.value=` 在"整体替换文本"时越界崩溃（vendored 包，alpha.91 才暴露）
+
+#### 症状
+
+```
+RangeError (index): Invalid value: Not in inclusive range 0..28: -1
+
+#1  CodeController.value= (third_party/code_text_field/.../code_controller.dart:165)
+#2  CodeEditorState.reset   (lib/editor/code_editor.dart:510)
+#3  EditorPageState._applyDiskContent (lib/editor/editor_page.dart:1144)
+```
+
+注意第 2 帧：是 `reset()`—— 也就是**"把整份内容换成另一份"**这个操作。
+
+#### 根因（vendored 包的启发式误判）
+
+```dart
+// third_party/code_text_field/lib/src/code_field/code_controller.dart
+int? _insertedLoc(String a, String b) {
+  final sel = selection;
+
+  if (a.length + 1 != b.length || sel.start != sel.end) {
+    return null;      // ← 判据：新文本比旧文本长 1 = "插入了一个字符"
+  }
+
+  return sel.start;
+}
+
+@override
+set value(TextEditingValue newValue) {
+  final loc = _insertedLoc(text, newValue.text);
+
+  if (loc != null) {
+    final char = newValue.text[loc];   // ← :165 越界崩在这
+    ...
+```
+
+`_insertedLoc` 是为**自动闭合括号**这类 modifier 服务的：它用
+"`新文本.length == 旧文本.length + 1`" 这个启发式来判断"用户敲进了一个
+字符"。这个判据对逐字符输入是对的。
+
+但 `reset()` 做的是**整体替换**：
+
+```dart
+_controller.value = TextEditingValue(
+  text: content,                                       // 全新的整份内容
+  selection: TextSelection.collapsed(offset: content.length),
+  composing: TextRange.empty,
+);
+```
+
+此时：
+- `text`（控制器里的旧文本）与 `newValue.text`（新的整份内容）
+  **内容毫无关系**，但**长度可能恰好差 1**；
+- `_insertedLoc` 比较时用的 `selection` 是 `this.selection`，即
+  **替换之前**的旧选区（不是 `newValue.selection`）；
+- 于是它返回一个基于**旧文本**的 `sel.start`，拿这个索引去读
+  **新文本** → 越界。
+
+实测触发：编辑器里 29 字符的文件，被外部改成 28 字符 →
+自动同步调 `reset()` → 崩。
+
+#### 为什么 alpha.91 才暴露
+
+`reset()` 一直存在（Bug 218 的撤销更改就用它），但**以前没什么人用**：
+
+| 触发路径 | 内容长度差恰好为 1 的概率 |
+|---|---|
+| 手动「撤销更改」 | 低（用户不太会点，且长度常差很多） |
+| 「从磁盘重新载入」 | 低（同上） |
+| **alpha.91 自动同步** | **高**——外部 AI 每改一行就可能差 1，且这操作会**频繁自动发生** |
+
+新功能不是"制造了 bug"，而是**把一条从没被走到的代码路径走热了**。
+
+#### 修复（patch vendored 包）
+
+```dart
+set value(TextEditingValue newValue) {
+  final loc = _insertedLoc(text, newValue.text);
+
+  // ⚠️ FOA patch (alpha.91)：夹住索引。整体替换时 _insertedLoc 的
+  // 启发式会误判，且它返回的偏移是基于旧文本的。
+  if (loc != null && loc >= 0 && loc < newValue.text.length) {
+    final char = newValue.text[loc];
+    ...
+  }
+  super.value = newValue;
+}
+```
+
+越界时**跳过 modifier 逻辑**直接赋值 —— 整体替换本来也不该触发
+"插入一个字符"的语义，跳过是对的，不是妥协。
+
+#### 教训
+
+**vendored 的第三方代码里可能藏着"只有在特定输入模式下才暴露"的崩溃。**
+这类问题的特征是：第一次走那条路就炸，但在此之前没人走过。
+新功能上线前，值得问一句："**我这条新路径，以前有没有人走过？**"
+没有的话，它很可能是第一个踩到某个陈年坑的。
+
+（本条属于 vendored 包，升级上游时**记得重新打这个 patch**。
+文件头 `third_party/code_text_field/` 里搜 `FOA patch` 可定位全部改动。）
+
+---
+
+### Bug 631 · `setMethodCallHandler` 每通道只有一个，后者**静默**顶掉前者（2026-09-26，alpha.91）
+
+#### 症状
+
+用户点构建完成的通知，**什么都不发生**。没有崩溃、没有异常、没有日志。
+`navigate` 这个反向调用就像从来没注册过一样。
+
+与此同时另一个功能也不灵了（或者反过来，只有另一个灵）。
+
+#### 根因
+
+`MethodChannel.setMethodCallHandler` 在 Dart 侧**每个通道只能有一个
+handler，后注册的直接覆盖前一个**——注意是覆盖，不是"两个都收到"。
+
+本项目此前只有 `lib/toolchain/build_notify.dart` 一处注册：
+
+```dart
+// build_notify.dart（alpha.91 之前）
+static void ensureHandler() {
+  if (_hooked) return;
+  _hooked = true;
+  _channel.setMethodCallHandler((call) async {
+    if (call.method == 'navigate') onNavigate?.call();
+  });
+}
+```
+
+这个写法能工作，靠的是一句**注释里的侥幸**：
+
+> 注意：dev.foa/proot 通道原生侧只 invoke 过 `navigate` 一个反向方法，
+> 在此 setMethodCallHandler 不会劫持 Dart → Native 的正常调用。
+
+它成立的前提是"永远只有这一个文件注册"。alpha.91 要加 `fsChange`
+（文件变更推送），如果在新文件里再写一次 `setMethodCallHandler`：
+
+- 新代码后注册 → **`navigate` 失效**（点通知没反应）
+- `BuildNotify` 后注册 → **`fsChange` 失效**（自动同步收不到事件）
+
+两种都不崩溃，都只是"功能没做"。这类 bug 极难查，因为没有任何线索
+指向"注册被顶掉了"。
+
+#### 为什么编译期完全无警告
+
+两个 handler 都是合法的 `setMethodCallHandler` 调用，类型也对。
+"只能有一个"是**运行时语义**，不是类型系统约束。Kotlin 那边
+invoke 一个 Dart 未注册的方法同样是**静默丢弃**，不报错。
+
+也就是说：**反向方法名是一个无任何编译期保护的全局命名空间**。
+
+#### 修复
+
+建立一个**唯一分发器** + **登记制** + **启动期自检**：
+
+`lib/events/native_events.dart`（新建）：
+
+```dart
+class NativeEvents {
+  static const String kNavigateMethod = 'navigate';
+  static const String kFsChangeMethod = 'fsChange';
+
+  /// 反向方法名 → 说明。**新增反向方法必须登记在这里**。
+  static const Map<String, String> _reverseMethods = {
+    kNavigateMethod: '用户点通知 → 回最近启动的前台任务页',
+    kFsChangeMethod: '被监听文件发生变更（参数 {path, seq}）',
+  };
+
+  static void Function(String path)? onFsChange;
+
+  /// 开发期自检：反向名不得与正向名重合。
+  static void assertNoCollision() { ... }
+
+  /// ⚠️ 全项目**只有这里**可以调 setMethodCallHandler。
+  static void ensureHandler() { ... }
+}
+```
+
+配套改动：
+- `build_notify.dart` 移除自己的 `setMethodCallHandler`，改为**转调**
+  `NativeEvents.ensureHandler()`（保留旧入口作兼容，标 `@Deprecated`）；
+- `main.dart` 改调 `NativeEvents.ensureHandler()`；
+- 新增反向方法只需在 `_reverseMethods` 登记 + 加一个 `case`。
+
+#### 防复发：源码扫描断言
+
+`test/native_events_test.dart`：
+
+```dart
+test('扫描全 lib/：只有 native_events.dart 真的注册反向 handler', () {
+  final offenders = <String>[];
+  for (final f in libFiles()) {
+    if (f.path.endsWith('events/native_events.dart')) continue;
+    if (stripComments(f.readAsStringSync()).contains('setMethodCallHandler')) {
+      offenders.add(f.path);
+    }
+  }
+  expect(offenders, isEmpty, reason: '...');
+});
+```
+
+#### ⚠️ 踩坑：源码扫描必须先剥注释
+
+我第一版直接对整份文件做文本匹配，结果**三条断言里两条红**——
+红的不是代码，是**注释**：新写的说明性注释里出现了
+"不要再写一次 `setMethodCallHandler`"这句话，被扫描当成了真实调用。
+
+修法是先 `stripComments` 再匹配：
+
+```dart
+String stripComments(String s) {
+  s = s.replaceAll(RegExp(r'/\*[\s\S]*?\*/'), '');  // 块注释
+  s = s.replaceAll(RegExp(r'//[^\n]*'), '');        // 行注释
+  return s;
+}
+```
+
+顺序不能反（先剥块注释再剥行注释），否则字符串字面量里的 `//`
+会被当成注释起点，切掉半行代码。
+
+**教训：源码扫描断言守的是"代码里有没有"，那么先要把"注释里有没有"
+排除掉。**否则你会在注释里写什么、测试就红什么——包括你写的
+"别这么写"的提醒。
+
+---
+
+### Bug 630 · 反向方法名两边对不上 → **静默丢弃**，Dart 永远等一个不来的事件（2026-09-26，alpha.91）
+
+#### 症状
+
+自动同步功能"没有反应"。没有报错、没有异常，编辑器就是**不更新**。
+
+#### 根因
+
+反向调用是两个**独立字符串**在跨语言握手：
+
+```kotlin
+// Kotlin 侧
+dartChannel?.invokeMethod("fsChange", mapOf("path" to guest, ...))
+```
+
+```dart
+// Dart 侧
+case kFsChangeMethod:   // == 'fsChange'
+```
+
+这两边的字符串**没有任何机制保证一致**。改名一边、或者手滑打错一个
+字母，Kotlin 照样 invoke 成功（引擎返回正常），Dart 侧 `switch` 走到
+`default` 分支，**静默忽略**。
+
+同理，正向方法的**参数 key** 也对不上就静默失败：
+
+```kotlin
+val guest = call.argument<String>("path") ?: ""   // Kotlin 读 "path"
+```
+
+```dart
+_channel.invokeMethod('fsWatchStart', {'filePath': path})  // Dart 发 "filePath"
+```
+
+→ Kotlin 拿到 `null` → `""` → `resolveGuestPath("")` 返回 null →
+`fsWatchStart` 返回 false → **静默降级**（功能"看起来能用"，只是慢）。
+
+#### 为什么难查
+
+整条链路上没有任何一处会报错。你只能观察到"功能没生效"，而错误信息
+是空的。
+
+#### 修复（项目惯例：Kotlin 零测试，用源码扫描代替）
+
+```dart
+test('Kotlin 侧确实存在这两个反向方法的 invoke 点（源码扫描）', () {
+  final kt = src('android/.../MainActivity.kt');
+  for (final name in [NativeEvents.kNavigateMethod, NativeEvents.kFsChangeMethod]) {
+    expect(kt, contains('invokeMethod'));
+    expect(kt, contains('"$name"'));
+  }
+});
+
+test('两边的参数 key 一致：path（不是 filePath / guestPath）', () {
+  expect(src('android/.../MainActivity.kt'),
+      contains('call.argument<String>("path")'));
+});
+```
+
+**注意断言写法**：不要匹配 `invokeMethod("fsChange"` 这个整串。
+Kotlin 里参数变多后会被格式化换行：
+
+```kotlin
+dartChannel?.invokeMethod(
+    "fsChange",
+    mapOf("path" to guest, ...),
+)
+```
+
+匹配整串就会因为**排版变化**而红——那测的是"怎么换行"，不是
+"有没有这个调用"。拆成"有 `invokeMethod`"+"有 `"fsChange"`"更稳。
+
+---
+
+### Bug 629 · `reloadFromDisk` 里 `setState` 与 `reset` 顺序反了 → 每次重载后**假脏**（2026-09-26，alpha.91）
+
+#### 症状
+
+点「从磁盘重新载入」，内容正确更新了，**但文件名旁边立刻多出一个
+未保存小圆点**。
+
+危害不只是难看：
+
+1. 用户以为自己在脏状态 → 再点一次保存 → 一次无意义的写盘；
+2. 更糟：`_confirmSaveIfDirty()` 的守卫是 `if (!_dirty) return true;`，
+   于是**切文件时会弹「未保存的修改」对话框**，而其实一个字都没改。
+   这正是"同步完立刻切走"这条最自然的操作路径。
+
+#### 根因
+
+```dart
+// 错（alpha.91 之前）
+setState(() {
+  _content = r.content;
+  _initialContent = r.content;
+  _dirty = false;                 // ← 先置 false
+});
+_editorKey.currentState?.reset(r.content);   // ← 这行又把它顶回 true
+```
+
+`reset()` 内部是 `_controller.value = TextEditingValue(...)`
+（`code_editor.dart:510`），而 `CodeController` 上挂着 `_onChanged`
+（`:245`）→ `widget.onContentChanged(text)` → EditorPage 的：
+
+```dart
+onContentChanged: (t) {
+  _content = t;
+  if (!_dirty) setState(() => _dirty = true);   // :1349
+},
+```
+
+守卫 `!_dirty` —— 此刻 `_dirty` 刚被置成 false，**守卫恰好通过**，
+于是又变成 true。
+
+#### 修复
+
+对齐同文件里 `_rollbackAi()`（`:1155`）的正确写法：**先 reset 再覆写**。
+
+```dart
+_editorKey.currentState?.reset(r.content);   // ① 先 reset（会让 _dirty 变 true）
+setState(() {                                 // ② 再显式覆写钉死
+  _content = r.content;
+  _initialContent = r.content;
+  _dirty = false;
+});
+```
+
+让"复位引发的副作用"先发生，再用显式赋值把最终状态定下来。
+
+#### 这条规则统一适用于三处
+
+| 方法 | 顺序 | 说明 |
+|---|---|---|
+| `_rollbackAi()` | 先 reset | 一直都是对的 |
+| `reloadFromDisk()` | 先 reset | alpha.91 修正 |
+| `_applyDiskContent()` | 先 reset | alpha.91 新增（自动同步） |
+
+#### 回归测试必须**先看它红**
+
+`test/editor_reload_dirty_test.dart` 写了三条，全部走过"先红后绿"：
+
+```
+（修复前）
+重载后不应残留未保存标记 ............ [E]  Found 1 widget（绿点还在）
+重载后能干净地切走文件 .............. [E]  Found 1 widget text "未保存的修改"
+重载后内容确实换成了磁盘上的版本 .... ✓（这条本来就该过，用来证明测试是有针对性的）
+```
+
+第三条特意保留：它证明"测试不是在无差别地失败"，而是**精确指向
+状态标记这一个问题**。
+
+---
+
+### Bug 627 · Gradle 报 `Cannot access output property 'outputDir'` / `Failed to create MD5 hash`（2026-09-26，alpha.89）
+
+#### 症状
+
+```
+> Cannot access output property 'outputDir' of task ':app:mergeReleaseJniLibFolders'.
+  Accessing unreadable inputs or outputs is not supported.
+> Failed to create MD5 hash for file:
+  .../merged_jni_libs/release/mergeReleaseJniLibFolders/out/arm64-v8a/libapp.so
+BUILD FAILED in 55s
+```
+
+#### 关键判断：这不是代码问题，别再查代码
+
+出现这条时的**先行检验**：
+
+| 检查 | 结果 |
+|---|---|
+| 门禁（`flutter analyze` + 全量测试） | **已经全绿**（1419 条） |
+| 报错文件是否存在、是否可读 | **存在、`-rw-r--r--` 可读** |
+
+两条都正常，说明**不是我们的代码**——是 Gradle 的**增量构建状态**与残留
+中间产物不一致。Gradle 9.3.1 在算 `mergeReleaseJniLibFolders` 产物的 MD5 时，
+那个文件正好处于"刚被写入 / 时间戳被刷新"的状态。
+
+#### 解法（**顺序很重要**）
+
+```bash
+# 第一步：停掉 Gradle / Kotlin daemon（必须！）
+bash tools/mem_check.sh --clean
+
+# 第二步：删中间产物（daemon 停了之后删才有效）
+rm -rf app/build/app/intermediates/merged_jni_libs
+```
+
+重建即通过。
+
+> ### ⚠️ alpha.90 实测更正：只删目录是**不够**的
+>
+> alpha.90 出包时这条**连撞两次**：
+>
+> | 尝试 | 做法 | 结果 |
+> |---|---|---|
+> | 第一次 | 只 `rm -rf merged_jni_libs app/android/.gradle` | **5 秒就再挂**（比原来还快） |
+> | 第二次 | **先 `mem_check.sh --clean` 停 daemon**，再删目录 | ✅ 一次通过 |
+>
+> **原因**：Gradle daemon 还活着时，它进程里持有 stale 的 task 状态和
+> 文件句柄。**你删了磁盘上的文件，daemon 并不知情**，下一次构建它按自己的
+> 内存状态认为"这个产物还在"，于是又去算那个已经不完整的文件的 MD5。
+> **光删磁盘文件没用，必须先让 daemon 忘掉。**
+>
+> #### 真身：内存压力下写出的**半截文件**
+>
+> alpha.90 实测数据：
+> - 构建**还没开始**，cgroup 已用 **6.78G / 8G**（GradleDaemon 2.9G +
+>   KotlinCompileDaemon 1.1G + others）；
+> - `mem_check.sh --clean` 后降到 **2.59G**。
+>
+> `mergeReleaseJniLibFolders` 要把 Flutter 编出的 AOT `libapp.so`
+> （约 14.5 MB）**合并进中间产物目录**。构建期内存已经吃了 4G+，
+> 这次写入**被中途掐断，留下一个不完整的文件**。
+> 下一次构建算它的 MD5 → 炸。
+>
+> **所以这不是"时间戳正好在变"，是文件本身是残缺的。**
+> 内存紧张 → 写入中断 → 残缺文件 → MD5 失败，是一条完整因果链。
+>
+> #### 修正后的判断顺序
+>
+> ```
+> ① 门禁是不是绿的？               → 是 → 不是代码问题
+> ② cgroup 内存用了多少？           → 偏高 → 先 mem_check.sh --clean
+> ③ daemon 停了吗？                 → 没停 → 删文件是白删
+> ④ 删中间产物 → 重建
+> ```
+>
+> ⚠️ **不要做的事**：不要加 `--stacktrace` / `--info` 深挖，不要改
+> `android/gradle.properties`，不要动 `abiFilters`。这是**状态 + 资源问题，
+> 不是逻辑问题**，而报错文案（"Accessing unreadable inputs or outputs"）
+> 很容易让人误以为是权限或配置问题。
+
+> ### ⚠️⚠️ alpha.94 实测**再更正**：不是半截文件，`sync` 也不够
+>
+> alpha.94 出包时这条**第三次出现**，而且照着上面那套做（停 daemon → 删目录
+> → sync → 重建）**仍然原样复挂**。重新取证：
+>
+> | 检验 | 实测结果 |
+> |---|---|
+> | `stat` 文件大小 | 14,870,416 字节，**完整**（不是半截） |
+> | `md5sum` | `Input/output error` |
+> | `dd` 读 | **0 字节** |
+> | 上游 `merged_native_libs/…/libapp.so` | **能读**，md5 `ddf307cb…` |
+> | `generated/jniLibs/…/libapp.so` | **能读**，md5 同上 |
+> | **等 20 秒后**再 `md5sum` 那个报错的文件 | **成功，且 md5 与上游完全一致** |
+>
+> 结论三条，逐条推翻前面的旧说法：
+>
+> 1. **文件是完好的**（与上游逐字节一致），"半截文件"这个诊断错了；
+> 2. **真身是"刚 copy 出来的那份立刻读会 IO error"**——Gradle 的
+>    `mergeReleaseJniLibFolders` 是 copy 完**马上**给输出算 MD5，
+>    正好撞在这个窗口里；
+> 3. **`sync` 不保证返回时脏页已落盘**。alpha.92/93 那两次"sync 后就好了"
+>    是碰巧（sync 自己耗掉的那几秒刚好够）。
+>
+> #### 试过的两条**无效**方案（别再走一遍）
+>
+> | 方案 | 结果 |
+> |---|---|
+> | 清完目录后**写个 8MB 探针文件、反复 sync + 等到能读** | 探针**第 1 轮（2s）就通过**，但构建照样挂 → 说明不是"系统整体没落盘"，是这个 task 自己的窗口 |
+> | `doNotTrackState()`（Gradle 报错文案里建议的那条） | **`Changes are not tracked, unable determine incremental changes.`** —— 该 task 是增量的，关掉状态跟踪它自己就没法工作了 |
+>
+> #### 采用的解法：在 task 的 `doLast` 里**读到能读为止**
+>
+> `doLast` 正好落在"copy 完 ↔ Gradle 做输出快照"之间，所以在这里自己
+> 把输出文件读一遍，读不动就等 1s 重试（最多 30s），即可绕过去：
+>
+> ```kotlin
+> // app/android/app/build.gradle.kts
+> tasks.configureEach {
+>     if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
+>         doLast {
+>             val deadline = System.currentTimeMillis() + 30_000
+>             while (System.currentTimeMillis() < deadline) {
+>                 try {
+>                     val stack = mutableListOf<File>()
+>                     outputs.files.files.forEach { stack.add(it) }
+>                     while (stack.isNotEmpty()) {
+>                         val f = stack.removeAt(stack.lastIndex)
+>                         if (f.isDirectory) f.listFiles()?.forEach { stack.add(it) }
+>                         else f.inputStream().use { s -> s.read(ByteArray(8192)) }
+>                     }
+>                     return@doLast
+>                 } catch (e: java.io.IOException) { Thread.sleep(1000) }
+>             }
+>         }
+>     }
+> }
+> ```
+>
+> 两个写法上的坑（都是编译期才炸，且报错指向别处）：
+> - **别写 `java.util.ArrayDeque`** —— 脚本里 `java` 是 `JavaPluginExtension`
+>   的属性名，会被遮蔽成 `Unresolved reference 'util'`；
+> - **别用 `FileTree.visit { }`** —— Kotlin DSL 里这个重载的 lambda 参数
+>   解析不出来（`Unresolved reference 'it'`），用显式栈遍历替代。
+>
+> ⚠️ 这条**只加在 FOA 自己的出包工程**，**不要抄进给用户工程用的 Flutter
+> 模板**：这是本沙箱 overlayfs 的现象，手机上是真实 ext4/f2fs，
+> 用户的构建脚本该保持干净。
+
+#### 通用教训
+
+- **构建报错先做"是不是我的代码"二分**：门禁全绿 + 报错指向的文件本身正常
+  → 优先怀疑构建缓存/状态，而不是改源码。
+- **"上次这么做就好了"不等于根因找到了**。这条 bug 三次归因三次被推翻
+  （时间戳 → 半截文件 → 落盘慢 → 实际是 copy 后立即 hash 的窗口），
+  每次都"当时能复现当时能解决"。记结论时**必须写清当时实测了什么**，
+  否则下一个人（很可能就是你自己）会照着错的方法再试一遍。
+- **增量构建状态会腐坏**。同一个仓库反复构建、构建被中断、并发跑测试与构建，
+  都可能留下不一致的中间态。**"清掉中间产物重建"是最廉价的第一手尝试**，
+  比读 Gradle 文档快得多。
+- **但"清"的前提是"停"**。daemon 持有状态时，磁盘清理是无效动作——
+  第一次 5 秒复挂就是这个原因。**先停进程，再清磁盘。**
+- **内存是这类"玄学构建失败"的常见上游**。cgroup 6.78G/8G 时出各种
+  写文件失败的怪报错，别只盯着文件系统和 Gradle 版本。
+- 报错里带 `libapp.so` 会让人以为 Dart 侧出了问题。**看任务名**
+  （`mergeReleaseJniLibFolders`）就知道是**合并 JNI 库**这一步，与 Dart 无关。
+
+> ### ⚠️ alpha.92 / alpha.93 实测更正：「半截文件」这个真身判断是**错的**
+>
+> 上面那段"内存压力下写出半截文件"的结论，被 alpha.92 的直接测量推翻：
+>
+> | 检查 | alpha.92 实测结果 |
+> |---|---|
+> | `ls -l` 文件大小 | **14,774,568 字节，完整** |
+> | `dd` 分块读（9 块） | **全部读成功**（我第一版脚本误报 IO ERROR，是 `count=1` 没读满导致非零退出 + 我把 stderr 也吞了） |
+> | `md5sum` | **成功**（`sync` 之前失败、之后成功） |
+> | `stat` | 正常 |
+>
+> 真因是 **overlayfs 脏页没落盘**：`cp` 写完文件后**立刻**去读会返回
+> `Input/output error`，Gradle 这时正好来算 MD5，就撞在这个瞬时 IO error 上。
+> `sync` 之后立刻恢复正常——**文件从头到尾都是好的**。
+>
+> 因果链修正为：
+>
+> ```
+> 内存紧张 → 构建被掐断（真）
+>   └→ 但报错的直接原因是：刚写完的文件脏页未落盘 → 读它得到 IO error（真）
+>       而不是：文件被写了一半（假）
+> ```
+>
+> **处置顺序因此必须加一步**（已改进 `tools/release.sh`）：
+>
+> ```bash
+> bash tools/mem_check.sh --clean                                  # 1 停 daemon
+> rm -rf app/build/app/intermediates/merged_jni_libs app/android/.gradle  # 2 清产物
+> sync                                                              # 3 落盘（缺它就必然复挂）
+> ```
+>
+> alpha.93 出包实测：脚本里只有 1+2（没有 `sync`）→ 自动重试**原地复挂**；
+> 手工补 `sync` 后一次通过。**同一个坑两次踩在同一步**。
+>
+> 教训：**"文件读不了"和"文件内容坏"是两件事**。前者可能是 page cache /
+> 文件系统状态问题，用 `sync` 就能验证；直接按后者处理（删文件重编）会
+> 让人得出错误的因果解释，并写出一个**永远重试不成功**的兜底分支。
+
+> #### ⚠️⚠️⚠️ alpha.96 第三次更正：`doLast` 也不够，要 `doFirst` + `doLast`
+>
+> alpha.94 加的 `doLast` 等待（读到能读为止，最多 30s）在 alpha.95 出包时
+> **有效**，但 alpha.96 出包时**又挂了**，而且**报错变了**：
+>
+> ```text
+> > Cannot access output property 'outputDir' of task
+> >   ':app:mergeReleaseJniLibFolders'. Accessing unreadable inputs or
+> >   outputs is not supported.
+> > Failed to create MD5 hash for file: .../libapp.so
+> ```
+>
+> **关键在措辞**：报错的是"访问 `outputDir` **这个动作**"失败了，
+> 不是某个具体文件读不了。说明：
+>
+> ```text
+> doLast 执行  →  我读通了（这是 alpha.94 保证的）
+>      ↓  Gradle 做输出快照
+> 再读一次 outputDir  →  又撞进 IO error 窗口   ← 这里挂的
+> ```
+>
+> 也就是 **`doLast` 只保证"我读的时候可读"，保证不了"Gradle 读的时候可读"**。
+> 中间隔着一个快照阶段，时间窗又拉开了。**两次生效不代表根因找到了。**
+>
+> **alpha.96 的解法：两段 hook 组合**
+>
+> ```kotlin
+> fun bug627WaitReadable(files: Iterable<File>, label: String, maxMs: Long) { … }
+>
+> tasks.configureEach {
+>     if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
+>         doFirst { bug627WaitReadable(outputs.files.files, "pre", 15_000) }   // ① 消掉上一轮残留
+>         doLast  { bug627WaitReadable(outputs.files.files, "post", 60_000) }  // ② 等新产物
+>     }
+> }
+> ```
+>
+> - `doFirst`：copy **之前**先把上一轮残留的不可读窗口消掉；
+> - `doLast`：copy **之后**读到可读为止（30s → **60s**，多留余量）；
+> - 两段都读 `outputs.files.files`，覆盖 Gradle 的两条访问路径。
+>
+> alpha.96 出包实测：**一次通过**，六项验证全过。
+>
+> **还是那条元教训**（本次是它的第三次应验）：
+>
+> > **"上次这么做就好了" ≠ "根因找到了"。**
+>
+> 三次记录分别推翻了前一次的结论：
+> "半截文件"（错）→ "sync 就好"（不完整）→ "doLast 就好"（不完整）。
+> 每次都是在**同一个报错的不同措辞**里藏着新信息，而前一次的成功
+> 会让人停止追问。
+
+---
+
+### Bug 628 · "别的程序可以不填模型名然后自己选" —— 我把发现成本推给了用户（2026-09-26，alpha.90）
+
+#### 症状
+
+alpha.89 交付后，用户在面板上点了「测试连接」，得到的提示是：
+
+> 还没选模型。请查阅服务商文档确认模型名后填入（**我们无法替你猜**）
+
+用户的反应：
+
+> 我看别的有的程序不是可以不填模型名然后自己选择模型吗？
+
+**这一问没有技术难点，纯粹是设计失职。** 上一版的"留空就拦下"不是解决问题，
+是**把本该由程序承担的发现成本原样推给了用户**。用户被叫去"查文档"，
+而同类产品是**点一下按钮，模型列表就出来了**。
+
+#### 原因
+
+**没有实现 `GET /models`。**
+
+OpenAI 兼容接口都提供：
+
+```
+GET {baseUrl}/models
+→ {"object":"list","data":[{"id":"deepseek-v4-flash",...},{"id":"deepseek-v4-pro",...}]}
+```
+
+这个端点有两个好处：
+
+1. **它就是一份权威清单**，不需要用户去翻文档、不需要我硬编码任何模型名
+   （硬编码的模型名会过期 —— Bug 626 的 `deepseek-chat` 就是这么挂的）。
+2. **拉得到列表 = 地址对 + 密钥对**。它**本身即一次连通性 + 密钥校验**，
+   而且比"发一条真请求去试"代价低、失败原因更干净
+   （拉不到就是拉不到，不会扯上模型名、上下文长度等一堆变量）。
+
+#### 解决
+
+**`llm_client.dart`**
+
+| 新增 | 作用 |
+|---|---|
+| `LlmTransport.get` | 接口加一个方法；`IoLlmTransport` 与 `FakeLlmTransport` 同步实现 |
+| `IoLlmTransport._send(url, headers, body?)` | `post`/`get` 共用；`body == null` 即走 GET |
+| `parseModelIds` | 兼容 `data` / `models` / 裸数组；元素支持 `id` / `name` / `model`；**去重 + 排序** |
+| `modelsEndpoint` | `/chat/completions` 结尾先砍再拼 `/models`；`/v1` 保留 |
+| `ModelListResult` + `fetchModels` | 把"HTTP 状态 / 错误原因 / 模型 id 列表"打包返回 |
+
+**`ai_takeover_panel.dart`**
+
+- 新增 `_loadingModels` / `_models` / `_modelsError` 三态。
+- 模型名那行改成 `Row`：输入框 + **「获取模型」按钮**。
+- 拉到列表后，下方 `Wrap` 铺开可点选的 `_modelChip`，**点一下即填入**。
+- 若当前填的模型不在列表里 →
+  `当前填的「$cur」不在该接口的可用列表里，建议换一个`。
+- 留空文案改为：
+  > 还没选模型。点「获取模型」从接口拉回可用列表再点一个即可（不用自己查文档）
+
+#### 顺带修掉的一个测试坑（Bug 625 的同一家族）
+
+`FakeLlmTransport` 原先直接持有调用方传进来的 `responses` 列表。
+为消 `prefer_const_constructors` 给构造参数加 `const` 之后，
+调用方传的是 `const [...]`，后续 `removeAt` 直接抛：
+
+```
+Unsupported operation: Cannot remove from an unmodifiable list
+```
+
+**解法**：构造时 `List.of()` 复制一份，**永远不持有调用方的容器引用**。
+顺手加 2 条回归测试钉住这个行为。
+
+#### 教训
+
+> **"无法替你猜"是程序在把自己的活儿外包给用户。**
+> 凡是"需要用户去查文档才能填对"的输入框，先问一句：
+> **这个值，接口自己有没有提供列表？** 有就把它拉下来让用户点。
+
+这跟 Bug 626 是同一个病根的两面：那次是**硬编码了一个会过期的模型名**，
+这次是**干脆不填、让用户自己查**。两头都不对——
+**唯一正确的来源是接口本身**。
+
+**出现版本**：alpha.89
+**修复版本**：alpha.90
+
+---
+
+### Bug 626 · `deepseek-chat` 已于 2026-07-24 弃用，调用返回 **HTTP 400**（2026-09-26，alpha.89）
+
+#### 症状链
+
+Bug 623（latin1 编码）修好之后，真机错误从 `ArgumentError` 变成：
+
+> 失败：请求失败（HTTP 400）
+
+**编码问题确认解决**（请求真的发出去了、服务端也回话了），但 400 仍然没说为什么。
+
+#### 排查：用探针排掉"URL 形态"与"body 结构"
+
+```
+① /v1/chat/completions        → 401
+② /v1/v1/chat/completions     → 401
+③ /chat/completions           → 401
+④ 根路径 /                     → 401
+⑤ 非法 JSON body              → 401
+⑥ 缺 messages                 → 401
+⑦ messages 空数组              → 401
+```
+
+**七种形态全是 401。** 关键推论：
+
+> DeepSeek 的**鉴权检查优先于格式检查**。用无效 key 时，
+> 无论 body/URL 多离谱都先返回 401，**根本走不到格式校验**。
+
+所以用户拿到 400 只能说明一件事：**他的密钥是有效的**，请求进入了格式校验后被拒。
+这也意味着**用假 key 在沙箱里永远复现不出 400**——必须查文档。
+
+#### 真因：模型别名过期
+
+官方文档（`api-docs.deepseek.com`）：
+
+> **The model names `deepseek-chat` and `deepseek-reasoner` will be deprecated on 2026/07/24.**
+> **Requests to those legacy model names now return HTTP errors.**
+
+| 旧名（已弃用） | 新名 |
+|---|---|
+| `deepseek-chat` | `deepseek-v4-flash` |
+| `deepseek-reasoner` | `deepseek-v4-pro` |
+
+而我们在 UI 上**拿 `deepseek-chat` 当示例占位符**，等于**引导用户填一个必挂的值**。
+这不是用户填错，是**我们的提示误导了他**。
+
+#### 顺带查出的第二个坑：默认模型名写死
+
+```dart
+// ❌ 旧代码
+final model = cfg.model.trim().isEmpty ? 'gpt-4o-mini' : cfg.model.trim();
+```
+
+用户 baseUrl 填 `api.deepseek.com` + 模型名留空 → 拿 `gpt-4o-mini` 去问 DeepSeek
+→ **必然 400**，提示还只有"HTTP 400"。
+
+**"猜一个默认模型"在跨服务商场景下根本不成立**：每家模型名不同，猜错就是必挂。
+改成留空直接拦下并说清楚：
+
+```dart
+if (model.isEmpty) {
+  return const AiOutcome.failure(
+    '没填模型名。各家模型名不同（如 DeepSeek 是 deepseek-v4-flash、'
+    '`deepseek-chat` 已于 2026-07-24 弃用），无法替你猜，请按服务商文档填写',
+    remedy: AiRemedy.configureLlm,
+  );
+}
+```
+
+UI 同步改：`模型名（可留空）` → `模型名（必填）`，占位符
+`deepseek-chat` → `deepseek-v4-flash`。
+
+#### 第三个问题：把服务端写好的原因丢了
+
+`describeHttpError` 的 `default` 分支只返回 `请求失败（HTTP $status）`，
+而 DeepSeek 的 400 响应体里明明写着原因：
+
+```json
+{"error":{"message":"Model Not Exist","type":"invalid_request_error"}}
+```
+
+新增 `errorMessageFromBody()`，从响应体里**只摘 `error.message`**（不整段回显，
+避免账号信息泄漏 + UI 撑爆），摘出的串再过一遍密钥打码——
+DeepSeek 真的会把收到的 key 片段回显在错误里（`Your api key: ****-key is invalid`）。
+
+`describeHttpError` 新增 `serverMessage` 参数，**优先级最高**：
+
+```dart
+if (serverMessage.isNotEmpty) return '服务端拒绝：$serverMessage';
+```
+
+同时给 400 补了诚实版兜底（摘不出原因时才用）：
+
+```
+请求被拒（HTTP 400）：常见原因是模型名不存在、上下文超长，
+或接口地址多/少了一级 /v1
+```
+
+⚠️ 措辞刻意用「常见原因」而非肯定句——Bug 622 就是栽在"编一个确定结论"上。
+
+#### 通用教训
+
+- **第三方 API 的"名称"会过期**。模型名、端点版本、参数名都随时间失效，
+  而**过期后往往报一个语焉不详的状态码**（400 而不是"model not exist"）。
+  占位符 / 示例 / 默认值里写死的第三方标识，都是**定时炸弹**。
+- **鉴权优先级决定了能否用假凭证复现**。发现"怎么试都只返回 401"时，
+  要意识到**格式类错误在这条路径上根本测不到**，该转去查文档而不是继续试。
+- **`default: return '请求失败（HTTP xxx)'` 是信息黑洞**。状态码是给机器看的，
+  服务端的 `error.message` 才是给人看的。**拿到响应体就该摘出来**。
+- **"猜默认值"跨服务商必错**。宁可拦下要求用户填，也不要猜——
+  猜错的代价是用户对着 400 查半天。
+
+
+本轮出包时连踩两个脚本坑，都是"脚本本身有问题，不是环境有问题"。
+
+#### ① `release.sh` 在自动化环境里必然中止
+
+```bash
+bash tools/mem_check.sh || true
+echo
+read -r -p "  内存形势看清了吗？继续构建？[y/N] " _ans
+[[ "${_ans:-N}" =~ ^[Yy]$ ]] || die "已中止（先按上文处置内存问题）"
+```
+
+`read` 是**交互式确认**，本意是"让人看一眼内存再决定"。但在 CI /
+后台任务 / `nohup` 里没有 stdin，`read` 立刻返回非零，`_ans` 为空 →
+`${_ans:-N}` 兜底成 `N` → 直接 `die`。
+
+**症状有迷惑性**：日志最后停在「❌ 已中止（先按上文处置内存问题）」，
+让人以为是内存不够，其实 cgroup 只用了 29%。
+
+**绕过方式**：
+
+```bash
+yes y | bash tools/release.sh      # 持续喂 y
+# 或
+bash tools/release.sh < /dev/null  # 不行！仍然会中止，因为读到 EOF
+```
+
+⚠️ 注意 `< /dev/null` **没用**——`read` 读 EOF 同样返回非零。必须真给输入。
+
+#### ② `mem_check.sh` 里 `PROPS` 路径写死
+
+```bash
+PROPS="/workspace/app/android/gradle.properties"   # ❌
+```
+
+项目实际在 `/workspace/FOA/FOA/app/`，所以这格**永远**打印
+「⚠ 未找到 .../gradle.properties」，堆预算核算形同虚设——
+而这个体检脚本的存在意义就是算堆预算（Bug 469 那次栽在漏算 daemon）。
+
+**修法**：按脚本自身位置回溯仓库根。
+
+```bash
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROPS="$REPO_ROOT/app/android/gradle.properties"
+```
+
+修好后能正常读出：
+
+```
+org.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m
+kotlin.daemon.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m
+```
+
+#### ③ 顺带：内存被残余 daemon 占满，先把它们停掉
+
+第一次跑构建时 cgroup **已用 85%（7033/8192 MB）**，元凶是一个
+**3.8 GB 的 `java`（GradleDaemon）** 和 845 MB 的 `dartaotruntime`——
+都是前一轮 `flutter test` 留下的。处置：
+
+```bash
+cd app/android && ./gradlew --stop
+pkill -f GradleDaemon; pkill -f KotlinCompileDaemon
+```
+
+清理后从 7033 MB 降到 **2363 MB（29%）**。
+
+**通用教训**：
+- **交互式确认 = 自动化流程的隐患**。脚本里出现 `read -p` 的那一刻，它就只能
+  手动跑了。要么加 `--yes` / `-y` 开关，要么把确认改成"打印证据 + 显式参数"。
+- **路径不许写死绝对前缀**。本项目在 `/workspace/FOA/FOA/`，任何
+  `/workspace/app/...` 形式的硬编码都会静默失效——**而且失效方式是"打印一句
+  警告继续跑"**，比直接报错更难发现。
+- **测试进程不退干净会连带下一个任务**。长跑 `flutter test` 之后出包前，
+  先跑 `bash tools/mem_check.sh --clean`。
+
+---
+
+### Bug 625 · 测试里的"手工同款校验"漏规则 —— 而且断言会固化错误结论（2026-09-26，alpha.88）
+
+这条从 Bug 623 里单独拎出来，因为它是个**反复出现的模式**，不限于本次。
+
+#### 症状：用假实现替身测了半天，真路径一行没跑
+
+```dart
+class _FakeSettableHeaders {
+  void set(String name, String value) {
+    // 与 HttpHeaders.set 一致的非法字符判据（实测行为）
+    if (RegExp(r'[\x00-\x1F\x7F]').hasMatch(value)) {
+      throw const FormatException('Invalid HTTP header field value');
+    }
+  }
+}
+```
+
+注释写着"与 `HttpHeaders.set` 一致"，但那只复刻了我**以为**的规则。
+而 `ai_llm_client_test.dart` 原有 495 行里，**`IoLlmTransport` 一次都没被实例化**——
+全部走 `FakeLlmTransport`。于是 `req.write(body)` 落到 latin1 这条最脆弱的路径，
+零覆盖，bug 在那里躺了两个版本。
+
+#### 症状：断言把"我编的文案"钉成期望行为
+
+```dart
+test('ArgumentError 不再裸奔成"请求失败（ArgumentError）"', () {
+  expect(d, isNot(contains('ArgumentError')));
+  expect(d, contains('网络中间设备'), reason: '要给出可操作的怀疑方向');
+  //                ^^^^^^^^^^^^^^^^ 这句是我编的，纯属虚构
+});
+```
+
+真因（latin1 编码）查明后，这条断言**反而成了阻力**——它保护的不是
+"别只报类型名"这个真实意图，而是"必须提网络中间设备"这个错误结论。
+
+#### 判据与修法
+
+| 场景 | 要求 |
+|---|---|
+| 编码 / 序列化 / 协议细节 | **必须至少一个走真实实现的用例**（这里是绑 `HttpServer` 到 `127.0.0.1:0` 做 echo） |
+| 写"同款校验"假实现 | 注释里必须写**它是近似，不是等价**；且真实路径另有覆盖 |
+| 改文案时 | 先问：**这条断言在保护什么意图？** 若保护的是文案措辞而非意图，就该改成断言意图 |
+
+本次加的回归测试（必须"先看到它红过"）：
+
+```
+回退修复 → 测试变红，报错与真机截图**一字不差**：
+  Invalid argument (string): Contains invalid characters.:
+  "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",
+   \"content\":\"你是嵌在手机 IDE 里的代码补全体。…
+恢复修复 → 变绿
+```
+
+**"没先看到它红过"的回归测试不算回归测试**——你不知道它到底测没测到那条路径。
+
+---
+
 ## 七、架构类问题排查工具箱（2026-09-16 SDK 调研实战总结）
 
 > 适用场景：任何"这个二进制 / SDK / artifact 有没有 arm64 版"、"这个工具能在手机上跑吗"、"为什么服务器能构建手机不能"类问题。
@@ -5010,24 +7491,4019 @@ cat /sys/fs/cgroup/memory.current    # 确认降到 ~3GiB 再开工
 
 ---
 
+### Bug 471：proroot 冒烟测试失败——二进制要求的 glibc 比我们的 rootfs 高两个版本（2026-09-20，alpha.64 修复）
+
+**症状**（真机，5/5 文件已就位、开关可开）：
 
 ```
-### Bug XXX · <一句话描述症状>
+proroot-ldso: no offset table for glibc 2.36 - patches skipped
+reloc: unresolved __isoc23_strtoul in
+  /data/user/0/dev.foa.flutter_on_android/files/proroot/libproroot-runtime.so
+proroot-ldso: failure rc=2
+[proroot] child exited with code 2
+```
+
+UI 上「已就位 5/5」显示正常，「冒烟测试」却直接失败。这条日志同时出现
+"no offset table for glibc 2.36" 与 "unresolved __isoc23_strtoul"，
+两句指向的是**同一件事**，但很容易只看到前一句就以为是 linker 老旧。
+
+**取证（全部在沙箱里实测，不是推测）**：
+
+1. **拉上游 5 个 .so 逐个核 sha256** —— 与 `ProrootOption.soAssets`
+   钉死的值**逐个相符**。→ 排除"下载损坏 / 镜像投毒"。
+2. **`readelf -sW libproroot-runtime.so`** —— 未定义符号里有：
+   ```
+   UND __isoc23_strtoul@GLIBC_2.38
+   UND __isoc23_strtoull@GLIBC_2.38
+   UND __isoc23_strtol@GLIBC_2.38
+   ```
+   它要求 **GLIBC_2.38**。
+3. **解包 rootfs 里的 `libc.so.6`** —— 符号版本最高只到 **GLIBC_2.36**，
+   `__isoc23_*` 家族**一个都没有**（实测 `grep -c` = 0）。
+4. **`strings libproroot-linker.so`** —— 内置诊断串：
+   ```
+   proroot-ldso: glibc detect failed, falling back to
+   proroot-ldso: glibc <n>
+   _rtld_global_ro
+   proroot-ldso: _rtld_global_ro off 0x<n>
+   proroot-ldso: no offset table for glibc <n> — patches skipped
+   ```
+   **两个候选分支**：找到 `_rtld_global_ro` 偏移 → 打印 `off 0x<n>`
+   并继续；找不到 → 打印 `no offset table ... patches skipped`。
+   真机日志走的是后者、且 `<n>` = **2.36**。
+
+   > 注意：glibc 版本是 linker **运行时探出来的**（读 rootfs 的
+   > `libc.so.6` / `libc.so.` 符号表），**不是**编译期写死的版本表——
+   > 我在 `libproroot-linker.so` 的 `.rodata` 里搜 `2.36`/`2.38` 字面量
+   > 是 **0 处**，而在 runtime 里搜到 4 处。这个区别很重要：
+   > 说明 linker 本身**没有"支持到 2.36 为止"的上限**，它只是对
+   > "2.36 这个具体版本"没有准备偏移表。
+
+**原因（第一层）**：不是"哪个文件坏了"，是**版本错配**：
+
+| 角色 | 版本要求 | 实际 |
+|---|---|---|
+| `libproroot-runtime.so`（**v1.2.8**） | 需要 glibc **2.38**（用 `__isoc23_*`） | — |
+| 我们的 rootfs（Debian 12 bookworm） | — | glibc **2.36** |
+
+`__isoc23_*` 是 **C23 转写函数族**（`strtol`/`strtoul` 等带 `0b` 二进制
+字面量支持的版本），glibc **2.38 才引入**。上游用 2.38 的构建环境编了
+runtime，却没在 2.36 上验证过。`libc.so.6` 里根本没有
+`__isoc23_strtoul` 这个符号 → 重定位无处可解 → `reloc: unresolved`
+→ `rc=2`。
+
+**原因（第二层，才是真正的根因）**：**我们把上游版本钉错了。**
+
+第一层只是"哪个版本不兼容"，第二层回答"为什么我们会拿到一个不兼容的
+版本"。答案是——**我们当时跟着上游 `main` 走，等于"上游推什么我们拿
+什么"**。而上游恰好在这个点上**回退过**：
+
+| 上游 tag | glibc 符号要求 | 5 个资产是否齐全 | 结论 |
+|---|---|---|---|
+| v1.2.3 | 2.33 | ❌ 不齐（无 stub-loader） | 不可用 |
+| **v1.2.5** | **2.34** | **✅ 齐全** | **✅ 选它** |
+| v1.2.6 / v1.2.7 / v1.2.8 | **2.38** | ✅ 齐全 | ❌ 我们 rootfs 跑不了 |
+
+决定性证据来自上游自己的 Release note：**v1.2.3 的条目里明写
+「glibc 2.36 compat — `__isoc23_strtol@GLIBC_2.38` undefined symbol
+제거」**——也就是说**这个坑上游知道、修过、然后从 v1.2.6 起又退回去了**。
+我们踩的正是那次回退。
+
+**为什么是 v1.2.5 而不是最新版**：它是"**5 个资产齐全 ∩ glibc ≤ 2.36**"
+的**最大交集**。v1.2.3 虽然 glibc 最低，但缺 stub-loader，装了也起不来；
+v1.2.6 起资产齐了，glibc 却又回到 2.38。两个条件同时满足的只剩 v1.2.5。
+
+> ⚠️ **这是本项目第二次栽在"跟 main"上**。跟 main 的代价不是"偶尔
+> 拿不到新功能"，而是**把上游的一次回退直接变成我们的线上故障**，
+> 而且版本号变了、哈希也变了，查起来像"文件损坏"。修法是把
+> `upstreamRef` 钉到 tag（`upstreamRef == pinnedVersion`），
+> 让"上游改了什么"永远不能悄悄影响我们。
+
+**这里有两件不同的事，别混为一谈**：
+
+| 现象 | 是否致命 | 说明 |
+|---|---|---|
+| `no offset table for glibc 2.36 — patches skipped` | **不一定** | 只是"没对这个版本打内部结构补丁"。某些情况下仍可能跑（降级路径） |
+| `reloc: unresolved __isoc23_strtoul` | **致命** | **符号根本不存在**。就算补丁全打上、linker 完美工作，也没用——rootfs 里没有这个函数 |
+
+换句话说：**我们的失败是两个问题叠加**，而其中**第二个是决定性的**。
+偏移表那行只是"WARNING 级别的旁证"，真正拦住我们的是 `__isoc23`。
+
+> ⚠️ **别被 "no offset table for glibc 2.36" 带偏两次**：
+> ① 它读起来像"linker 版本太老"——不是，linker 没有版本上限，
+>    是"对这个具体版本没有预设偏移表"；
+> ② 它读起来像"这就是根因"——也不是，真正的根因是**符号不存在**。
+> **有未解析重定位才叫失败**，偏移表落空只是"优化没生效"。
+
+**这也解释了 Bug 467 的一个隐性前提**：一键下载器把 5 个文件当作
+**一个不可分的整体**钉死 sha256，但没检查"这套二进制与我们的 rootfs
+glibc 是否兼容"——文件全对、组合却跑不起来。
+
+**解决**（alpha.64）：
+
+1. **换版本，而不是换 rootfs**（核心修复）：`pinnedVersion` 从
+   `v1.2.8` 改为 **`v1.2.5`**，`requiredGlibc` 从 `2.38` 改为 `2.34`，
+   `upstreamRef` 从 `main` 改为**钉 tag**。5 个资产的 `size`/`sha256`
+   全部换成 v1.2.5 的实测值（与上游 Release 页公布值逐字节核对一致）。
+2. **下载前预检**：`fetchAll()` 在**发出第一个网络请求之前**先做
+   组合级兼容性判定，不兼容直接 `throw DownloadException`——
+   用户几十 MB 都不用下。逐文件 sha256 与组合级检查是**互补**关系
+   （前者查"字节有没有被改"，后者查"这些字节能不能一起跑"），谁都不能删。
+3. **失败文案直指版本，不再指向"文件缺失/架构不对"**：原来的文案是
+   "glibc 版本不匹配、缺少 /lib64/ld-linux-aarch64.so.1"——后半句是
+   **误导**（我们的 `ld-linux-aarch64.so.1` 好端端在
+   `/usr/lib/aarch64-linux-gnu/` 下）。同时**引导到「一键下载」**
+   （它会取回配套版本），而不是让用户自己去下最新版——那会重新踩坑。
+4. **原生侧文案只说结论、不写死数字**：`prorootProbe()` 的失败文案
+   只讲"版本错配 + 请用一键下载"，具体版本号由 `ProrootOption`
+   单点提供。两处各写一份常量，迟早会各说各话（原生侧一度还写着
+   2.38，正是那个已作废的数字）。
+5. **风险清单第一条讲清"为什么不是最新版"**：用户有权知道我们钉了
+   哪个版本、以及为什么不是最新版——否则他会自己去下最新版、导入、
+   然后踩同一个坑。
+
+**为什么不能靠"升级 rootfs 到 glibc 2.38"绕过**：
+
+- 换 Debian 13 trixie / Ubuntu 24.04 意味着整个 rootfs 重做并重测，
+  而 FOA 的工具链（qemu 转发、proot、NDK、aapt2）全都建立在当前
+  Debian 12 上验证过的**那一份 rootfs** 之上。
+- 收益是"让一个实验特性可用"，代价是"动摇整个已验证的构建链路"。
+  **这笔账不划算**——尤其当**换版本**就能解决的时候（我们原本就
+  误以为只有换 rootfs 一条路）。
+
+**验证**：新增契约测试断言——
+① 版本比对函数能在 runtime 需求 > rootfs 提供时判失败；
+② 钉死的常量自洽（`pinnedVersion == 'v1.2.5'`、`requiredGlibc == '2.34'`、
+   `isGlibcCompatible() == true`）；
+③ `upstreamRef` 必须等于 `pinnedVersion` 且不得为 `main`；
+④ v1.2.8 的 2.38 仍会被判不兼容（防上游再回退，也防我们改回去）；
+⑤ 失败文案含双方版本号、不含"缺少 ld-linux"这类误导表述；
+⑥ 预检的位置**早于**第一个下载调用、且抛异常而非静默返回；
+⑦ 原生侧文案不含已作废的 `需要 glibc 2.38`。
+
+**通用教训**：**"文件校验通过" ≠ "这套东西能跑"**。哈希只证明
+"字节没被改动"，不证明"这些字节合在一起能工作"。凡是要把一个
+**多文件组合**装进用户设备的地方，除了逐文件完整性，还得有一项
+**组合级的兼容性检查**——而且最好放在**下载阶段**，让用户在花掉
+几十 MB 流量之前就知道结果。
+
+**第二条教训**：**遇到"上游二进制不兼容"，先问"我们钉的是哪个版本"，
+再问"要不要换 rootfs"**。这次我们差点为了一个实验特性去重做整个
+rootfs，而答案只是"把 tag 从错的改成对的"。**换依赖版本的成本，
+永远低于换自己基础设施的成本**——先往这个方向找。
+
+**第三条教训**：**测试里的断言会随着真相变化而变化，这很正常，
+但要留下痕迹**。这个 Bug 的测试断言改了三轮
+（"未验证" → "已实测确认不兼容" → "版本够"），
+每一轮都对应着**当时我们对真相的理解**。改的时候写清"为什么变"，
+否则下一个人看到断言翻来覆去，会以为是在瞎改。
+
+**出现版本**：alpha.61（proroot 接入）～ alpha.63（一键下载）
+**修复版本**：v0.1.0-alpha.64（**部分修复**，见下方 471c）
+
+---
+
+### Bug 471c：钉 v1.2.5 之后**仍然崩**——`no offset table` 不是警告，是死因（2026-09-20，alpha.65 真机推翻 471 的结论）
+
+> ⚠️ **本章的"根因"结论已被后续实验再次修正 —— 请先读 [Bug 471d](#bug-471d真机判别实验升级-rootfs-能不能救-proroot的答案是不能2026-09-21alpha65-后)。**
+>
+> 本章把 `no offset table` 定为死因，**这个判断只到症状层**。
+> 2026-09-21 的判别实验查明：真正的根因是 `libproroot.so` 的
+> `DT_NEEDED` 写了开发名 `libc.so`/`libdl.so`，导致它**根本加载不起来**；
+> `no offset table` 是绕过加载这一层之后才轮到的下游症状。
+> 本章末尾"出路只有换 rootfs"这句也**已被实测证否**（换 glibc 2.41
+> 报错逐字相同）。
+>
+> 保留原文是因为：**它记录了一次真实的误判过程**，其中的取证链、
+> 寄存器分析和三条通用教训仍然成立且有价值。只是结论口径要按 471d 读。
+
+**症状**（真机，alpha.65，钉 v1.2.5，5/5 文件就位、sha256 全对）：
+
+```
+proroot-ldso: no offset table for glibc 2.36 — patches skipped
+[proroot] SIGSEGV pc=0x7e5b332638 lr=0x7e5b32a9c8 fault=0x7e5b458e34 code=2
+[proroot] x8 =0x4b5e525852464852  x9 =0x7f7f7f7f7f7f7f7f
+[proroot] x10=0xfffffffffffffff0
+[proroot] thread_state @x26+0x710..+0x740  → 全部 (read failed)
+[proroot] backtrace (fp chain): #0 lr=0x0000007e5b484778 ...
+[proroot] child exited with code 139
+```
+
+**Bug 471 修的东西没错，但结论下早了。** 471 把 `pinnedVersion` 从
+v1.2.8 换成 v1.2.5，理由是"v1.2.5 只需 glibc 2.34，我们 rootfs 有
+2.36，版本够"。真机证明：**不够。**
+
+**错在哪**——我在 471 里写下了这句话，它是**错的**：
+
+> `no offset table for glibc 2.36 — patches skipped`：**不一定**致命。
+> 只是"没对这个版本打内部结构补丁"。某些情况下仍可能跑（降级路径）。
+
+真机证明这不是"降级路径"，而是**崩溃路径**：`no offset table` 之后
+紧跟 SIGSEGV，退出码 139 = 128 + 11。
+
+**为什么没打补丁就会崩**：proroot 的 linker 靠 `LD_PRELOAD` 拦截
+glibc 内部行为，很多 hook 需要知道 glibc **内部结构体的字段偏移**
+（`_rtld_global_ro` 那类）。这些偏移**每个 glibc 版本都不同**，
+所以上游内置了一张"版本 → 偏移表"的映射，逐版本打补丁。
+一旦目标版本不在表里，补丁**全部跳过** → linker 按自己的假设布局
+去读结构体 → 取到垃圾数据 → 解引用崩溃。
+
+崩溃现场**每一个寄存器都在说这件事**：
+
+| 现场 | 含义 |
+|---|---|
+| `x8 = 0x4b5e525852464852` | 这是 **ASCII 数据**（`HRFRXR^K` 之类），**不是指针** —— 本该是指针的字段读到了字符串 |
+| `x9 = 0x7f7f7f7f7f7f7f7f` | 典型**填充/未初始化模式**，不是地址 |
+| `x10 = 0xfffffffffffffff0` | = **-16**，一个"算错了"的小整数 |
+| TLS 区（`x26+0x710..+0x740`）全部 `read failed` | 那块内存**根本没映射** —— 按错误布局取到的地址必然指向空洞 |
+
+**取证（沙箱实测，逐条可复现）**：
+
+1. **核对 rootfs glibc**，排除"是我版本判错"：
+   ```
+   $ strings rootfs/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 | grep stable
+   ld.so (Debian GLIBC 2.36-9+deb12u14) stable release version 2.36.
+   $ strings .../libc.so.6 | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1
+   GLIBC_2.36
+   ```
+   → `rootfsGlibc = '2.36'` **写对了**，判错版本这条路排除。
+
+2. **核 v1.2.5 的 runtime 依赖** —— 确实最高 `GLIBC_2.34`，
+   **没有** `__isoc23_*`。所以 471 说的"符号够"是**真的**。
+   → 问题不在符号层。
+
+3. **搜 linker 的 `.rodata`** —— `2.31`/`2.32`/`2.33`/`2.34`/`2.35`/
+   `2.36`/`2.38` 这些**版本号字面量一个都没有**（逐个 `grep -c` = 0）。
+   → 偏移表**不是**按版本号字符串查的（可能是数值编码或哈希）。
+   → 也再次印证 471 的发现：**linker 没有"支持到某版本为止"的上限**，
+   它就是"对这个具体版本没准备表"。
+
+4. **上游 Release note 交叉验证**：
+   - v1.2.3：`glibc 2.36 compat — __isoc23_strtol@GLIBC_2.38 undefined symbol 제거`
+   - v1.2.7：`Adds adaptive glibc internal syscall patching for compatible runtime layout changes`
+   → 上游**确实在动这块**，说明它是活跃的适配面，不是"永远支持"的。
+
+5. **上游 README 的要求**：`Requirements: Ubuntu arm64 rootfs with glibc`；
+   "Tested with" 一节列的全是 Ubuntu 系。**Debian 从来不在验证范围内。**
+
+**修正后的版本交集表**：
+
+| 版本 | 5 资产齐全 | runtime 最高 GLIBC 需求 | 真机实测 |
+|---|---|---|---|
+| v1.2.3 | ❌ 无 stub-loader | 2.33 | 资产不齐，未测 |
+| **v1.2.5** | ✅ | 2.34 | **❌ SIGSEGV（code 139）** ← 本次 |
+| v1.2.6 / 1.2.7 / 1.2.8 | ✅ | 2.38（`__isoc23_*`） | ❌ `reloc: unresolved` → rc=2 |
+
+**两个方向都堵死了**：往下（v1.2.3）资产不齐；往上（≥1.2.6）要 glibc 2.38。
+**所有可获得的 proroot 版本，对本项目的 Debian 12 rootfs 都不可用。**
+
+**解决**（alpha.65）：
+
+1. **不再用 `isGlibcCompatible()` 当门禁**。它的判据（符号版本比对）
+   已被证伪一次，继续用它 = "预检通过 → 下载 → 冒烟 → 崩溃 → 白折腾"。
+   新增 `isKnownUnusable()`（真机实测结论，当前恒为 `true`），
+   **排在 `isGlibcCompatible()` 之前**，两者**分开表达**：
+   - `isGlibcCompatible()` → "符号依赖算得过来"（仍是 true，事实没变）
+   - `isKnownUnusable()` → "实测跑不起来"（true）
+
+   这两个**不能合并成一个布尔**——合并就丢掉"纸面可行 ∩ 实测不行"
+   这个反直觉但关键的信息。测试专门钉住这一点。
+2. **UI 开关改为硬拦**。原来 `_toggle` 对未冒烟是"提醒但不强制"，
+   注释写着"用户可能就是想在真构建里试"。那时我们**只是没验证过**；
+   现在已**实测确认必崩**，再放行只是让用户把一次注定失败的构建
+   跑完（几十分钟 + 一堆定位不到根因的 gradle 报错）。
+   **未知风险可以交给用户判断，已知错误不该出现在选项里。**
+3. **失败文案分形态**。原生侧 `prorootProbe()` 原来只认
+   `reloc: unresolved`（形态 A），把 `no offset table` 当"没打补丁"。
+   现在两种形态**都要认**，且**形态 B 不许再引导"一键下载"**
+   ——换了还是崩，那是把人往第二次失败里推。
+4. **风险清单第一条改成"实测不可用"**。原来第一条是
+   "讲清为什么不是最新版"，那个框架暗示"我们钉的这版能用、只是不是最新",
+   而事实是**钉的这版也崩**。第一条是用户最先读到的内容，
+   留着旧措辞等于继续给一个已知为假的承诺。
+5. **`pinnedVersion` 保留 v1.2.5**（不换回 v1.2.8）：v1.2.8 错得更早
+   （`reloc: unresolved` 直接 rc=2），v1.2.5 至少能走到 linker 补丁阶段。
+   两者对 Debian 都不可用，保留信息量更大的那个，等上游或换 rootfs 后重估。
+
+**为什么"再试试别的版本"这条思路本身是错的**：
+可获得的版本只有 4 档（v1.2.3~v1.2.8），其中 v1.2.3 资产不齐、
+v1.2.6+ 要 2.38、v1.2.5 实测崩。**穷举已经做完了。**
+继续"换个版本试试"是在一个已知为空的空间里搜索。
+
+**通用教训（本次最贵的三条）**：
+
+1. **"我没有观察到它致死" ≠ "它不致死"。** 471 里我只有 **readelf
+   静态推断**，没有真机运行，就断言 `no offset table` 是良性的。
+   静态分析能证明"依赖存在/不存在"，**证明不了运行期行为**。
+   凡是要对"能不能跑"下结论，**必须真机跑一次**。
+
+2. **一个成功信号的存在，不能推出另一个失败信号不存在。**
+   我看到 `reloc: unresolved`（真失败）就以为找到了唯一死因，
+   把旁边的 `no offset table` 降级成"旁证"。实际上**那是两条独立的
+   死路**：符号层（`reloc`）和布局层（offset table）。
+   修掉前者不会自动修掉后者，而我只修了前者就宣布"修好了"。
+
+3. **"版本号算得过来"是纸面推理，不是验证。** 本次两轮修复都栽在
+   同一件事：用某个**间接指标**（符号表、版本号比对）代替
+   **直接验证**（真机跑）。间接指标能快速排除，**不能用来确认**。
+   所以 471 里那句"仍建议先跑一次冒烟测试确认"其实写对了 ——
+   错的是我**在没跑之前就把它当成已确认**，还据此改了 UI 门禁。
+
+**验证**：基线 685 → **689**，新增 4 条契约测试——
+① 断言"符号够"与"能跑"两个判断**分开存在**且当前**同时为 true**
+  （钉住那个反直觉组合，防止有人合并回一个布尔）；
+② UI 开关必须**硬拦**（查 `isKnownUnusable()` 且 `return`），
+  且硬拦排在"建议冒烟"之前；
+③ 原生侧**两种失败形态都要认**，且形态 B 分支**不许出现"一键下载"**
+  （防把用户推进第二次失败）；
+④ 风险清单第一条必须是"已实测不可用"，且全文不得再出现"够"。
+
+**出现版本**：alpha.64（471 的"修复"实际未生效）
+**确认失败**：alpha.65 真机冒烟
+**当前状态**：**未解决**。proroot 在 Debian 12 上不可用，
+出路只有换 rootfs（代价大）或等上游支持 Debian。
+
+---
+
+### Bug 471d：真机判别实验——"升级 rootfs 能不能救 proroot"的答案是**不能**（2026-09-21，alpha.65 后）
+
+> 🔴 **本章末尾的"根因"与"我方无解"结论已被 [Bug 471e](#bug-471e471d-的根因判断是错的不是上游缺陷是我们用错了加载器2026-09-21-定案) 全部推翻。**
+> 本章**仍然有效**的部分：① "升级 rootfs 不能救"这个实测结论；② 判别实验
+> 的方法（隔离在 `/tmp`、不动系统）；③ 对"把最先观察到的当成最先发生的"
+> 这个错误的反思。
+> **已作废**的部分：把 `DT_NEEDED` 写 `libc.so`/`libdl.so` 判为"上游开发名
+> 写错"。真相是**在 Android bionic 下这两个名字完全正确**，是我拿 glibc
+> 规则审错了二进制；真正的死因是我们用 `ld-linux` 去加载一个
+> `PT_INTERP = /system/bin/linker64` 的 Android launcher。**有解**。
+
+**背景**：471c 的结尾给用户留了两条出路——"换 rootfs"或"等上游"。
+用户随即追问：**"可以升级 rootfs 升级难道有什么副作用吗？"**
+
+这个问题暴露了我论述里的一个漏洞：我把"换 rootfs"说成一条
+**合理的出路**，却从没验证过它**真的有用**。所以我做了这个判别实验。
+
+**实验设计**（关键：**全程不动系统**，所有操作都在 `/tmp` 隔离目录）：
+
+| 步骤 | 做法 |
+|---|---|
+| ① | 取 Debian 13 trixie 的 `libc6` 包解包到 `/tmp/pexp/tx/`（glibc **2.41-12+deb13u4**，arm64） |
+| ② | 用 trixie 的 `ld-linux-aarch64.so.1`（2.41）作 loader |
+| ③ | 用 `LD_LIBRARY_PATH` 指向只含软链的 shim 目录，把 NEEDED 名指到真实 `.so.6` |
+| ④ | 系统文件一个字节没改（实验后核对：`libc.so` 时间戳 `Apr 27` 未变） |
+
+**结果 —— 两代 glibc 报错逐字相同**：
+
+```
+glibc 2.36 (bookworm)：version `LIBC' not found (required by ./libproroot.so)
+glibc 2.41 (trixie)  ：version `LIBC' not found (required by ./libproroot.so)
+```
+
+**升级 rootfs 对此问题零改善。**
+
+#### 真正的根因：`DT_NEEDED` 写了开发名
+
+容器里没有 `readelf`/`objdump`（`binutils` 未装），所以我**用 python 手写
+了一个 ELF 解析器**直接读 `.dynamic` 节。硬证据：
+
+| 文件 | SONAME | `DT_NEEDED` |
+|---|---|---|
+| `libproroot.so` | (无) | **`libdl.so`, `libc.so`** ← 开发名 |
+| `libproroot-runtime.so` | libproroot-runtime.so | `libc.so.6` |
+| `libproroot-linker.so` | libproroot-linker.so | (无) |
+| `libproroot-stub-loader.so` | libproroot-stub-loader.so | (无) |
+
+**`libproroot.so` 是全套里唯一一个写开发名的**，其余都规规矩矩写 `libc.so.6`。
+
+这两个名字为什么在运行期必然失败：
+
+- **`libdl.so`** —— glibc **2.34 起**已把 libdl 并入 libc，`libdl.so`
+  从此不存在（仅保留空壳 `libdl.so.2`）。任何 2.34+ 系统上都没有它。
+  **与版本高低无关。**
+- **`libc.so`** —— 它是 `libc6-dev` 提供的 **GNU ld script**（291 字节纯文本，
+  内容为 `GROUP ( /lib/.../libc.so.6 ... )`），供链接器 `-lc` 使用，
+  **永远不是 ELF**。实测 **Debian 12 与 Ubuntu 22.04 的 `libc.so`
+  是同一种东西**（283/291 字节 ld script）—— 这是发行版通用约定。
+
+所以 loader 的行为必然是三层的：
+
+```
+① 找不到 libdl.so      → cannot open shared object file
+② 找到 libc.so 但是文本 → invalid ELF header
+③ 强行当 ELF 处理       → version `LIBC' not found
+```
+
+**第三层的 `LIBC` version tag 尤其说明问题**：实测扫描 2.36 与 2.41 的
+`libc.so.6`，**两代都不存在 `LIBC` 这个 version 定义**。glibc 内部符号用的是
+`GLIBC_PRIVATE`（两代都有，`__libc_init` 确实在其内）。
+**proroot 索要的 `LIBC` 不是标准 tag。**
+
+#### 为什么会需要"glibc 偏移表"这个机制
+
+自写解析器扫 `libproroot.so` 的导入符号表，64 个导入符号里有 2 个
+glibc 内部符号：
+
+```
+__cxa_atexit
+__libc_init    ← 关键
+```
+
+**`__libc_init` 是 glibc 的内部初始化函数，不是公开 API。**
+（公开 C 程序入口是 `_start` → `__libc_start_main` → `main`。）
+
+因为 proroot 的加载器要接管后续所有库的加载，它必须调用 glibc 内部
+初始化。而内部结构体的布局**每代都变**，所以需要按版本打补丁 ——
+`no offset table for glibc 2.36` 是**这条链的第三层症状**，
+不是根因。471c 里我把它当成死因，其实是绕过了前两层之后才轮到的。
+
+#### 我在这个 Bug 里犯的三个错
+
+1. **"换 rootfs"当成出路却没验证。** 471/471c 两轮里我都写了
+   "出路是换 rootfs（代价大）"，但**从没测过它是否有效**。
+   用户一句"升级有什么副作用吗"就问到了这个漏洞。**代价大的方案
+   更应该先验证有效性**，否则用户花了代价还是失败。
+   教训：**在给用户列"出路"之前，先确认它真的是出路。**
+
+2. **把"最先观察到的"当成"最先发生的"。** 471c 里我把
+   `no offset table` 定为死因，因为它出现在崩溃日志里、看着最像原因。
+   实际上它前面还有两层（`libdl.so` 缺失、`libc.so` 非 ELF），
+   只是当时我用"补个软链"绕过去了，**没意识到绕过的正是根因**。
+   教训：**绕过一个问题时，要问"我绕过的是什么"，而不是"我终于过去了"。**
+
+3. **又一次用间接指标代替直接验证。** 471 栽在 readelf 静态推断，
+   471c 栽在"崩在哪个阶段看着更靠前"，471d 前我又差点栽在
+   "glibc 版本够不够"——**三次都用了间接指标**。
+   这次改用手写 ELF 解析器**直读 `.dynamic`**，才拿到硬证据。
+   教训：**报错信息是症状，二进制结构才是事实。**
+
+#### 顺带澄清的一个**曾经写错的假设**
+
+我在 471c 里推测过"minbase 精简 rootfs 没装 `libc6-dev`，所以缺
+`libc.so`/`libdl.so`"。真机 `dpkg -l` 实测**推翻了它**：
+
+```
+ii  libc6-dev:arm64    2.36-9+deb12u14    arm64   GNU C Library: Development Libraries and Header Files
+```
+
+**`libc6-dev` 是装了的**，`libc.so` 也确实在 —— 问题不是"缺文件"，
+而是"这个文件本来就不是 ELF"。**"文件不存在"和"文件不可用"是两回事**，
+我上一轮把后者误判成了前者。
+
+#### 修正后的结论
+
+1. **升级 rootfs 不是出路**（实测：2.41 报错与 2.36 逐字相同）。
+   Debian 13 的运行时包 `libc6` 同样**不含** `libc.so`/`libdl.so`
+   —— 这两个只有 `libc6-dev` 才带，且 `libc.so` 在任何发行版上都不是 ELF。
+2. **根因是上游的构建配置错误**：`DT_NEEDED` 该写运行时名 `libc.so.6`
+   却写了开发名 `libc.so`。**这不是我们能通过换 rootfs / 换版本绕过的** ——
+   除非上游重新构建。许可又禁止我们修改二进制（`Redistribution of
+   modified binaries is not permitted`），所以**我们这边无解**。
+3. 因此 UI 文案必须**显式堵掉"升级 rootfs"这条错误引导**，
+   而不是继续把它列成出路。
+
+#### 代码变更
+
+- `ProrootOption.knownUnusableMessage()` — 改写为三层加载失败现场，
+  显式写"**换 rootfs 不是出路**"并给出 2.41 的证否证据
+- `ProrootOption.compatNote()` — 从"linker 偏移表不覆盖"改为
+  "根因不在 glibc 版本上"，并堵掉"升级 rootfs 也救不了"
+- `ProrootOption.glibcMismatchMessage()` — 删掉"换用官方要求的 rootfs"
+  这条出路，改为"**不要试图靠升级 rootfs 解决**"
+- `ProrootOption.risks` — 前三条重写：第一条指向加载失败，
+  第二条讲 `DT_NEEDED` 根因，第三条明确"两条路都堵死"
+- `ProrootOption.linkerSupportedGlibc` — 注释改为"第三层症状，非根因"
+- `MainActivity.kt` — 失败分诊新增**形态 C**（加载失败，`devNameNeeded`），
+  且**排在 A/B 之前**（它最先发生）；形态 B 文案补上"升级 rootfs 亦已实测无效"
+
+---
+
+### Bug 471e：**471d 的根因判断是错的**——不是上游缺陷，是我们用错了加载器（2026-09-21 定案）
+
+> ⚠️ **本章推翻了 471d 的核心结论。** 471d 说的"根因是上游 `DT_NEEDED`
+> 写开发名、我方无解"**全部作废**。请以本章为准。
+
+**触发**：用户追问 —— **"参考作者的 proroom 项目有解吗？作者是怎么在安卓上
+用 proroot 的？"**
+
+这一问问到了要害：我从 471 到 471d **折腾了四轮，从没去看过作者自己怎么用
+这套二进制的**。所有结论都建立在我自己猜的调用方式上。
+
+**做法**：去找作者的**开源 App**。proroot 本身闭源，但作者另有一个开源项目
+[`coderredlab/andClaw`](https://github.com/coderredlab/andClaw)，
+里面 `proroot/ProrootManager.kt` 就是完整的集成实现。
+
+#### 决定性证据：`PT_INTERP`
+
+自写 ELF 解析器直读五个文件的 program header，答案一目了然：
+
+| 文件 | `e_type` | `PT_INTERP` |
+|---|---|---|
+| `libproroot.so` | DYN(3) | **`/system/bin/linker64`** |
+| `libproroot-linker.so` | DYN(3) | （无，static-pie） |
+| `libproroot-stub-loader.so` | DYN(3) | （无，static-pie） |
+| `libproroot-bridge.so` | EXEC(2) | （无，静态） |
+| `libproroot-runtime.so` | DYN(3) | （无，LD_PRELOAD 钩子库） |
+
+**`libproroot.so` 的 `PT_INTERP` 是 `/system/bin/linker64`** ——
+它是 **Android 原生 launcher**，由 bionic 链接器加载。
+
+而我四轮里一直用的是 `ld-linux-aarch64.so.1`（glibc 的加载器）。
+**加载器用错了，那些报错全是我自己造出来的。**
+
+#### 471d 的"硬证据"错在哪
+
+471d 里我扫出 `libproroot.so` 的 `DT_NEEDED` 是 `libdl.so` / `libc.so`，
+判为"开发名写错"。**数据是对的，判断是错的**：
+
+- **在 Android bionic 下，`libc.so` / `libdl.so` 都是真实存在的运行时库**
+  （`/system/lib64/libc.so`、`libdl.so`），不是 glibc 语境的 ld script，
+  也不是"已并入 libc 的历史名"。
+- 我是**拿 glibc 的规则去审一个 Android 二进制**，然后判它"写错了不该写的名字"。
+
+同理，471d 说"两代 glibc 都扫不到 `LIBC` version tag，所以 proroot 索要的是
+非标准 tag" —— **`LIBC` 本来就是 bionic 的 version tag**，glibc 里当然没有。
+它不是"非标准"，只是不属于 glibc。
+
+#### 作者怎么集成（andClaw 源码要点）
+
+`ProrootManager.kt` 给出了六个必须照做的点：
+
+| # | 做法 | 源码位置 |
+|---|---|---|
+| ① | **五个 .so 打包进 APK 的 `jniLibs/arm64-v8a/`**，安装时由 Android 自动解压到 `nativeLibraryDir` | 注释 18-19 |
+| ② | **从 `nativeLibraryDir` 直接 exec**，不经任何 ld-linux | 118-120 |
+| ③ | 补 **6 个 `PROROOT_*` 环境变量** | 711-717 |
+| ④ | **SELinux**：`nativeLibraryDir` 受保护，guest 的 linker 访问不到 → `libproroot-runtime.so` 要复制到 `filesDir`，**并再放一份进 rootfs 的 `/root/.proroot/`** | 143-152 |
+| ⑤ | 启动参数用 **`-b <host>:<guest>`** 形式，**且不带 `-0`** | 581-592 |
+| ~~⑥~~ | ~~rootfs 用 Ubuntu 24.04.3 LTS~~ → **已撤销，见下** | — |
+
+> ⚠️ **⑥ 已删除：rootfs 不是硬约束，不必换。**
+>
+> 我先把作者的**产品选择**当成了**技术门槛**。查证后：
+>
+> 1. 官方 README 的 Requirements 是 **`Ubuntu arm64 rootfs with glibc`**，
+>    硬条件在 **`with glibc`**（即非 musl），"Ubuntu" 是作者的验证环境。
+> 2. **决定性反证**：作者在 `ProrootManager.kt:475-495` 的
+>    `repairRootfsOsReleaseFiles()` 里**主动覆写** rootfs 的
+>    `etc/os-release` / `usr/lib/os-release` / `etc/lsb-release` 成硬编码
+>    Ubuntu 字符串，还会**删除 `etc/alpine-release`**（变量名直接叫
+>    `alpineExistedBefore`）。**真依赖 Ubuntu 的运行时不需要修这些标记** ——
+>    需要覆写恰恰说明 proroot 不关心实际发行版。
+> 3. 本项目三条硬条件**全部满足**：arm64-v8a ✓、glibc 2.36（非 musl）✓、
+>    API 28 ≥ 26 ✓。
+>
+> **正确顺序：先做完 ①-⑤，用现有 Debian 12 直接跑冒烟测试。**
+> 跑通就完全不用换；只有实测失败且报错指向 glibc 内部结构体布局
+> （偏移表机制）时，才考虑换 Ubuntu。
+>
+> **教训**：判断一个条件是不是硬约束，看"官方最低要求写了什么"，
+> 而不是"作者顺手用了什么"；并且要特别注意 ——
+> **作者需要额外做的补偿动作（覆写标记、删除文件），
+> 往往正是"这不是硬约束"的证据。**
+
+③ 的六个变量（我们**一个都没设**）：
+
+```
+PROROOT_TMP_DIR         PROROOT_ROOTFS         PROROOT_GUEST_EXE
+PROROOT_LIB_PATH        PROROOT_LINKER_PATH    PROROOT_TRAMPOLINE_PATH
+```
+
+⑤ 的正确 argv（对照我们写的）：
+
+```sh
+# 作者（正确）
+libproroot.so -r <rootfs> \
+  -b /dev:/dev -b /proc:/proc -b /sys:/sys \
+  -b /dev/urandom:/dev/random -b <cacheDir>/shm:/dev/shm \
+  -w /root --link2symlink /bin/sh -c '<cmd>'
+
+# 我们（错误）
+libproroot.so -r <rootfs> -0 --link2symlink -w /root ...
+```
+
+两处关键差异：**`-b` 是 host:guest 冒号对**（proot 是单路径，抄错就是挂载错位）；
+**proroot 分支不带 `-0`**（那是 proot 的参数）。
+
+#### 我犯的错（471 → 471d 共四轮）
+
+| 轮次 | 我的结论 | 实际 |
+|---|---|---|
+| 471 | 根因是 glibc 版本太低 | 与版本无关 |
+| 471c | 根因是 linker 偏移表不覆盖 | 只是下游症状 |
+| 471d | 根因是上游 `DT_NEEDED` 写开发名，**我方无解** | **上游没写错，加载器用错** |
+| 471e | 根因是**加载方式不对**，有解 | ✓ |
+
+**共同错误：四轮都在"解读报错"，没有一轮去"核对二进制该怎么被启动"。**
+`PT_INTERP` 就在 program header 里，五个文件扫一遍就能看到 ——
+这个检查直到用户提醒我去看作者的实现才做。
+
+**教训：报错再"硬"，也只是加载器说的话。要判断一个二进制属于哪个运行世界，
+先看 `PT_INTERP`，而不是看它报什么错。**
+
+#### 修正后的结论
+
+1. **有解。** 不需要等上游、不需要重新构建、不需要改二进制（许可也不需要破）。
+   缺的只是**集成方式**。
+2. **rootfs 不是卡点，而且很可能不必换。** 官方硬条件是 **glibc（非 musl）**，
+   本项目满足；Ubuntu 只是作者的验证环境。**先做完 ①-⑤ 用现有 Debian 12
+   跑冒烟测试** —— 跑通就完全不用换。
+3. **"升级 rootfs 也救不了"仍然成立**，但理由变了：不是"版本无关"，
+   而是**光换 rootfs 不做集成改造照样跑不起来**。
+
+#### 代码变更
+
+- `ProrootOption.knownUnusableMessage()` — 从"我方无解"改为
+  "**该特性尚未接通**"，列出五项改造清单（rootfs 一项已撤除）
+- `ProrootOption.compatNote()` — 改为"**硬条件满足 + 尚未接通**"；
+  不再说"未支持组合"（那是把产品配置当技术门槛），
+  改为"与官方验证环境不同，但硬条件满足"，并补上"跑通就不必换"的顺序
+- `ProrootOption.requiredRootfs` — 注释更正：明确"**不要读成非 Ubuntu 就跑不了**"，
+  附上作者覆写 `os-release` 的反证
+- `ProrootOption.glibcMismatchMessage()` — 删掉"真死因是 `DT_NEEDED` 写开发名"，
+  改为 `PT_INTERP` / `linker64` 的解释
+- `ProrootOption.launcherUsage` — 修正为正确的 `-b host:guest` 形式，去掉 `-0`
+- `ProrootOption.risks` — 前三条重写 + 新增 andClaw 参考实现条目
+- `MainActivity.kt` — 分诊注释与三条文案从"DT_NEEDED 根因"改为"加载方式不对"；
+  `prorootProbe` 的 KDoc、`buildProrootCmd` 的 argv 注释、
+  `applyProrootEnv` 全部更正（并补上 `PROROOT_TMP_DIR`）；
+  删掉"本机 Debian 属未支持组合"这句过重的表述
+- 测试：471d 的"堵死升级 rootfs"断言改为"**必须说清 rootfs 不是卡点**"；
+  新增"文案不许再断言上游 `DT_NEEDED` 写错"的兜底断言
+- `platform/android/MainActivity.kt` — 同步（Bug 440 逐字节门禁）
+
+#### 还没做的
+
+**五项集成改造已实施**（见下节 471f），`isKnownUnusable()` 仍返回 `true`
+—— 因为**尚未在真机上验证通过**。"做到了"与"验证过了"是两件事，
+在冒烟测试通过前不给用户承诺。
+
+**验证**：`flutter test` 693/693 全绿，`flutter analyze` 7 条基线
+（全在 `third_party/`），Kotlin `compileDebugKotlin` 通过。
+
+---
+
+### Bug 471f：按作者实现完成五项集成改造（2026-09-21，待真机验证）
+
+**背景**：471e 定案"有解，缺的是集成方式"后，用户拍板：
+**"先直接做 5 项改造但是不换底层跑测试"**。
+
+**五项改造与实施位置**：
+
+| # | 改造 | 实施位置 |
+|---|---|---|
+| ① | 五件套打包进 `jniLibs/arm64-v8a/` | `tools/fetch_assets.sh` 新增 `proroot` 子命令 + `tools/setup_android.sh` 第 ④ 步 |
+| ② | 从 `nativeLibraryDir` 直接 exec | `MainActivity.kt` 新增 `findProrootLauncher()` / `prorootLibDir()` / `prorootDirs()` / `resolveProrootFile()` |
+| ③ | 补 6 个 `PROROOT_*` 环境变量 | `applyProrootEnv()` 重写 |
+| ④ | SELinux 路径处理 | 新增 `syncProrootRuntimeLib()` |
+| ⑤ | `-b host:guest` + 去掉 `-0` | `buildProrootCmd()` 的 argv 重写 |
+
+#### 一个被推翻的**前置设计决策**（重要）
+
+代码里原本写着**不走 jniLibs**，理由是：
+
+> "jniLibs 的 .so 会被 Android 校验并当作'库'加载，而 proroot 的 5 个 .so
+> 里只有 libproroot.so 是启动器、其余是运行时组件，混在 jniLibs 里反而
+> 要靠 rename 绕过（现有 proot 就是这么做的，代价是名字对不上、排查困难）。"
+
+**这个理由不成立。** proot 需要 rename，是因为它下载来的文件叫
+`proot-arm64`（不匹配 `lib*.so`，Android 直接忽略不打包）。
+而 proroot 五件套**原名就是 `lib*.so`**：
+
+```
+libproroot.so              ✓  libproroot-bridge.so        ✓
+libproroot-runtime.so      ✓  libproroot-stub-loader.so   ✓
+libproroot-linker.so       ✓
+```
+
+**全部匹配，一个都不用改名** —— 那条"代价"根本不存在。
+所以 ① 的成本从"要设计绕名方案"降到"改两行脚本"。
+
+#### 独立佐证：`libproot.so` 的 interp 也是 linker64
+
+改造记录里对五件套重新扫了一遍 `PT_INTERP`，顺带发现：
+
+```
+libproot.so                DYN  interp=/system/bin/linker64   ← 已在用！
+libproroot.so              DYN  interp=/system/bin/linker64
+libproroot-linker.so       DYN  interp=(none)
+libproroot-stub-loader.so  DYN  interp=(none)
+libproroot-bridge.so       EXEC interp=(none)
+libproroot-runtime.so      DYN  interp=(none)
+```
+
+**`libproot.so` 的 interp 同样是 `/system/bin/linker64`，而且它今天就在
+`nativeLibraryDir` 里正常工作** —— 这是"必须从 nativeLibraryDir 直接 exec"
+这条结论的**现成的、跑得通的佐证**，比任何论证都硬。
+
+#### 关键实现细节
+
+**双路径（与 `findProot` 同一形状）**：
+
+```
+nativeLibraryDir/libproroot.so   ← 优先（jniLibs 打包）
+filesDir/proroot/libproroot.so   ← 兜底（「导入 proroot」/ 一键下载）
+```
+
+`resolveProrootFile()` 是**逐文件**在两个目录里找，而不是整目录二选一 ——
+允许"jniLibs 里有一半、用户又手工补了另一半"这种混合状态。
+
+**③ 的注意点**：README 说启动器会从 `/proc/self/exe` 的 dirname
+**自动发现**组件，同目录时理论上不必显式设。但作者显式设了六个变量，
+我们跟着设 —— 显式路径比依赖自动发现更稳，成本为零。
+
+⚠️ 这五个路径变量是给 **launcher 自己**（宿主侧进程）读的，
+**不能跨 SELinux 边界**：指向 nativeLibraryDir 的路径，rootfs 内的
+linker 访问不到。guest 要用的那个库由 ④ 单独复制。
+
+**④ 的幂等做法**：源与目标**长度相同**即跳过复制。比时间戳可靠
+（Android 上 `copyTo` 后 mtime 未必如预期），也比每次无条件复制省。
+
+**⑤ 的两个易错点**：
+- `-b` 必须 `host:guest` 冒号对（proot 是单路径）——
+  连 `NATIVE_BIONIC_BINDS` 那条循环也要跟着改成 `"$p:$p"`；
+- `/dev/shm` 要绑到**应用可写**目录（`cacheDir/shm`），
+  不能直接绑宿主 `/dev/shm`（权限不足）。
+
+#### 验证状态（诚实标注）
+
+| 项目 | 状态 |
+|---|---|
+| Kotlin 编译（`compileDebugKotlin`） | ✅ 通过（36 tasks executed） |
+| `flutter test` | ✅ 693/693 |
+| `flutter analyze` | ✅ 7 条基线（全在 `third_party/`） |
+| Bug 440 逐字节门禁 | ✅ 两份 sha256 一致 |
+| `fetch_assets.sh proroot` 实跑 | ✅ 五个文件下载 + sha256 校验通过 |
+| **真机冒烟测试** | ❌ **未做** —— 这是唯一还没验证的一环 |
+
+⚠️ **本轮改动全部是"按作者实现照做"，不是"已验证能跑"**。
+真正的判据只有真机冒烟测试。跑通则开放卡片；若失败，
+以真机报错为准继续修正 —— **不再靠推测**（这是 Bug 471 四轮误判的教训）。
+
+**出现版本**：alpha.64 起
+**定性**：2026-09-21 真机判别实验
+**当前状态**：**五项改造已实施，待真机验证**（见上方验证状态表）。
+⚠️ 上面那句"已确认我方无解"是 **471e 之前的旧结论，已作废** ——
+471e 推翻了它（不是无解，是用错了加载器），471f 已按作者方式重做集成。
+保留这行是为了记录"我们曾经这么想过"。
+
+**真机副作用**：已全部还原 —— apt 源回到 bookworm 单行、临时文件清理、
+系统 `libc.so` 时间戳未变、`libdl.so` 恢复为不存在、`my_flutter` 项目零改动。
+
+---
+
+### Bug 471g：作者"直接能用"的那个包，为什么我们抄过来也不行（2026-09-22 查证）
+
+**触发**：用户看了截图后问了一句很关键的话 ——
+
+> "不能直接用了是吗？之前作者不是有项目可以直接用吗？具体卡点是哪里"
+
+这个问题**我此前没正面回答过**。答案是：**作者确实有能跑的包，但我们
+之前拿的那个版本不对，而这恰恰不是版本号的问题 —— 是 glibc 需求与
+rootfs 的匹配问题，并且它解释了"为什么换 rootfs 也没用"。**
+
+#### 查到的事实
+
+把 [andClaw](https://github.com/coderredlab/andClaw) 拉下来（它把
+`app/src/main/jniLibs/arm64-v8a/` 入库了，所以能直接对比）：
+
+| 文件 | 作者 (andClaw) | 我们 (v1.2.5) | 差异 |
+|---|---|---|---|
+| `libproroot.so` | 43,624 | 40,720 | +7% |
+| `libproroot-runtime.so` | **376,064** | 228,136 | **+65%** |
+| `libproroot-linker.so` | 79,408 | 71,216 | +11% |
+| `libproroot-bridge.so` | 23,624 | 23,624 | 相同 |
+| `libproroot-stub-loader.so` | 144,144 | 142,576 | +1% |
+
+`libproroot-runtime.so` **大了 65%** —— 差异集中在这里。sha256 全部不同。
+
+#### 卡点的真正位置
+
+`no offset table for glibc X` 这句来自 **`libproroot-linker.so`**
+（`grep -a "no offset table" *.so` 可复现定位）。它是 proroot 的
+**clean-room linker**（见作者 `THIRD_PARTY_LICENSES.md` 第 13 行：
+"The clean-room `libproroot-linker.so` package is the only bundled
+proroot linker artifact"）。
+
+这个 linker 干的事：**给 rootfs 里的 glibc 动态链接器打二进制补丁**，
+把 ptrace 那套（每次系统调用两次上下文切换）换成 LD_PRELOAD + 直接
+改内存布局。要改布局就必须知道 glibc 内部结构体的**字段偏移**，
+而这个偏移**每个 glibc 版本都不一样**，只能**逐个版本硬编码**。
+
+于是：
+
+```
+proroot-ldso: glibc 2.36  →  表里没有这个版本  →  补丁全部跳过
+                          →  结构体布局与预期不符
+                          →  运行期取到垃圾数据  →  SIGSEGV (139)
+```
+
+**所以 `no offset table` 不是警告，是"我放弃打补丁了"的宣言**，
+后面 139 是它的必然结果。
+
+#### 关键对比：两版的 glibc 需求
+
+用 `readelf -V` 读两版 `libproroot-runtime.so` 的符号版本需求：
+
+| | 需要的最低 glibc |
+|---|---|
+| 作者版 | **GLIBC_2.38** |
+| 我们版 (v1.2.5) | GLIBC_2.34 |
+
+而两边的 rootfs：
+
+| | rootfs | 提供的 glibc |
+|---|---|---|
+| 作者 | Ubuntu 24.04.3 base（`scripts/setup-assets.sh:34` 的 `ROOTFS_URL`） | 2.39 |
+| 我们 | Debian 12 bookworm | 2.36 |
+
+**作者的组合能跑，理由是 2.39 ≥ 2.38。** 这不是"Ubuntu 特殊"，
+是 Ubuntu 24.04 恰好带了个够新的 glibc。
+
+#### 这解释了两件此前想不通的事
+
+**① 为什么换 rootfs 没用。** 我们试过 Debian 13（glibc 2.41，比作者还新），
+配上 **v1.2.5** —— 报错仍是 `no offset table for glibc 2.41`。
+因为我们换的是 rootfs，**没换 linker**：老 linker 的表里本来就没有
+2.36+ 任何版本，换成 2.41 只是把"表里没有的版本号"从 2.36 变成 2.41。
+
+> **表里没有的版本，换什么 rootfs 都是没有。**
+
+**② 为什么"升版本"也不行（表面上）。** 早前试 v1.2.8 时失败得更早
+（`version 'LIBC' not found`），于是我们判"两个方向都堵死"。
+现在看，**那个方向其实是对的**：v1.2.8 要 GLIBC_2.38，和我们当时的
+Debian 12（2.36）不匹配 —— **但作者证明了配上 2.39 它就能跑**。
+当时的错误不是"选错了方向"，而是**只换了版本、没换 rootfs**，
+换了个措辞会死得更早的组合，就误以为此路不通。
+
+#### 更正后的结论
+
+proroot 的可用组合是**成对**的，缺一不可：
+
+```
+linker 的偏移表 ⊇ rootfs 的 glibc 版本
+        ↑ 由 proroot 版本决定        ↑ 由 rootfs 决定
+```
+
+| 组合 | linker 表 | rootfs glibc | 结果 |
+|---|---|---|---|
+| 作者：新版 + Ubuntu 24.04 | 含 2.38+ | 2.39 | ✅ 能跑（已验证，上架 Play） |
+| 我们：v1.2.5 + Debian 12 | 到 2.34 为止 | 2.36 | ❌ no offset table |
+| 我们：v1.2.5 + Debian 13 | 到 2.34 为止 | 2.41 | ❌ 同样报错（换汤不换药） |
+| 我们：v1.2.8 + Debian 12 | 含 2.38+ | 2.36 | ❌ LIBC not found（rootfs 太旧） |
+| **未试：新版 + Debian 13** | 含 2.38+ | 2.41 | **理论上可行 —— 但 glibc 2.41 在不在表里仍未知** |
+
+最后一行是**唯一还没试过、且逻辑上说得通的组合**。但它有前提没验证：
+新 linker 的表到底覆盖到哪个版本（2.38？2.39？2.41？）。
+**在不知道表内容之前，无法保证 2.41 在里面** —— 表里没有 2.41 的话，
+换 rootfs 又会回到 `no offset table`。
+
+#### 但我仍然建议先别投这个
+
+三个理由，按重要性排：
+
+1. **收益极小**。proroot 优化的是**容器层**（省掉 ptrace 的上下文切换）。
+   而 FOA 构建慢的大头是 **QEMU x64 指令翻译**（`gen_snapshot` /
+   `gradle` / `aapt2` 全是 x64 二进制）与 dart/gradle 自身的计算 ——
+   **这两项 proroot 一点都不改善**。它只对 I/O 密集型操作（apt 装包、
+   tar 解压、海量小文件读写）有感。不要指望构建时间从 10 分钟变 2 分钟。
+
+2. **会引入一个不能自控的依赖**。偏移表是上游**硬编码**的，且
+   `libproroot.so` 是 **proprietary**（作者 `THIRD_PARTY_LICENSES.md`
+   第 10 行："Proprietary (free to use; redistribution of modified
+   binaries is not permitted)"）。我们既不能改它，也不该把 rootfs
+   绑死在"某个 Ubuntu 版本"上 —— 那会让 rootfs 升级变成一个
+   "先确认 proroot 表里有没有这个 glibc"的**耦合决策**。
+
+3. **验证成本 > 收益**。要试就得：下新版五件套 → 换 Ubuntu 24.04 rootfs
+   → 重做五项集成 → 真机冒烟。而且**即使跑通，也只是拿到一个 I/O 优化**，
+   对"能不能构建"没有改变 —— 现在的官方 `libproot.so`（纯 ptrace、
+   不依赖任何偏移表）已经能构建。
+
+**所以我的建议**：把 proroot 卡片**保持劝退**（`isKnownUnusable() = true`），
+在文案里把上面这张"组合矩阵"讲清楚 —— 让想折腾的用户知道**该怎么试**，
+而不是我们替他试。想试的人按"新版 + Ubuntu 24.04"这个作者验证过的组合走。
+
+#### 通用教训（第 5 条）
+
+前面四条教训见 `proroot-结论报告.md` 第六节。这是第 5 条：
+
+> **"版本不匹配"这种结论，必须说明是哪两个东西在匹配。**
+> 我们前后说了三次"版本不对"（rootfs 版本 / proroot 版本 / 都换），
+> 但一直没把**"linker 的偏移表"**列为匹配的一方 —— 于是每次只动一半，
+> 每次失败，就误以为"此路不通"。**A 需要 X、B 提供 Y，那就必须
+> 同时看 X 和 Y 是否相容，只换 A 或只换 B 都是掷硬币。**
+> 作者能跑，不是因为他的包里藏了什么魔法，是因为他的 A 和 B 恰好合得上。
+
+**出现版本**：alpha.66 起（文案更新）
+**定性**：2026-09-22 对照作者入库产物查证
+**当前状态**：查清卡点，**不投入修复**；文案改为给出"该怎么试"的指引
+
+---
+
+### Bug 472：Web 预览比 APK 构建还慢——两条路径的瓶颈根本不在同一层（2026-09-20，评估）
+
+**现象**（用户实测）："apk 6 分钟就好了，web 要十多分钟。"
+
+这个对比**反直觉**：APK 要过 AOT（`gen_snapshot`）、Gradle、R8、
+资源编译（aapt2）——一堆重活；web 只是 DDC 编译 Dart 代码。为什么
+更重的那条路反而更快？
+
+**原因：两者被 QEMU 翻译的"代码量"差异极大。**
+
+先明确 FOA 的 x64 兼容层在做什么：Flutter 官方**没有** linux-arm64 版
+工具链（`artifacts.dart` 里挂着 `flutter/flutter#152281` 的 TODO），
+所以 `bin/cache/dart-sdk/bin/dart`、`linux-arm64/gen_snapshot` 这些
+都是 **x86_64 ELF**，靠转发脚本进 qemu-user 跑（见
+`lib/toolchain/qemu_compat.dart`）。**所有 Dart 层工具都是被翻译执行的。**
+
+于是关键差别在"谁在被翻译"：
+
+| | APK 构建 | Web 预览 |
+|---|---|---|
+| Dart 前端（kernel 编译） | 走一次 | 走一次 |
+| **后端编译** | **`gen_snapshot`**（x64，**被 qemu 翻译**） | **DDC `dartdevc`**（Dart 写的工具，**同样被 qemu 翻译**） |
+| 后端产物的"体量" | AOT 快照，一次成型 | **DDC 按模块产出一堆 `.js` + `.map`，逐模块翻译** |
+| Gradle/R8/aapt2 | 有，但**是 JDK 生态，非 dart** | 无 |
+| 首次编译的静默期 | 有日志 | **完全无日志**（Bug 454 已记录） |
+
+**核心洞察**：DDC 是**为开发期增量编译设计的**，它把应用切成大量
+细粒度模块分别编译，每次还要产出 source map、保留调试信息。
+这个"细粒度 × 带调试信息"的组合，在被 QEMU 逐条翻译时**放大了**
+——模块数量多、每个模块都要起一次编译动作、还有大量元数据 I/O。
+而 `gen_snapshot` 是**一次性的整体编译**，虽然单次重，但架不住
+"次数少"。
+
+换句话说：**APK 那条路赢在"后端只干一次"，web 这条路输在
+"后端要干很多次、每次都过 QEMU"**。Gradle/R8 那些重活是在
+JVM 里跑的**宿主原生代码**，根本不经过 qemu 翻译——所以它们
+并不像看上去那么贵。
+
+**已有的正确认识**（`Web预览预热收益评估.md`，alpha.62 周期）：
+"预热一个空白项目复用产物"**不成立**，因为 DDC 产物
+是项目专属的、不可互换（只引擎运行时那 ~8% 可复用，且那部分只是
+`cp`）。这个结论依然有效。
+
+**本轮补充**：那份评估里"引擎运行时 ~8% 可复用"的估算，
+**方向对但归因可以更准**——真正的可复用面比 8% 更小，因为
+DDC 产物里的模块引用是硬编码路径的，混用会直接运行时报
+"找不到模块"。**结论不变，但"不做"的理由更硬了。**
+
+**解决**：本轮**不改实现**，只把三件事写清楚（避免下一轮再走弯路）：
+
+1. **不要试图靠 proroot 提速 web 预览**。proroot 优化的是
+   **容器层**（`LD_PRELOAD` 路径翻译替代 ptrace 的两次上下文切换）；
+   而 web 预览的瓶颈是 **QEMU 指令翻译**——这两层在栈上完全不相干。
+   UI 文案已经写对了这一点（"proroot 一点不改善这两项"），保留。
+2. **真要提速，唯一有量级收益的方向是改掉"每次重新构建"这个设计**
+   —— 接 VM Service 做真正的 hot reload（增量 patch 而不是整包重编），
+   那是另一个量级的工程。
+3. **短期可做的仍是那两项**（`pub get` 复用、`--profile` 实测），
+   合计预期远不足以让"十多分钟"变成"一两分钟"，**不要在 UI 上
+   暗示用户会变快**。
+
+**验证**：本次为评估，无代码改动；结论记入本条目与
+`Web预览预热收益评估.md` 的交叉引用。
+
+**通用教训**：**比较两条性能路径之前，先确认它们的瓶颈在不在同一层**。
+"更重的构建更快"这种反直觉现象，几乎总是因为——
+**你以为的重活根本没在慢的那一层上**。APK 的重活在 JVM（宿主原生），
+web 的重活在 Dart（经 QEMU 翻译）——只有后者付翻译税。
+
+**出现版本**：alpha.57（web 预览引入）起一直如此
+**修复版本**：本轮不修（评估澄清）
+
+---
+
+### Bug 471b：终端里 `wget` 能装上、UI 里装不上——下载器从不创建父目录（2026-09-20，alpha.65 修复）
+
+**症状**（用户报）：
+
+> "之前我们在终端里不是可以 `wget` 下载安装成功吗？怎么做成 UI 就不行了。"
+
+真机 UI 报：
+
+```
+PathNotFoundException: Cannot open file,
+  path = '.../files/rootfs/debian/opt/foa-bin/cloudflared.dl.p0'
+  (OS Error: No such file or directory, errno = 2)
+```
+
+**先分清 errno**：`errno = 2` 是 **ENOENT（打不开）**，
+**不是句柄失效**。如果是"文件被别的分片删了、句柄还拿着"，
+报的会是 `File closed` 之类。所以这个报错的含义是——
+**那个文件连同它的父目录，在 `open()` 的那一刻都不存在**。
+
+这一点直接把排查方向从"竞态"拉到了"目录不存在"。**errno 是这里
+最有价值的线索，不要跳过去**。
+
+**原因**：`downloadMultiSource` **从头到尾没有创建过父目录**。
+它把"父目录已存在"当成了**调用方的责任**。
+
+那为什么终端能成功？因为终端里那行命令是：
+
+```bash
+mkdir -p <dir> && wget -O <dir>/cloudflared ...
+```
+
+——**我们自己把目录建好了**，`wget` 才得以成功。而 UI 走的是
+`downloadMultiSource` 这段 Dart 代码，它没有那一句 `mkdir -p`。
+
+更绕的是：`cloudflared_install.dart` 里**确实有** `mkdir -p $dirPath`，
+所以乍看"代码是建目录的"。但它在**下载成功之后的落位步骤**里
+（step ③），而失败发生在**下载**（step ②）——**时序上晚了一步**，
+目录还没建，下载先挂了。
+
+**解决**（`lib/toolchain/sdk_downloader.dart`）：让**下载器自己**
+保证父目录存在（幂等，已存在则 no-op）：
+
+```dart
+final parent = Directory(File(savePath).parent.path);
+if (!await parent.exists()) {
+  await parent.create(recursive: true);
+}
+```
+
+位置在分片区间计算**之前**，这样无论走分片还是整文件兜底路径
+都已经有目录。
+
+**为什么修在下载器里、而不是在调用方补一句 `mkdir`**：
+这类"把前置条件推给调用方"的写法**在本项目里已经坑过多次**
+（Bug 464 的 gradle 读写不对称是同一类）。下载器的契约应该是：
+**给它一个路径，它负责把文件放进去**——不需要调用方先替它铺路。
+调用方越少知道下载器的内部前提，就越不容易漏掉。
+
+**验证**：真机复现路径 —— UI 点「安装 cloudflared」，
+容器内 `/opt/foa-bin/` 目录**预先删除**，安装仍应成功。
+
+**通用教训**：**"终端里能跑"不等于"代码里该能跑"——要问"终端里
+我做对了哪件代码没做的事"**。终端命令往往把好几个隐含前提
+（`cd` 到某处、目录已建、环境变量已设）**显式写在同一行里**，
+而代码里这些前提是**隐式**的，只有写的人知道。用户报
+"终端能、UI 不行"时，**最高效的动作是把终端那行命令逐段拆开，
+找出哪些段落在代码里没有对应物**。
+
+**出现版本**：alpha.60（cloudflared 接入）～ alpha.64
+**修复版本**：v0.1.0-alpha.65
+
+---
+
+### Bug 473：终端手工起的隧道公网访问 502——隧道通，但 8977 上没人听（2026-09-21，工具补齐）
+
+**症状**（用户实操）：在真机终端里手工装好 cloudflared 并起隧道，
+日志**一切正常**：
+
+```
+Your quick Tunnel has been created! Visit it at:
+https://position-there-blank-absent.trycloudflare.com
+Registered tunnel connection connIndex=0 ... location=lax10
+```
+
+但用这个地址访问，返回 **502 Bad gateway**。
+
+**先纠正一个误判**：用户以为"cloudflared 下载又失败了"。**并没有**——
+`Length: 37466252` 与保存字节数一致、`--version` 正常输出、
+隧道注册成功。**下载和隧道两条都是好的。**
+
+**502 的含义**：Cloudflare 把请求**送到了**你手机，但**回源失败**
+（手机上的 cloudflared 连不上 `127.0.0.1:8977`，或那里没人应答）。
+502 是"路通了、目的地没人"——**不是**"路不通"。
+
+**原因**：`8977` 是 **App 进程内的 MCP 服务**
+（`McpServer`，`HttpServer.bind(InternetAddress.loopbackIPv4, 8977)`），
+它**只在 App 里点「远程协助 → 启动隧道」时才被拉起**。
+
+而 UI 那条路的启动顺序是**三步**（`tunnel_service.dart`）：
+
+| # | 步骤 | 手工做时 |
+|---|---|---|
+| ① | `McpServer.I.start()` → 绑 8977 | ❌ **漏了** |
+| ② | `CloudflaredInstall.ensure()` → 下载 | ✅ 做了 |
+| ③ | `cloudflared tunnel --url ...` | ✅ 做了 |
+
+手工只做了 ②③。**隧道起来了，但回源目标是个空端口。**
+
+> **这件事的普遍性**：cloudflared 只负责"把公网请求转给 8977"，
+> 它**不检查** 8977 上有没有人。所以"隧道建好了"这个信号，
+> 完全不蕴含"服务可用"。两个独立的东西，日志里看不出区别。
+
+**解决**：新增 `tools/foa-sh-mcp.sh` —— **纯 shell 的终端版 MCP 服务**，
+补上那个缺口。它提供与 App 版**同名同参数**的 7 个工具
+（`foa_info` / `foa_diag` / `run_command` / `read_file` / `write_file` /
+`list_dir` / `list_projects`），走同一套 MCP 协议。
+
+为什么是 shell 而不是别的：容器 rootfs 是 **Debian minbase**，
+**没有 python3、没有 socat、没有 curl**（只有 wget）。能用的只有
+POSIX sh + coreutils + `nc`。
+
+**开发中实测踩到的三个坑**（都写进了脚本注释，别删）：
+
+| # | 坑 | 现象 | 修法 |
+|---|---|---|---|
+| 1 | `nc -l` 遇 stdin EOF 立刻退出 | 客户端发完请求半关闭写端 → nc 死 → 响应发不出去 → `Empty reply from server` | 用 **FIFO 撑住 nc 的 stdin**，并持有读端 fd |
+| 2 | "处理完再挂下一个监听"有空窗 | ~1s 窗口内端口没人听 → 连发的第 2 个请求 `Connection refused`，表现为"**第一个成功、后面全失败**" | **先挂下一个 listener，再处理当前请求** |
+| 3 | JSON 转义未还原 | `write_file` 写出字面量 `\n` 而不是换行（`od -c` 实锤） | 参数统一过 `json_unescape`；**先还原 `\n`、最后还原 `\\`** |
+
+**已知局限**（脚本头部如实写明，不藏）：
+
+- **同一时刻只服务一个连接**——实测 3 并发只有 1 个成功，另 2 个
+  `Connection reset by peer`。顺序请求没问题（连发 10/10 全过）。
+  MCP 客户端通常是顺序发的，所以正常用法不会暴露。
+- 不支持 chunked / keep-alive；参数解析只认扁平 JSON；
+  **没有 App 版那套单飞锁与审计日志**。
+
+**它是应急/排障通道，不是 App 版的替代品。**
+
+**验证**：新增 `test/foa_sh_mcp_test.dart` **15 项** ——
+shell 语法（dash+bash）门禁、上述三个坑的防回归断言、
+协议契约（端口/路由/鉴权/202/工具清单/isError/黑名单）、
+以及"文档与实现不许打架"（说了不并发就必须真写着）。
+另在沙箱里做了**真实端到端实测**：健康检查、鉴权 401、
+`initialize` / `notifications/initialized` / `tools/list` / `tools/call`
+全序列、文件读写（`od -c` 验字节）、黑名单拦截、连发 10 次全过。
+
+**通用教训**：**"隧道建好了" ≠ "服务可用"。** 隧道是**传输层**，
+它只保证"公网包能到这台机"；服务是**应用层**，"这个端口有没有人应答"
+是另一回事。日志里所有信号都来自传输层，所以**传输层全绿也可能是
+端到端全挂**——必须从**外部**真的发起一次请求才算验证过。
+（这条与 Bug 466「探测通过 ≠ 能下完」是同一族：**间接信号不能替代
+端到端验证**。）
+
+**第二条教训**：**"手工在终端能跑通"和"产品里能跑通"是两条路径，
+别假设前者蕴含后者。** 本 Bug 里用户手工做了 ②③、漏了 ①，
+而 ① 恰好在 UI 里是自动的。手工验证时要问自己：
+**"我这一步，产品里是由谁负责的？"**——Bug 471b 也是同一个形状
+（终端那行 `mkdir -p` 是手工补的，UI 里没人补）。
+
+**出现版本**：alpha.60（远程接管引入）～ 今
+**修复版本**：本轮补齐工具（`tools/foa-sh-mcp.sh`）
+
+---
+
+### Bug 474：终端版 MCP 脚本"语法全过、实测全错"——四个坑串成一条链（2026-09-21，工具修好）
+
+**背景**：写 `tools/foa-sh-mcp.sh`（见 Bug 473）时，`sh -n` / `bash -n` /
+`dash -n` **三个 shell 语法检查全部通过**，但真跑起来**四个问题同时爆**，
+而且症状互相掩盖、极难定位。
+
+**总教训（先说最重要的）**：**语法通过 ≠ 能工作。这一轮我在这句话上
+栽了四次。** 每个坑单独看都很小，但它们的**表征全是"响应为空/超时"**，
+从表象完全无法区分——只能逐层带 `-x` 剥开。
+**凡被执行的脚本，必须真发一次请求才算验证过**（已写成单测守住）。
+
+---
+
+#### 坑 1：`--serve-one` 分流的位置——"尽早"不是"最靠前"
+
+**症状**：`run_single_connection: not found`。
+
+**原因**：shell 解析 `if ... fi` 这个**复合命令**时会**整体读入**。
+我为了"尽早分流"把它放在文件最前面，此时函数尚未定义 → 找不到。
+（shell 确实是"执行到才解析"，但**解析粒度是整个复合命令**，
+不是单条语句。）
+
+**第二次踩**：移到文件**最底部**（紧贴函数定义之后，看着很自然）——
+函数是有了，但**启动横幅 + 挑监听器**在它前面先跑。socat 拉起的
+每个子进程都会：① 打印一遍横幅（日志刷屏）；② 走到"挑监听器"
+**卡住不处理连接** → `curl: Operation timed out with 0 bytes received`。
+
+**唯一正确位置**：**函数定义之后 ∩ 横幅之前**。这两个条件之间只有
+一个位置。
+
+**教训**：**"尽早"指的是"在不需要的逻辑之前"，不是"在文件最前面"。**
+判断这类顺序问题要问：**"这段代码依赖什么已经就位？"**（函数已定义）
++ **"什么不该在它之前跑？"**（横幅/监听器）。
+
+---
+
+#### 坑 2：参数名两端不一致——`cmd` vs `command`
+
+**症状**：`run_command` 返回**空输出 + exit=0**，看起来"成功"；
+黑名单**永远命中不了**（`rm -rf /` 直接放过）。
+
+**原因**：脚本里写 `json_str_field "$body" "cmd"`，而 App 版
+（`mcp_server.dart` 第 471 行）和 `tools/list` 声明里都是 `command`。
+客户端发 `command` → 脚本取 `cmd` → **永远拿到空串** →
+`/bin/sh -c ""` → 空输出、退出码 0。
+
+**为什么难查**：它**不报错**。返回的是"成功的空结果"，
+而空结果在终端工具里太常见了（命令本来就是 `true`？路径不对？
+权限问题？），不会第一时间怀疑参数名。
+
+**修法**：参数名与 App 版**逐字对齐**；并加一条**空 command 直接拒绝**，
+让同类错误下次立刻暴露而不是静默。
+
+**教训**：**同一个协议在两个实现里出现两个名字，是 bug 的温床。**
+凡是"跨语言/跨进程复述一份契约"的地方（工具名、参数名、字段名），
+必须有一处**权威**并写测试锁住（本项目的做法：以 `mcp_server.dart`
+为准，脚本跟着它，单测断言两边一致）。
+
+---
+
+#### 坑 3：字段抽取用 `[^"]*` → 在转义引号处**静默截断**
+
+**症状**：`write_file` 写 `a\nb\tc\"d\\e`，落盘只有 9 字节里的前 7 个
+（`a\nb\tc\`），**`d\e` 整段丢失**。
+
+**原因**：原来用
+
+```sh
+grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\""
+```
+
+`[^"]*` 遇到**转义的引号** `\"` 就停了 —— 它不区分"这个引号是
+内容的一部分，还是值的结束符"。于是整个值的后半段**在进入
+`json_unescape` 之前就已经没了**。
+
+**为什么难查**：内容"只是短了点"，而且 `json_unescape` 那一层
+看起来逻辑是对的（我还专门为它写了转义顺序的注释与测试）。
+**我花了很久在 `json_unescape` 里找，实际错在它上游一步。**
+
+**修法**：改成 awk 逐字符扫描，**显式区分转义引号与结束引号**。
+
+**教训**：**正则的"否定字符类"处理不了"带转义的同种字符"。**
+只要数据里可能出现 `\"`，`[^"]*` 就一定是错的。
+排查这类"内容被截断"问题时，要在**每一层之间**都看一眼长度
+（`od -c`），不要只在最终产物上看——**错在哪一层，
+和错在哪个函数，经常不是同一个地方。**
+
+---
+
+#### 坑 4：索引偏移 `p + klen + 1` → 全部字符串字段变空
+
+**症状**：修完坑 3 后，`method` 变成空串，启动日志打印
+`→  (id=3)`，所有请求都回 `不支持的方法：`。
+
+**原因**：`pat = "\"" key "\""`，**含两侧引号**，长度是 `klen + 2`。
+而我把下一个字符的位置写成 `p + klen + 1` —— 那停在 **key 的收尾
+引号**上，不是冒号。于是 `!= ":"` 判定失败 → `continue` →
+函数**返回空串**。
+
+**修法**：`q = p + klen + 2`。
+
+**为什么难查**：`method` 空 → 报"不支持的方法"，
+**看起来像协议解析问题**（客户端发的 body 有问题？）
+而不是"字段抽取函数算错了下标"。
+
+**教训**：**`index()` 的下标算法要把"匹配串本身有多长"算进去。**
+写 `index()` + `substr()` 组合时，始终问：
+**"p 指向的是匹配串的第一个字符，那么匹配串占据 [p, p+len-1]，
+下一个字符是 p+len。"** 差一在这里不是差一点，是差全部。
+
+---
+
+**四个坑的共同形状**：
+
+| 坑 | 表层症状 | 真实位置 | 为什么难定位 |
+|---|---|---|---|
+| 1 分流位置 | `not found` / 超时 | 代码顺序 | 语法检查全过 |
+| 2 参数名 | **空输出但 exit=0** | 跨实现的契约 | 不报错，像"成功" |
+| 3 转义截断 | 内容短了一截 | 抽取层（非还原层） | 往错误的函数里找 |
+| 4 索引偏移 | **全部字段为空** | 下标算术 | 症状像"协议错" |
+
+**它们全部满足**：**语法检查通过、不抛异常、表征收敛到"响应为空"。**
+这就是为什么必须**真发起一次请求**、并且**逐层看中间值**。
+
+**落地**：`app/test/foa_sh_mcp_test.dart` 从 15 项增到 18 项，
+把这四个坑**各写一条断言钉住**（含"索引必须是 +2 不是 +1"
+和"参数名必须是 command"这种精确到字符的检查）。
+
+**出现版本**：本轮开发中（未出包）
+**修复版本**：本轮
+
+---
+
+### Bug 475：构建静默挂死 26 分钟 —— 代理黑洞 + "清空重建"误伤框架仓库（2026-09-21，出包受阻）
+
+**症状**：`flutter build apk --release` 输出停在
+
+```
+Running Gradle task 'assembleRelease'...
+```
+
+然后**再无任何输出**。不是报错，不是超时，就是**不动了**。
+实测挂满 **26 分钟**，期间：
+
+| 指标 | 观测值 | 含义 |
+|---|---|---|
+| 4 个 JVM CPU | **全部 0.0%** | 不是在算，是在等 |
+| 内存 | 3.78 / 8 GB | **远未到顶 → 排除 OOM** |
+| 中间产物 | 0 个 | 连配置阶段都没走完 |
+
+**第一反应是错的**：我以为是 `gradle.properties` 里那套 OOM 老问题
+（Bug 469），因为症状"没输出"很像 daemon 被杀。但 `memory.events`
+没有 `oom_kill`、内存峰值离上限很远——**排除**。
+
+**真正的手段：线程栈。** 卡住时抓 `jstack`：
+
+```
+"Daemon worker" ... java.lang.Thread.State: WAITING
+  at sun.nio.ch.NioSocketImpl.timedRead
+  at sun.security.ssl.SSLSocketInputRecord.readHeader
+  at org.apache.http.impl.execchain.MainClientExec.execute
+  at org.gradle.internal.resource.transport.http.HttpClientHelper.performHttpRequest
+  at ...DefaultExternalResourceArtifactResolver.downloadByCoords
+  at ...DefaultMavenPomMetadataSource.create
+  at ...ExternalResourceResolver.resolveStaticDependency
+```
+
+**结论一目了然：卡在一个 HTTPS 请求上**，而且是在解析依赖元数据。
+
+**根因**：沙箱把三个上游仓库解析到了代理黑洞网段 `198.18.0.x`：
+
+```
+dl.google.com            → 198.18.0.21
+repo.maven.apache.org    → 198.18.0.24
+plugins.gradle.org       → 198.18.0.25
+```
+
+**TCP 层能连上，但 TLS 握手后永不返回数据。** 不是"拒绝"、不是"超时"，
+是**挂住**。Gradle 默认没有针对这种"连上了但不回包"的超时，
+于是无限等下去。`ss -tnp` 能看到 java 进程开着到 `198.18.0.21:443` 的
+ESTAB 连接，一直不动。
+
+`198.18.0.0/15` 是 RFC 2544 保留网段（基准测试用），被代理软件拿来做
+透明转发——**解析到它就说明流量进了代理，而代理没把这个域名接上**。
+
+---
+
+#### 修复过程：两层，缺一不可（第一层单独上反而更糟）
+
+**第一层：让死域名快速失败。** 把黑洞域名指向 `127.0.0.1`
+（写进 `~/.user_hosts`，因为 `/etc/hosts` 工作区重启会被还原）：
+
+```
+127.0.0.1 dl.google.com
+127.0.0.1 repo.maven.apache.org
+127.0.0.1 plugins.gradle.org
+```
+
+效果：从"挂 26 分钟"变成"**8 秒失败**"。**但构建仍然不过**——
+因为失败信息暴露了下一层问题：
+
+```
+Could not resolve com.android.tools.build:gradle:8.13.1
+  > Could not get resource 'https://dl.google.com/.../gradle-8.13.1.pom'
+    > Connect to dl.google.com:443 failed: Connection refused
+```
+
+而这两个 artifact **明明已在本地缓存**（pom / module / jar 都在）。
+
+**第二层：摘掉死仓库（但绝不能 clear）。** 项目原本已有
+`~/.gradle/init.gradle`（Sep 17 写的，只**前插**阿里云镜像）。
+前插不够——项目自己声明的 `google()` 仍在列表末尾，Gradle 没命中镜像
+就继续去试它。所以要把死仓库**从列表里摘掉**。
+
+> ⚠️ **这里我踩了本 Bug 最值钱的一跤**：第一版我写的是
+> `repositories.clear()` 然后重建为纯镜像。看着更"干净"，结果报：
+>
+> ```
+> Could not resolve io.flutter:arm64_v8a_release:1.0.0-06a2e2a...
+> ```
+>
+> **Flutter 插件会往 `rootProject.allprojects` 注入引擎仓库**
+> `$FLUTTER_STORAGE_BASE_URL/download.flutter.io`
+> （见 `FlutterPlugin.kt` 第 100 行）。`clear()` 把它一起清掉了——
+> 而那个 artifact **只在 Flutter 自己的仓库里有，任何公共镜像都没有**。
+>
+> **教训：「清空重建」看着干净，实则会误伤框架注入的仓库。**
+> 正确姿势是**精确摘除已知不可达的几个，其余原样保留**。
+
+最终修法（`~/.gradle/init.gradle` 追加）：
+
+```groovy
+def deadHosts = ['dl.google.com', 'repo.maven.apache.org', 'repo1.maven.org',
+                 'plugins.gradle.org', 'jcenter.bintray.com']
+def stripDeadRepos = { repos ->
+    repos.removeAll { r ->
+        def u = (r.hasProperty('url') ? r.url?.toString() : '') ?: ''
+        deadHosts.any { u.contains(it) }
+    }
+}
+allprojects { p ->
+    // 子项目 buildscript（url_launcher_android 这类插件自带 google()）
+    p.buildscript.repositories { repos ->
+        stripDeadRepos(repos)
+        repos.maven { url 'https://maven.aliyun.com/repository/public' }
+        // ... 其余三个阿里云镜像
+    }
+    p.afterEvaluate { stripDeadRepos(p.repositories) }
+}
+```
+
+结果：**102 秒构建完成**（对比挂死 26 分钟）。
+
+---
+
+#### 第三个坑：我自己的 `pub get` 污染了 `pubspec.lock`
+
+排查途中我跑了一次**没带 `PUB_HOSTED_URL`** 的 `flutter pub get`，
+把 `pubspec.lock` 里 **59 处** `pub.flutter-io.cn` 全改成了 `pub.dev`
+（而 `pub.dev` 在本沙箱同样不可达）。这一度让我误判"是依赖版本漂移导致
+url_launcher_android 升级"。
+
+**教训**：`pubspec.lock` 是**锁定文件**，跑 `pub get` 前务必确认镜像
+环境变量已设；一旦被改写，用 `git checkout pubspec.lock` 还原，
+不要顺着它的差异去分析——那是自己制造出来的噪声。
+
+---
+
+**通用教训**：
+
+1. **"没输出"要先分清是"在算"还是"在等"。** 判据是 CPU 与中间产物：
+   CPU 0% + 产物不增 = 在等。**别凭症状像什么就下结论**（我第一反应
+   猜 OOM，浪费了一轮）。
+2. **线程栈是"卡住类"问题的第一手段。** `jstack` 一次就能从
+   "不知道为什么不动"跳到"卡在 SSL 读"。**没有栈就别猜。**
+3. **"连上了但不回包"比"连不上"难查得多。** 前者无限等、后者立刻报错。
+   遇到前者，把域名指向 `127.0.0.1` **把它转成后者**，问题立刻显形。
+4. **改仓库配置时，"摘除"优于"清空重建"。** 框架（Flutter/AGP）
+   会往你不知情的列表里注入仓库，`clear()` 会连它们一起清掉，
+   而报错信息（`Could not resolve io.flutter:...`）完全指不到你的
+   `clear()` 上。
+5. **别用自己的工具打断构建。** 我用 `timeout 1500` 包了几次构建，
+   结果是"构建被杀 + 残留中间产物损坏"（`mergeReleaseJniLibFolders`
+   报 `Failed to create MD5 hash`），又引入新噪声。**构建就该在后台跑完。**
+
+**出现版本**：仅影响构建环境（本沙箱），非产品代码
+**修复版本**：alpha.65 出包过程
+
+---
+
+### Bug 476：About 页的 proroot 版本停在 v1.2.8 —— 同一事实存两份（2026-09-21，出包验证抓到）
+
+**症状**：出包后做"包里到底是什么版本"的验证，从 `libapp.so` 里
+`strings` 出：
+
+```
+v1.2.5
+v1.2.8      ← 多出来的这个
+```
+
+Bug 471 已把钉死版本换成 **v1.2.5**，为什么包里还有 `v1.2.8`？
+
+**根因**：`lib/ui/about_info.dart` 的第三方组件清单里**写死了**版本号：
+
+```dart
+AboutComponent(
+  name: 'proroot',
+  version: 'v1.2.8',     // ← 换版本时漏改这里
+  ...
+)
+```
+
+`ProrootOption.pinnedVersion` 改成了 v1.2.5，About 页那份没人动——
+于是**用户看到的版本号与实际下载的版本不一致**，
+而且这个不一致只在 About 页可见，**任何测试都不会失败**。
+
+**修法**：不写死，引用唯一真源：
+
+```dart
+version: ProrootOption.pinnedVersion,
+```
+
+并加一条测试同时钉住两件事：
+① 展示值 == 常量值；② `about_info.dart` 里**不存在**写死的版本字面量。
+
+**怎么发现的**：**不是测试发现的，是"包里逐字节核对"发现的。**
+685 项测试当时全绿，`flutter analyze` 也只剩基线——
+**这个 bug 对整套自动化是隐形的**，只有真去看产物才暴露。
+
+**通用教训**：**"同一事实存两份"迟早打架。**
+Bug 474 的 `cmd`/`command` 参数名是同一个病。
+凡"版本号 / 字段名 / 端口 / 路径"这类事实，必须有一处权威，
+其余地方**引用**它。判断标准很简单：
+**"这个值改动时，我需要改几个地方？"** —— 答案是"不止一个"就有隐患。
+
+**第二条教训**：**出包后的"产物核对"不是走过场。**
+这次如果只跑测试 + `verify_apk.sh` 四件套就交付，这个 bug 会直接到用户手上
+（而且用户看到的是"版本号对不上"，第一反应会是"你根本没改吧"）。
+**测试全绿 ≠ 交付物正确**——测试验证代码逻辑，
+产物核对验证"装进去的到底是哪一版"。
+
+**出现版本**：本轮开发中（未出包）
+**修复版本**：alpha.65
+
+---
+
+### Bug 477：转义分号在 Dart 单引号串里怎么写 —— 三种写法混在一个文件里（2026-09-22，alpha.67 修复）
+
+**症状**：新写的 `project_importer.dart` 静态契约测试里，
+「清扫用 `-exec rm -rf {} \;`」与「去 CRLF + 补可执行位」两条断言
+**反复红**，改了三次都对不上。而**运行期完全看不出问题** ——
+没有报错、没有异常，`flutter analyze` 只给一条 info 级的
+`unnecessary_string_escapes`，很容易被当成噪声划过去。
+
+**原因**：这类转义有两层（Dart 编译一层、shell 解析一层），
+**叠加之后很难靠肉眼核对**：
+
+| Dart 源码写法 | analyzer | 求值后的字符串 | shell 看到 | 语义 |
+|---|---|---|---|---|
+| `'{} \\;'` | 无告警 | `{} \;` | `\;` | ✅ find 要的转义分号 |
+| `'{} \;'` | info: unnecessary escape | `{} \;` | `\;` | ✅ 也能跑，但提示误导人 |
+
+两者在**单引号字符串里求值结果相同**（Dart 遇到 `\;` 这种非合法转义
+会原样保留反斜杠）。真正的问题是**同批代码里三种同类转义写法各不相同**：
+
+```dart
+'-exec rm -rf {} \\; 2>/dev/null; '        // 双反斜杠
+'sed -i "s/\\r\$//" ...'                  // \r 双、$ 单
+'... -exec chmod +x {} \\; ...'            // 双反斜杠
+```
+
+而 analyzer 那条 `unnecessary_string_escapes` 会诱导你以为"单反斜杠
+就够了" —— 它说的是"写 `\;` 和写不写反斜杠效果一样"，
+**不是**"你该删掉一个反斜杠"。按这个直觉去改，就会在需要双反斜杠的
+地方写成单反斜杠，然后测试红、运行期照跑。
+
+**解决**：
+
+1. **统一**：所有要传给 shell 的转义分号一律写 `\\;`，
+   并在源码里留注释说明"Dart 单引号串里 `\\;` 才是发给 shell 的 `\;`"。
+2. **加断言钉住规则本身**，而不是钉住"我这次写对了"：
+
+```dart
+// Dart 单引号串里 `\\;` 才是发给 shell 的 `\;`
+expect(src.contains(r'-exec rm -rf {} \\;'), isTrue);
+```
+
+3. **补一条不依赖 `find` 的兜底**。写到这一步才发现更值得担心的事：
+   真机上 `tar`/`find` 来自 **toybox/busybox**，`-exec ... \;`
+   的支持并不统一。所以 `sweepStale()` 里补了两条能独立完成清理的路径：
+
+```dart
+'find ... -exec rm -rf {} \\; 2>/dev/null; '
+'rm -rf <stagingRoot>/<prefix>* 2>/dev/null; '
+'rmdir <stagingRoot> 2>/dev/null; '
+```
+
+三条路通一条即可清理成立；最后 `rmdir` 只在目录真空时成功，安全。
+
+**验证**：`flutter test test/import_export_project_test.dart` **63 项全绿**；
+其中「去 CRLF + 补可执行位」与「清扫用 `-exec rm -rf {} \\;`」
+两条直接钉住这两个转义。另用 Python 逐字符 dump（`hex(ord(ch))`）
+确认源码里确实是两个 `0x5c`。
+
+**通用教训一**：**当同一类写法在一个文件里出现三种变体时，
+说明没人真正搞清哪一种是"对的"。** 这时候该做的是查清规则并统一，
+而不是逐条试到测试变绿 —— 试绿的后果是测试钉住的是
+"我这次写对了"，不是"规则是什么"，下一个人照样会写错。
+
+**通用教训二（更重要）**：**analyzer 的 info 级提示里藏着重灾区。**
+`unnecessary_string_escapes` 读起来是"你多打了个反斜杠，删掉更干净"，
+但**跨语言边界（Dart → shell）的转义不适用这个直觉** ——
+删掉之后语义可能就变了。这类"info 级告警 + 跨语言语义"的组合，
+值得比 error 更认真对待，因为**它不会拦住你**。
+
+**通用教训三**：**这轮 63 条测试里，最有价值的不是"验证功能能跑"
+（那本来也验不了），而是这种"改错时不报错、只是行为不对"的契约。**
+`unzip -C` 是"忽略大小写"而不是"解压到目录"、`--exclude` 放在 `-C`
+之后会被当成文件名、`unzip -n` 遇同名静默跳过后**谎报成功** ——
+这三个坑**全都不报错**。静态契约测试是唯一能在沙箱里拦住它们的东西。
+
+**出现版本**：本轮开发中（未出包）
+**修复版本**：alpha.68
+
+---
+
+### Bug 478：模板卡片的「需Git」压住了模板名 —— `Badge.label` 是 overlay，不占布局（2026-09-22，alpha.69 修复）
+
+**症状**：创建工程面板里，五张非空白模板的图标右上角有个「需Git」小标签，
+它**右溢压到了相邻的模板标题首字上**（用户截图标注：「创建项目界面 git 与字重合」）。
+「Flutter 官方 Demo」被压成「**需Git**lutter 官方 Demo」的样子。
+
+**根因**：写的是 Flutter 官方的 `Badge`：
+
+```dart
+Badge(
+  label: const Text('需Git', style: TextStyle(fontSize: 9)),
+  isLabelVisible: t.needsGit,
+  child: Icon(t.icon, size: 26, ...),
+)
+```
+
+`Badge` 的内部实现是 `Stack` + `Positioned`：
+
+```dart
+Stack(children: [
+  child,
+  if (isLabelVisible)
+    Positioned(
+      top: .., end: ..,                 // alignment: AlignmentDirectional.topEnd
+      child: _Badge(...),               // 默认 offset: Offset(4, -4)
+    ),
+])
+```
+
+`Positioned` 在 `Stack` 里**脱离常规布局**，`Badge` 的尺寸就是
+`child` 的尺寸（26dp 的图标）。那个 4 字小标签按 `topEnd` 对齐往右上方
+**溢出到 child 边界之外**——它不占位、不撑大父容器、不触发换行，
+只是**画在外面**。于是正好盖住 `Row` 里的下一个孩子（模板标题）。
+
+**为什么看代码看不出来**：`Badge` 的 API 长得像"给图标加个角标"，
+读起来完全合理。`Positioned` 不参与布局这件事**不会报任何错**、
+不会 overflow 警告（`Stack` 默认 `clipBehavior: Clip.hardEdge` 只裁剪，
+不告警）。**只有真机截图能发现。**
+
+**修法**：换成占布局的普通组合——图标在上、「需Git」标签在下，
+纵向排列。标签挤占的是自己那一格的横向空间（26dp 图标改 24dp
+后竖排更窄），不再越界。
+
+```dart
+Column(mainAxisSize: MainAxisSize.min, children: [
+  Icon(t.icon, size: 24, ...),
+  if (t.needsGit) ...[const SizedBox(height: 3), const _NeedGitTag()],
+])
+```
+
+`_NeedGitTag` 另用 `warningContainer` / `warningBorder` / `warning`
+三个语义位（原先写死 `0x33FFB74D` / `0xFFFFB74D`，浅色主题下对比度不足）。
+
+**通用教训（这条比 bug 本身有用）**：
+**凡是"X 压住了 Y"的报障，第一个要查的是 X 是不是浮层。**
+候选名单：`Positioned` / `Stack` 里的非 positioned 孩子 /
+`Overlay` / `Badge.label` / `Tooltip` / `Transform` /
+`CustomPaint` 画到边界外 / 负 `margin`。
+这些的共同点是**不参与常规布局**，所以 `Row`/`Column` 完全不知道
+它们存在，该换行时不换行、该缩时不缩。
+
+判断方法：把 X 那层临时换成 `Container(color: red)`——
+如果红色块只有 child 那么大、标签是"飘在外面"的，
+那就是浮层，改 `Row`/`Column` 的参数一律没用。
+
+**出现版本**：alpha.24 起（Step 8 引入「需Git」角标）
+**修复版本**：alpha.69
+
+---
+
+### Bug 479：主题三档的「跟随系统」折成两行 —— 分段控件里 4 个字装不下（2026-09-22，alpha.69 修复）
+
+**症状**：设置页「主题模式」的 `SegmentedButton` 里，第三档显示为
+「跟随
+系统」两行，与左右两档（「浅色」「深色」各 2 字、单行）视觉不齐。
+用户报障：「部分卡片内字分行不好看」。
+
+**根因**：`SegmentedButton` 与 `expandedInsets: EdgeInsets.zero` 配用时，
+**三档等分宽度**——每档约 `(屏宽 - 卡片内边距) / 3`。
+「跟随系统」4 个字（含两侧 icon 18dp + 间距）需要的宽度超出这一格，
+`Text` 就按默认行为折行了。
+
+**为什么不能靠"调小字号"解决**：字号降到能单行放下的程度
+（大约 10sp）会比左右两档明显小一号，反而更不齐。
+**这不是度量问题，是文案长度问题。**
+
+**修法**：文案 `跟随系统` → `系统`。三档合起来仍读作
+「浅色 / 深色 / 系统」，语义不变（`ThemeMode.system` 的中文惯例
+就是「跟随系统」，但在空间受限的分段控件里「系统」不会歧义）。
+另给三个 label 都补 `maxLines: 1, overflow: TextOverflow.ellipsis`
+作为兜底——将来字体放大或本地化变长时，宁可省略号也不要静默折行。
+
+**通用教训**：**在"等分宽度"的容器里，文案长度是最窄那一档的约束。**
+`SegmentedButton` / `TabBar`（非 scrollable）/
+`BottomNavigationBar` / 固定列数的 `GridView` 都属此类。
+往这类容器里放文案前先问一句：**"最长的那一档放得下几个字？"**
+放不下就**改文案**，别改度量——度量一改就跟相邻档不齐了，
+而"不齐"比"字少"更显眼。
+
+配套地，本轮还顺手把「外部 → 容器」按钮（`OutlinedButton.icon`
+默认左右内边距各 16dp + icon-label 间距 8dp）的水平内边距收到 8dp、
+字号降到 12，让完整文案单行容纳——**这次是度量问题**，
+因为按钮不是等分对齐的，改内边距不影响与谁对齐。
+
+**出现版本**：alpha.61 起（设置页改版时引入三档分段控件）
+**修复版本**：alpha.69
+
+---
+
+### Bug 480：About 卡片把版本号折在中间 —— `ListTile.subtitle` + 手动 `\n` + `isThreeLine`（2026-09-22，alpha.69 修复）
+
+**症状**：设置页「关于」卡片的副标题显示成：
+
+```
+v0.1.0-alpha.68+68 · 作者 hao
+thtrteen
+引用了 12 个第三方项目
+```
+
+版本号没断，**作者名断了**；而用户的第一眼观感是"版本号那行排版事故"。
+
+**根因**：副标题是一整段拼接串 + 手动 `
+`：
+
+```dart
+subtitle: Text(
+  '${AboutInfo.version} · 作者 ${AboutInfo.author}\n'
+  '引用了 ${AboutInfo.components.length} 个第三方项目',
+  style: const TextStyle(fontSize: 12, height: 1.4),
+),
+isThreeLine: true,
+```
+
+`ListTile` 在位 `isThreeLine: true` 时给 subtitle 的**高度是固定的**，
+但不控制**断点**。拼接串里手动 `
+` 只保证"这里是硬换行"，
+不保证"这一段放得下"——第一段
+`v0.1.0-alpha.68+68 · 作者 haothtrteen` 在副标题可用宽度里放不下，
+于是在 `hao` 与 `thtrteen` 之间**再折一次**，变成三行。
+
+**修法**：拆成两个独立 `Text`，各占一行、各带 `maxLines: 1` +
+`overflow: ellipsis`；去掉 `isThreeLine`（subtitle 只吃两行）：
+
+```dart
+subtitle: Column(
+  crossAxisAlignment: CrossAxisAlignment.start,
+  mainAxisSize: MainAxisSize.min,
+  children: [
+    const Text(AboutInfo.version, maxLines: 1, overflow: TextOverflow.ellipsis, ...),
+    Text('作者 ${AboutInfo.author} · 引用了 ${AboutInfo.components.length} 个第三方项目',
+         maxLines: 1, overflow: TextOverflow.ellipsis, ...),
+  ],
+)
+```
+
+**Dart 语法坑（写到这才发现）**：这一对 `Text` **不能都加 `const`**。
+第一条能（`AboutInfo.version` 是 `const String`），
+第二条不能——`AboutInfo.components` 是 `List`，
+`.length` **不是常量表达式**，`const` 化会报：
+
+```
+error - The property 'length' can't be accessed on the type
+'List<AboutComponent>' in a constant expression. - const_eval_property_access
+```
+
+反过来，如果两条都不加 `const`，analyzer 又会给第一条
+`prefer_const_constructors`。所以这里**必须混用**，
+且最好留一句注释说明"别顺手统一"。
+
+**通用教训**：**手动 `
+` 拼接的文案，断点是不可控的。**
+`
+` 只声明"我要在这里换行"，不声明"这一段一定放得下"。
+凡是"已知长度的字段 + 已知长度的字段"拼一行，都该拆成
+**独立的 `Text` + `maxLines`**，让每个字段自己决定是被省略
+还是完整显示，而不是让渲染器在某个字段中间随机折断。
+
+**出现版本**：alpha.61 起（关于卡片改版时引入）
+**修复版本**：alpha.69
+
+---
+
+### Bug 481：工程列表和顶栏两个 🔄 —— 两个按钮覆盖的功能范围不同却长得一样（2026-09-22，alpha.69 修复）
+
+**症状**：主页「工程」标签下，标题行右侧有一个 🔄（tooltip「刷新工程列表」），
+顶栏 AppBar 右侧也有一个 🔄（tooltip「重新检测」）。用户报障：
+「工程主页卡片和顶栏有两个刷新🔄按钮应去掉一个」——
+**两个都有 tooltip，但手机上没有 hover，用户看不到区别。**
+
+**根因**：两个按钮**确实做的是不同的事**：
+
+| 位置 | 回调 | 实际行为 |
+| --- | --- | --- |
+| 工程标题行 | `_loadProjects` | 只重扫 `/root/projects` 目录 |
+| AppBar | `env.refresh()` | 重跑**全套环境检测**（rootfs / 工具链 / 设备信息）+ 内含重扫工程 |
+
+功能上不重复（后者是前者的超集），但**图标完全相同**，
+且都在首屏可见 —— 用户没有信息去分辨它们。
+
+**修法**：删掉工程标题行那个。
+理由：AppBar 的「重新检测」是**超集**（包含重扫工程），
+且它是环境出问题时唯一的恢复入口（必须有）；
+工程列表另有 `RefreshIndicator` 下拉刷新，
+**删掉这个按钮不减少任何能力**。
+
+**通用教训**：**"功能不重复"不等于"用户能分辨"。**
+判断两个按钮该不该并存，不能只比回调函数，
+要比**用户能否在 1 秒内说出它们的区别**。
+说不出 = 视觉噪音，删一个。
+
+反面做法是"给它们换不同图标/加角标来区分"——
+除非两者都是高频操作，否则**减法比加法对**：
+需求是"去掉一个"，不是"让它们看起来不一样"。
+
+**另外**：删这类按钮时**必须检查超集/子集关系**。
+这次差点删错的是 AppBar 那个（它看起来"更远、更不相关"），
+但它是超集；删掉它 = 环境检测失去唯一手动入口。
+所以补了一条**反向断言**：
+
+```dart
+expect(home().contains('重新检测'), isTrue,
+    reason: '删掉它 = 环境检测没有任何手动入口');
+```
+
+**出现版本**：alpha.33 起（工程列表改版时引入）
+**修复版本**：alpha.69
+
+---
+
+### Bug 482：`unzip -l` 查不到图标 —— release 包会混淆资源文件名（2026-09-22，alpha.69 修复）
+
+**症状**：给 `verify_apk.sh` 新加了第 5 项"图标已应用"，逻辑是遍历
+四条预期的资源路径做存在性检查：
+
+```bash
+for res in \
+  "res/mipmap-mdpi/ic_launcher.png" \
+  "res/mipmap-xxxhdpi/ic_launcher.png" \
+  "res/drawable-xxxhdpi/ic_launcher_foreground.png" \
+  "res/mipmap-anydpi-v26/ic_launcher.xml" \
+; do
+  echo "$LISTING" | grep -q "$res" || ICON_MISSING="$ICON_MISSING $res"
+done
+```
+
+跑出来**四项全"缺失"**，直接判红。但那个 APK 明明是刚构建的、
+`git status` 里图标资源都改过、手机上装上去图标也对。
+
+**根因**：release 构建**默认会混淆资源文件名**。APK 里实际长这样：
+
+```
+res/bB.png   res/yi.png   res/tP.png   res/BM.png   res/CH.png
+res/8G.xml   res/BW.xml   res/Zn.xml   res/8K.xml
+```
+
+`mipmap-xxxhdpi/` 这层目录名和 `ic_launcher` 这个文件名**都不存在了** ——
+AGP 把它们压平成一串短名。**`unzip -l` 的"文件名"字段在 release 包里
+没有任何语义**。
+
+唯一稳定的是 `resources.arsc` 里保留的**资源 ID + 逻辑名**，
+所以必须换工具：
+
+```bash
+aapt2 dump resources "$APK" | grep -E 'resource .* (mipmap/ic_launcher|\
+drawable/ic_launcher_foreground|color/ic_launcher_background)$'
+```
+
+**顺带发现的第二处**：改完之后想"抽一张图验配色"，
+但物理路径同样得从 `arsc` 反查：
+
+```bash
+FG_PATH="$(aapt2 dump resources "$APK" \
+  | grep -A 8 'resource .* drawable/ic_launcher_foreground$' \
+  | grep '(xxxhdpi)' | grep -oE 'res/[^ ]+\.png' | head -1)"
+```
+
+**第三处（更隐蔽）**：验配色的采样点坐标。前景层是把内容缩到
+中心安全区（`SAFE_SCALE = 0.62`）后画出来的，如果直接拿满幅图的
+几何比例（`0.64, 0.455`）去取像素，**会落在透明区域上**，
+取到 `000000`（透明黑）—— 又是一次假红。正确写法要做安全区换算：
+
+```python
+ox = (1 - SAFE) / 2
+px = im.getpixel((int((ox + gx * SAFE) * w), int((ox + gy * SAFE) * h)))
+```
+
+**通用教训一（可推广）**：**release 包与 debug 包是两种不同的观测对象。**
+凡是"从 APK 里按名字找东西"的检查，都要先问一句：
+**这个名字在 release 构建后还在吗？** 受影响的范围：
+资源文件名（被混淆）、类名/方法名（被 R8）、
+Dart 符号（被 tree-shake / AOT）。
+**不受影响**的只有：`AndroidManifest.xml` 的显式字符串、
+`resources.arsc` 里的资源逻辑名、`lib/*.so` 的文件名、asset 路径。
+
+> 📌 顺便回头看了第 4 项（proroot 合规检查）——它用的也是
+> `unzip -l | grep -i proroot`，**在 release 包上却是能用的**。
+> 原因：`.so` 文件名不做混淆，且没有哪条无关路径里含 "proroot"。
+> **这是碰巧成立，不是设计成立。** 如果将来查的是"某个短字符串
+> （如 `abc`）是否入包"，`unzip -l` 就会给出噪声。
+> 这条已写进 `fetch_assets.sh` 的注释里提醒后来者。
+
+**通用教训二**：**新加的门禁要拿真实产物试一次，不能只看逻辑对不对。**
+这项检查如果没在出包后实跑，就会一直是"看着很对、实际全红"的状态，
+而且因为它是**第 5 项**（原先是四件套），很可能被当成
+"新加的检查不稳定，先注释掉"处理掉。
+
+**通用教训三**：**假红比假绿更值得警惕。**
+假绿会让人放心地交付错东西；假红会让人**不再相信这个检查**，
+进而在真出问题时也忽略它。这里连踩三个假红
+（文件名混淆 / 路径未反查 / 采样点未换算），
+每一个都长得像"图标真的没打进去"。
+
+**出现版本**：本轮开发中（未出包）
+**修复版本**：alpha.69
+
+---
+
+### Bug 483：生成代码里 `const` 包着 `Theme.of(context)` —— 编译错误，但字符串测试发现不了（2026-09-22，alpha.70 修复）
 
 **症状**：
+
+「设计」区生成的 Dart 文件，用户放进项目后 `flutter analyze` 报：
+
 ```
-<关键错误日志 / 报错信息>
+error • Const variables must be initialized with a constant value
+        • lib/generated/design_20260922_160300.dart:31:18
+```
+
+但生成器自己的 41 条单测**全绿**。
+
+**原因**：
+
+代码生成器为了"更像手写代码"给文本节点加了 `const`：
+
+```dart
+const Text('标题', style: TextStyle(color: Theme.of(context).colorScheme.primary)),
+//                                                       ^^^^^^^^^^^^^^^^^^^
+//                                                       Theme.of(context) 不是常量表达式
+```
+
+关键点：**单测断言的是字符串内容，不是可编译性**。
+`code.contains("const Text('标题'")` 是 `true` —— 测试通过，
+而这份代码根本编译不过。**字符串级测试天然看不见语法/类型错误。**
+
+**解决**：
+
+生成器按"有没有主题色"决定加不加 `const`：
+
+```dart
+final hasThemeColor = _colorOf(node.props['color']) != null;
+// ⚠️ 带主题色时**不能**加 const：Theme.of(context) 不是常量表达式
+final c = hasThemeColor ? '' : 'const ';
+```
+
+并补两条断言把两个方向都钉死：
+
+```dart
+test('选了主题色时不能加 const（Theme.of 不是常量表达式）', () {
+  expect(code.contains('const Text('), isFalse);
+  expect(RegExp(r"const\s+Text\([^)]*Theme\.of").hasMatch(code), isFalse);
+});
+test('没选颜色时加 const（纯字面量，省对象也更像手写代码）', () {
+  expect(code.contains('const Text('), isTrue);
+});
+```
+
+**更大的教训**：字符串断言只是**便宜的近似**。真正的验证是
+**把生成物喂给 `flutter analyze`**。本轮做了一次性验证：
+
+```bash
+# 把各模板的生成物临时放进 lib/ 下（有 package resolution），再分析
+flutter analyze lib/_gencheck/
+# → 0 error，只有 prefer_const_* 级 info
+```
+
+> ⚠️ 别把生成物复制到 `/tmp` 再分析 —— 那里没有 Flutter 包解析，
+> 会刷出 140 条 `Target of URI doesn't exist: 'package:flutter/material.dart'`
+> 这种与生成物无关的假红。
+
+**验证**：`test/design_model_test.dart` 的两条 const 断言通过；
+生成物在项目内 `flutter analyze` 零 error。
+
+**出现版本**：本轮开发中（未出包）
+**修复版本**：alpha.70
+
+---
+
+### Bug 484：`'$padText('` 被当成标识符 —— 字符串插值后跟字母要加花括号（2026-09-22，alpha.70 修复）
+
+**症状**：
+
+```
+Error: Undefined name 'padText'.
+    lines.add('$padText(');
+                ^^^^^^^
+```
+
+连着 10 处同样的错：`padAlign` / `padSizedBox` / `padTextField` /
+`padContainer` / `padIcon` / `padListTile` / `padCard` / `padconst`…
+
+**原因**：
+
+Dart 的 `$name` 简写插值**会贪婪地吃掉后续所有标识符字符**：
+
+```dart
+final pad = '  ';
+'$padText('   // → 变量名被解析成 `padText`，不是 `pad` + `Text`
+'${pad}Text(' // ✅ 正确：显式界定变量名边界
+```
+
+这和 Bug 483 是同一类问题：**代码生成器本身也会写错**，
+而它错的方式是"生成器源码编译不过"（这次还算幸运，直接报错）。
+
+**解决**：
+
+```bash
+# 只替换 $pad 后面紧跟标识符字符的情况，不碰 $pad} / $pad, / 独立的 $pad
+python3 -c "
+import re
+s = open('lib/project/design_model.dart', encoding='utf-8').read()
+s = re.sub(r'\$pad(?=[A-Za-z_])', '\${pad}', s)
+open('lib/project/design_model.dart', 'w', encoding='utf-8').write(s)"
+```
+
+**同一个坑在测试里又踩了一次**：
+
+```dart
+reason: '直接拼 Icons.$unknown 会生成编译不过的代码');  // ❌ $unknown 未定义
+reason: r'直接拼 Icons.$未知名字 会生成编译不过的代码');  // ✅ raw 字符串，不插值
+```
+
+写法：**要输出美元符号本身时用 raw 字符串 `r'...'`**。
+
+**验证**：`flutter analyze` 无 `undefined_identifier`。
+
+**出现版本**：本轮开发中（未出包）
+**修复版本**：alpha.70
+
+---
+
+### Bug 485：生成的代码嵌套层级"看着是平的" —— 绝对缩进拼不出来，要用相对缩进（2026-09-22，alpha.70 修复）
+
+**症状**：
+
+生成物语法正确、能编译，但**缩进完全看不出一层套一层**：
+
+```dart
+return Scaffold(
+      body: SafeArea(
+        child: SingleChildScrollView(
+      child: Padding(          // ← 比上一行还浅，看着像平级
+        padding: const EdgeInsets.all(24),
 ```
 
 **原因**：
-<根本原因分析>
+
+第一版生成器把 `indent` 层级**当参数传下去，各分支自己拼好绝对缩进**：
+
+```dart
+static List<String> _build(DesignNode node, int indent) {
+  final pad = '  ' * indent;      // 每个分支自己算绝对缩进
+  ...
+}
+```
+
+父节点包裹子节点时又加一次缩进 → **双重缩进**；
+而"自动推算该收几层括号"的逻辑碰到
+`SafeArea` 里再套 `SingleChildScrollView` 这种多层 open 必然错位。
 
 **解决**：
-<具体解决步骤>
+
+改成**相对缩进**：各分支返回**不含缩进**的行列表，
+嵌套时由父节点统一加一层。层级由嵌套结构本身决定，**不可能算错**。
+
+```dart
+/// 递归生成节点代码，返回**相对缩进**（左对齐）的行列表。
+static List<String> _build(DesignNode node, {bool asRoot = false}) { ... }
+
+/// 给一组行统一加一层缩进。
+static List<String> _indentAll(List<String> lines, [int extra = 1]) {
+  final pad = '  ' * extra;
+  return lines.map((l) => l.isEmpty ? l : '$pad$l').toList();
+}
+```
+
+收尾括号也从"自动推算"改成**调用点显式给** —— 调用点最清楚自己开了几层：
+
+```dart
+static List<String> _wrap(
+  List<String> inner, String open, {
+  List<String> args = const [],
+  List<String> prelude = const [],
+  List<String> epilogue = const [],   // ← 显式给，不让工具猜
+  int childDepth = 1,
+  String close = '),',                // ← 嵌套用 `),`、语句收尾用 `);`
+}) { ... }
+```
+
+**顺带修掉的两处"看不出来但影响可读性"的**：
+- `children: [` 里的元素要比开括号多缩一层（否则列表项和括号齐平）
+- 分号要并进收尾括号（`);`），不能 `;` 独占一行
+
+**验证**：补了缩进断言 —— 光断言"有没有这个字符串"发现不了缩进全平：
+
+```dart
+final cardIndent = _indentOf(code, 'Card(');
+final textIndent = _indentOf(code, 'Text(');
+expect(textIndent, greaterThan(cardIndent),
+    reason: '卡片内子节点的缩进必须比 Card 本身更深');
+```
+
+**出现版本**：本轮开发中（未出包）
+**修复版本**：alpha.70
+
+---
+
+### Bug 486：组件树永远只有一行「页面（N 项）」—— `ListView` 的 children 只给了根节点（2026-09-22，alpha.71 修复）
+
+**症状**：
+
+设计区右侧「组件树」标签页只有一个根行，点它前面的 `>` 展开箭头**没有任何反应** ——
+子节点一个都不出现。但预览区渲染得好好的（图标、欢迎回来、邮箱框、登录按钮全在），
+说明树里**确实有内容**，只是树面板没画出来。
+
+```
+[组件树]
+> 页面（11 项）        ← 点箭头，什么也不发生
+                       ← 应该是：页面 → Column → Text / TextField / ...
+```
+
+**原因**：
+
+`_treeRow(DesignNode node, int depth)` **早就支持递归所需的全部东西**：
+`depth` 参数、缩进计算（`6.0 + depth * 14`）、展开箭头、`_collapsed` 折叠状态。
+它写得完全正确。
+
+问题出在**调用点**：
+
+```dart
+// alpha.70 的 _treePanel —— 错的
+Expanded(
+  child: ListView(
+    padding: const EdgeInsets.symmetric(vertical: 6),
+    children: [
+      _treeRow(_root, 0),        // ← 只生成了根节点这一个 Widget
+    ],
+  ),
+),
+```
+
+`ListView` 的 `children` 是个**扁平列表**，`_treeRow` 返回的又是一个扁平 `Widget`
+（它不嵌 `Column`，缩进靠 `depth` 算）。所以字面上"放根节点进去"就等于
+"树上只有一个节点" —— **没有任何一层递归去生成子节点的行**。
+
+这是最典型的一类接线漏项：**编译得过、运行时不抛异常、功能静默失效**。
+`_treeRow` 的 `depth` 参数成了摆设，`_collapsed` 永远查不到任何 id
+（因为能折叠的那些行压根没被创建）。
+
+**解决**：
+
+补一个前序遍历，产出的**扁平行列表**直接展开进 `children`：
+
+```dart
+Expanded(
+  child: ListView(
+    padding: const EdgeInsets.symmetric(vertical: 6),
+    children: [
+      ..._treeRows(_root, 0),
+    ],
+  ),
+),
+```
+
+```dart
+/// 前序遍历设计树，返回可直接塞进 `ListView` 的**扁平行列表**。
+///
+/// 为什么是扁平的而不是嵌套 Widget：`ListView` 只吃扁平 children，
+/// 要嵌套就得换成 `Column` + `ListView` 混排，那会丢掉回收能力
+/// （树深了卡）。缩进靠 `depth` 算，不靠嵌套。
+///
+/// ⚠️ 折叠时必须**提前 return**。写成"跳过不画但继续递归"的话，
+/// 子节点的行**照样生成**、只是被藏在下一层，展开时行数就对不上、还会重复。
+List<Widget> _treeRows(DesignNode node, int depth) {
+  final rows = <Widget>[_treeRow(node, depth)];
+  if (_collapsed.contains(node.id)) return rows;
+  for (final child in node.children) {
+    rows.addAll(_treeRows(child, depth + 1));
+  }
+  return rows;
+}
+```
+
+同时给缩进加**钳制**：
+
+```dart
+padding: EdgeInsets.fromLTRB(6.0 + depth.clamp(0, 6) * 14, 0, 8, 0),
+```
+
+> 为什么要钳：alpha.71 加了「导入已有 UI」之后，树的深度**不再可控** ——
+> 用户手写的 `build` 里套十层容器很常见。不钳的话 `depth = 20` 是 286px 缩进，
+> 手机窄屏上文字直接被挤出屏幕。**只钳缩进、不钳递归**：第 7 层往后的节点
+> 照样渲染，只是不再往右挪。
 
 **验证**：
-<如何确认问题已修复>
 
-**出现版本**：<tag / commit>
-**修复版本**：<tag / commit>
+先**只加断言、跑一次确认它红**（证明断言真的是护栏，不是同义反复），
+再改实现。三条断言在 `test/design_wiring_test.dart` 的
+「设计区 · 组件树真的会展开」组：
+
+```dart
+// 1. children 来自递归展开（`..._treeRows(`），不是单个根节点
+expect(RegExp(r'\.\.\._treeRows\(').hasMatch(page), isTrue);
+expect(RegExp(r'children:\s*\[\s*_treeRow\(').hasMatch(page), isFalse);
+
+// 2. 折叠必须提前 return（正则精确匹配，不是"跳过不画"）
+expect(RegExp(r'if \(_collapsed\.contains\(node\.id\)\)\s*return rows;')
+    .hasMatch(body), isTrue);
+
+// 3. 缩进有钳制
+expect(page.contains('depth.clamp('), isTrue);
 ```
+
+改完 17/17 绿。
+
+**出现版本**：alpha.70
+**修复版本**：alpha.71
+
+---
+
+### Bug 487：`ListTile` 的文字全变成了「列表项」—— 属性静默回落到默认值，不报错（2026-09-22，alpha.71 修复）
+
+**症状**：
+
+导入已有 UI 时，用户写的每一个 `ListTile` 在树上、在预览里、在生成代码里
+标题都成了默认值「列表项」，副标题全空，左侧图标永远是默认的 `circle`。
+**整个过程不报错、不抛异常、树结构完全正确** —— 只有内容是假的。
+
+**原因**（三个独立的错，叠在一起）：
+
+**① `ListTile.title` 是 `Widget`，不是 `String`。**
+
+```dart
+ListTile(title: Text('首页'), subtitle: Text('12 条新消息'), leading: Icon(Icons.home))
+```
+
+导入器里写的是 `_stringLiteral(namedArgument('title'))` ——
+它拿到的表达式是 `Text('首页')`（一个 `InstanceCreationExpression`），
+不是字符串字面量，于是**恒返回 null**，随后回落到 `defaultProps()` 里的
+`'列表项'`。
+
+和 Bug 483 是同一类：**静默回落比崩溃更危险** —— 崩溃你至少知道出了问题。
+
+修法：用 `_buttonLabel2()`（先剥一层 `Text(...)` 再取字面量）：
+
+```dart
+final title = _buttonLabel2('title') ?? '列表项';
+```
+
+**② `ListTile.leading: Icon(Icons.home)` 拿到的是整个 `Icon` 构造。**
+
+`_iconNameOf` 只认 `PrefixedIdentifier` / `PropertyAccess` / `SimpleIdentifier`，
+面对 `Icon(Icons.home)` 一个都不命中 → 恒返回 null → 恒回落到 `'circle'`。
+
+修法：在 `_iconNameOf` **开头**先剥一层 `Icon`，再取 `Icons.xxx`。
+
+**③ 生成器里有一段残留的旧代码，把整段逻辑无条件覆盖了。**
+
+`case 'ListTile'` 之后遗留了三样东西：
+
+```dart
+// 一段被 Dart 解析成"空的 collection-if"的注释
+// 一个 `if (title != null) ...` 形式的集合元素
+// 以及一个无条件的：
+return <String>[...];        // ← 直接覆盖前面所有判断
+```
+
+因为生成器的 `_str` 会把 `'列表项'` 原样转成 `'列表项'`，
+表面上看起来像"用了默认值"，实际是**无条件走了这段旧代码**。
+
+**解决**：删掉残留段，title/subtitle 走 `_buttonLabel2`，leading 走修好的
+`_iconNameOf`。
+
+**验证**：`design_import_test.dart` 里补断言，直接对着用户写的字断言：
+
+```dart
+expect(node.props['title'], '首页');       // 不是 '列表项'
+expect(node.props['subtitle'], '12 条新消息');
+expect(node.props['leadingIcon'], 'home'); // 不是 'circle'
+```
+
+> 📌 **排查这类"内容不对但不报错"的问题，第一步永远是打印
+> `defaultProps()`**。如果日志里的值和 `defaultProps()` 一模一样，
+> 那就是解析没命中、回落了 —— 而不是"解析错了"。
+
+**出现版本**：alpha.71 开发中（未出包）
+**修复版本**：alpha.71
+
+---
+
+### Bug 488：导入时用户写的注释被静默吃掉 —— AST 里注释是 trivia，不挂在任何节点上（2026-09-22，alpha.71 修复）
+
+**症状**：
+
+「原样带回」承诺了未识别的 widget 会连注释一起吐回去，但实测：
+
+```dart
+// 第三方登录：等接了 SDK 再打开      ← 这句丢了
+ThirdPartyLoginRow(
+  onTap: _onThirdParty,
+),
+
+MyChart(), // 数据源                 ← 这句跑到了**下一个**节点身上
+Qux(),
+```
+
+出现**串位**和**丢失**两种错，都不报错。
+
+**原因**（五个坑，每个都踩了一遍）：
+
+**① 注释不在 AST 里，它是 trivia。**
+
+`node.offset..node.end` 切出来的源码**不含注释**
+（前导注释挂在 `node` 的**第一个 token** 上，行尾注释也是 token 属性）。
+所以一开始的 `source.substring(node.offset, node.end)` 必然丢注释。
+
+**② 存"源码切片"而不是 AST 子树，是唯一正确的做法。**
+
+AST 重新打印会丢注释、丢格式、丢用户的一切。存
+`source.substring(...)` 才能在生成时**原样吐回去**。
+（这也是整个"原样带回"设计的立足点。）
+
+**③ 行尾注释在解析器眼里是"下一个 token 的前导注释"。**
+
+```dart
+MyChart(), // 数据源
+Qux(),
+```
+
+`// 数据源` 挂在 **`Qux`** 的前导注释链上，不挂在 `MyChart` 上。
+所以"无脑往左捞"会把上一行的行尾注释也带进来 —— 出现**重复**
+（`// 数据源` 同时出现在 `MyChart` 和 `Qux` 的 raw 上）。
+
+最终判别规则（**单条**，别加第二条）：
+
+```dart
+// 注释必须①自己独占它前面那部分行，且②与节点之间没有实质代码
+_isBlankBetween(source, _lineStartOf(source, s), s)   // ①
+  && !_hasCodeBetween(source, e, node.offset)          // ②
+```
+
+`_hasCodeBetween` 要**剥掉 `/*…*/` 与 `//…`** 再看有没有非空白。
+
+**④ `Token.precedingComments` 是单向链表，不是 `List`。**
+
+```dart
+for (final c in firstTok.precedingComments)   // ← 编译不过，迭代出 Object
+```
+
+它是靠 `CommentToken.next` 串的链表，且 `Token.next` 的静态类型是
+`Token?` 而非 `CommentToken?`。
+
+**⑤ 沿 token 链 `next` 遍历会踩到自引用节点、死循环。**
+
+`main11.dart` 探针就是这么挂的（跑满 3 分钟被迫 kill）。
+所以**行尾注释改成直接扫源码**，不跟解析器的 trivia 存放策略绑死
+（那是实现细节，换个 analyzer 版本就可能变）：
+
+```dart
+// node.end 停在 `)` 上，往后第一个字符是列表元素的 `,` —— 必须先跳过，
+// 否则永远看不到注释
+var i = node.end;
+while (i < source.length && source[i] == ' ') i++;
+if (i < source.length && source[i] == ',') i++;
+while (i < source.length && source[i] == ' ') i++;
+if (source.startsWith('//', i)) { /* 吃到行尾 */ }
+```
+
+**⑥ 顺带两个同族的坑：**
+
+- **`ListLiteral.elements` 的元素类型是 `CollectionElement` 而非 `Expression`**
+  （可能是 `IfElement` / `ForElement` / `SpreadElement`），
+  只有 `Expression` 才可能是 widget 构造。
+- **Dart 把 `[ // 只有注释 ]` 解析成一个空的 collection-if**（`IfElement`），
+  **不是"空列表"**。当占位带走会生成半句 `if ()` —— **直接编译不过**。
+  判别：`sliceSource(source, e.thenElement).trim().isNotEmpty`。
+  ⚠️ 配套坑：`IfElement.thenElement` **非空**，写 `t == null` 会被
+  `flutter analyze` 报 `unnecessary_null_comparison`。
+
+**解决**：新增 `sliceSourceWithComments()`，前导注释用上面那条单一规则，
+行尾注释直接扫源码。
+
+**验证**：`design_import_test.dart` 的「未识别组件：原样带回」组里
+断言注释出现在 raw 里、且**不重复**：
+
+```dart
+expect(node.props['raw'], contains('// 第三方登录：等接了 SDK 再打开'));
+expect(RegExp('// 数据源').allMatches(entireGeneratedCode).length, 1);
+```
+
+**另外两条 API 备忘**（analyzer 14.4.0，实测确认，与直觉差异很大）：
+- `ClassDeclaration` **没有** `.name` / `.members` —— 是
+  `decl.namePart.typeName.lexeme` 与 `decl.body.members`
+- **`NamedExpression` 不存在** —— 命名参数是 `NamedArgument`，
+  取名字走 `.name.lexeme`（`name` 是 `Token`，不是 `Label`），
+  取表达式走 `.argumentExpression`
+- `ArgumentList.arguments` 的元素类型是 `NodeList<Argument>`（不是 `Expression`）
+- `SimpleIdentifier.name` 是 `String`（**不是** `.lexeme`）
+- **裸名构造走 `MethodInvocation`，`const X()` 走 `InstanceCreationExpression`**
+  —— `Text('x')` 是前者（`target == null`），`const SizedBox(...)` 是后者。
+  **两类都必须处理**，只处理一种会让另一类 widget 静默变成 unknown
+- `IfElement.thenElement` 非空（`CollectionElement`）
+- `Token` / `CommentToken` 从 `package:analyzer/dart/ast/token.dart` 导入；
+  `RecursiveAstVisitor` 从 `package:analyzer/dart/ast/visitor.dart` 导入
+  （从 `ast/ast.dart` 导入会报 not found）
+
+**出现版本**：alpha.71 开发中（未出包）
+**修复版本**：alpha.71
+
+---
+
+## 十、Flutter / Material 布局与主题（外观类问题）
+
+> 这一类 Bug 的共同特征：**编译通过、静态分析通过、单元测试通过，
+> 只有真渲染才暴露**。它们不会崩、不会打日志，只会让界面变丑或不可用。
+> 定位手段只有两个：**逐档屏幕宽度渲染** + **捕获 `FlutterError.onError`**。
+> 见 `test/home_layout_widths_test.dart` 与 `test/home_ui_alpha92_test.dart`。
+
+### Bug 634 · `Material` 的 `borderRadius` 与 `shape` **互斥**，同传给会运行时断言（2026-09-26，alpha.92）
+
+#### 症状
+
+配置页「快捷入口」的**六个格子全部变成黄黑相间的溢出条纹**，整块区域不可用。
+控制台报：
+
+```
+'package:flutter/src/material/material.dart': Failed assertion: line 209 pos 15:
+'!(shape != null && borderRadius != null)': is not true.
+```
+
+同一帧里**报 6 次**（每个格子一次）。`flutter analyze` 无任何提示。
+
+#### 根因
+
+`Material` 的构造参数里，`borderRadius` 与 `shape` 是**两种表达同一件事
+（外形）的方式**，框架明确不允许同时给。想同时要"圆角 + 描边"时：
+
+- `borderRadius` 只能表达圆角，**表达不了描边**；
+- `shape`（`RoundedRectangleBorder`）**两个都能表达** ——
+  `borderRadius` 走它的 `borderRadius` 字段，描边走 `side`。
+
+所以正确写法是**只给 `shape`**。
+
+这次的错误来源很典型：想给格子加一层描边（深色主题下
+`secondaryContainer` 与卡片底只差约 4% 亮度，没描边就糊在一起），
+于是**在原来 `borderRadius` 的基础上又加了 `shape`**，忘了它俩不能共存。
+
+#### 解决
+
+`lib/ui/home_page.dart` 的 `_ActionTile`：
+
+```dart
+// ❌ 错的
+return Material(
+  color: ...,
+  borderRadius: radius,          // ← 与下面的 shape 冲突
+  shape: RoundedRectangleBorder(
+    borderRadius: radius,
+    side: BorderSide(color: border),
+  ),
+  child: InkWell(borderRadius: radius, ...),
+);
+
+// ✅ 对的：形状只由 shape 表达
+final shape = RoundedRectangleBorder(
+  borderRadius: radius,
+  side: border == null ? BorderSide.none : BorderSide(color: border),
+);
+return Material(
+  color: ...,
+  shape: shape,
+  // ⚠️ InkWell **不**受这条断言约束（它是 Material 的 child，
+  // 形状参数不在构造参数里同时给两套），所以水波纹仍用 borderRadius 裁。
+  child: InkWell(borderRadius: radius, ...),
+);
+```
+
+#### 验证
+
+`test/home_layout_widths_test.dart` 逐档宽度（320/360/412/600/800dp）遍历
+三个 tab，用 `FlutterError.onError` 收集**全部**渲染期异常并断言为空。
+
+> ⚠️ 必须用 `FlutterError.onError` 而不是 `tester.takeException()`：
+> 后者一次只能取到一个异常，这批问题是**同一帧六个格子各报一次**
+> —— 只取一个会让"修好一个还剩五个"看起来像通过。
+
+#### 教训
+
+**给已有的 `Material` / `Card` 加视觉参数前，先查一眼它现有的同类参数。**
+"圆角"这件事在这两个 widget 上有两套 API，框架选的是互斥而不是合并。
+
+这类错误的可怕之处在于它**不报编译错**：`borderRadius` 和 `shape` 都是
+合法参数，IDE 不会飘红，`flutter analyze` 也不管运行时断言。
+唯一的防线是**真的把它渲染一遍**。
+
+**出现版本**：alpha.92 开发中（未出包）
+**修复版本**：alpha.92
+
+---
+
+### Bug 633 · `GridView.count` 的 `childAspectRatio` 让格子高度随屏宽浮动 → 静默挤压内容（2026-09-26，alpha.92）
+
+#### 症状
+
+「快捷入口」宫格里，格子内容（图标 + 文字）被**压到溢出边缘**。
+不报错（`RenderFlex` 把超出的部分压缩了），但：
+
+- 窄屏（320dp / 分屏）上文字被切掉下半截；
+- 宽屏上格子被拉成一条扁矩形，图标与文字之间空出一大片。
+
+#### 根因
+
+`childAspectRatio` 定的是格子的**宽/高比**，而格子宽度是**算出来的**：
+
+```
+格子宽 = (可用宽 - 间距 × (列数 - 1)) / 列数
+格子高 = 格子宽 / aspectRatio
+```
+
+于是在 360dp 手机上两列布局：
+
+```
+(360 - 20 - 32) / 2 ≈ 154dp 宽   →   154 / 2.2 ≈ 70dp 高
+```
+
+而内容恒定需要：
+
+```
+图标(28) + 间距(8) + 一行 13px 字(~18) + 上下内边距(16) ≈ 70dp
+```
+
+**卡在临界点上**。从 alpha.60 加进第 6 个入口（图标 30 → 28）起，
+这个差值就在 ±0 附近来回，任何一侧的字体度量变化都会把它压过去。
+
+#### 解决
+
+改用 `mainAxisExtent`：**高度是给定值，与屏幕宽度无关**。
+
+```dart
+GridView.count(
+  crossAxisCount: constraints.maxWidth >= 560 ? 3 : 2,
+  mainAxisSpacing: 10,
+  crossAxisSpacing: 10,
+  // ✅ 高度给定 —— 内容需要多少就给多少
+  mainAxisExtent: 92,
+  // ❌ childAspectRatio: 1.9 —— 高度会随屏宽反比浮动
+  children: [...],
+)
+```
+
+92 = 图标 28 + 间距 8 + 文字行高 ~22 + 上下内边距 16 + 余量 18。
+
+#### 验证
+
+`test/home_layout_widths_test.dart` 里有一条**度量断言**（比截图断言稳）：
+
+```dart
+final delegate = grid.gridDelegate as SliverGridDelegateWithFixedCrossAxisCount;
+expect(delegate.mainAxisExtent, 92);
+```
+
+外加那条逐档宽度的无异常断言。
+
+#### 教训
+
+**凡是"内容尺寸基本固定、只在外层重复 N 次"的宫格，都该用
+`mainAxisExtent` 而不是 `childAspectRatio`。**
+`childAspectRatio` 适合"等比缩放的图片格"这类场景 —— 那时高度**本来就应该**
+跟着宽度走。用错场景的表现就是"某些屏宽下刚好挤爆"。
+
+另外注意：**这个 Bug 在 alpha.60 就埋下了，一直没被发现**。
+说明"只在自己手上的那台设备上看一眼"是不够的 ——
+必须**逐档宽度**渲染，或者写成测试让 CI 来跑。
+
+**出现版本**：alpha.60（埋下）→ alpha.92（暴露并修复）
+**修复版本**：alpha.92
+
+---
+
+### Bug 632b · 顶栏 `transparent` + 状态栏实色 = 顶部一条可见色带（2026-09-26，alpha.92）
+
+> ⚠️ 编号与上文的 **Bug 632**（vendored `CodeController` 越界）**不是同一件事**，
+> 只是编号撞了。查这条请认标题里的"顶栏/状态栏"。
+
+#### 症状
+
+浅色主题下，屏幕顶部从上到下是**三段不同的颜色**：
+
+1. 状态栏：中性灰 `#F5F7F8`
+2. 顶栏（AppBar）：带一层淡绿的 `#F6FBF3`
+3. 内容区 / 卡片：近白 `#FBFCFD`
+
+分界线肉眼可见，像"顶栏没对齐"。深色主题下同理（`#101418` vs `#101510`），
+只是差值小、不那么显眼。
+
+#### 根因
+
+**Bug 457 只修了一半。**
+
+当时把状态栏从 `transparent` 改成实色（正确，否则透出的是 `styles.xml` 的
+深色窗口背景），但 `AppBarTheme.backgroundColor` **仍然是 `transparent`**。
+于是：
+
+| 元素 | 实际颜色 | 来源 |
+|---|---|---|
+| 状态栏 | `#F5F7F8`（中性灰） | `systemOverlayStyle.statusBarColor` |
+| 顶栏 | `#F6FBF3`（带绿调） | transparent → 透出 `scaffoldBackgroundColor` = M3 `surface` |
+
+**两者是两个不同的值，必然有色差。** M3 的 `surface` 由种子色（Android 绿）
+派生，所以浅色下带绿调；而手调的 `lightSurface` 是中性灰 —— 这就是那条色带。
+
+深色下更隐蔽：`scaffoldBackgroundColor` 被显式设成 `FoaTheme.bg = #101418`，
+而状态栏也是 `#101418`，**看起来是对的**；问题出在"顶栏透出的其实是
+`scaffoldBackgroundColor`，一旦有人改了它就会分叉"这个脆弱结构上。
+
+#### 解决
+
+让顶栏、状态栏、导航栏**三者同源**，都取 `panelBg(brightness)`：
+
+```dart
+// theme.dart：dark()/light() 合并成一个 _build(Brightness)
+final surface = panelBg(b);
+return ThemeData(
+  appBarTheme: AppBarTheme(
+    backgroundColor: surface,        // ✅ 从 Colors.transparent 改成实色
+    systemOverlayStyle: overlayFor(b),  // overlayFor 内部也用 panelBg(b)
+  ),
+);
+
+static SystemUiOverlayStyle overlayFor(Brightness b) => SystemUiOverlayStyle(
+      statusBarColor: panelBg(b),
+      systemNavigationBarColor: panelBg(b),
+      systemNavigationBarDividerColor: panelBg(b),
+      // 图标亮度按亮度取反
+      statusBarIconBrightness: b == Brightness.dark ? Brightness.light : Brightness.dark,
+      ...
+    );
+```
+
+同时 `lightSurface` 由 `#F5F7F8` 改成 `#FBFCFD` = `panelBg(light)`，
+并同步三处跨文件副本：
+
+- `android/app/src/main/res/values/colors.xml` 的 `foa_bg_light`
+- `android/app/src/main/kotlin/.../MainActivity.kt` 的 `applySystemBarColors` 兜底
+- `app/platform/android/MainActivity.kt`（模板副本，必须逐字节一致）
+
+#### 为什么深色的 `bg` 不跟着改
+
+深色下**刻意保留** `bg = #101418`（页面底）与 `panelBg = #14181E`（顶栏底）
+的 2.5% 差值：顶栏是一块"浮在页面上"的横带，同色会让顶栏与内容区糊成一片、
+看不出 AppBar 到哪儿结束。浅色下同值则更干净（浅色本来就靠描边分层）。
+
+#### 验证
+
+- `test/home_ui_alpha92_test.dart` 有 6 条：AppBar 背景非 transparent、
+  等于 `panelBg`、等于 `statusBarColor`、与 `overlayFor` 同源、
+  导航栏同色、`lightSurface == panelBg(light)`。
+- `test/bug457_statusbar_theme_test.dart` / `bug464_..._test.dart` 里那组
+  **跨文件同源断言**（Dart ↔ Kotlin ↔ XML）已同步到新色值 ——
+  这两条测试是本 Bug 最好的守门人，改色时它们会红。
+
+#### 教训
+
+**"沉浸式顶栏"（`backgroundColor: Colors.transparent`）的前提是
+"状态栏也透出同一个底色"。** 一旦状态栏被设成实色（而它必须如此，
+否则透出的是宿主窗口背景），这个前提就没了，顶栏必须改用同一个实色。
+
+另外：`dark()` / `light()` 各写一份主题时，凡是"两个主题都该有的令牌"
+都得写两遍，**漏写一份的表现就是"一边正常、另一边返祖"** ——
+Bug 457 正是这个形状。合并成 `_build(Brightness)` 之后，
+"两个主题长得不一样"只剩两个有名字的变量（底色 + overlay）。
+
+**出现版本**：alpha.60 ~ alpha.91
+**修复版本**：alpha.92
+
+---
+
+### Bug 631b · M3 默认 `Card` 与页面底色几乎同色，且 `elevation: 1` 把卡片压得**比背景更暗**（2026-09-26，alpha.92）
+
+> ⚠️ 编号与上文的 **Bug 631**（`setMethodCallHandler` 覆盖）**不是同一件事**。
+> 查这条请认标题里的 "Card"。
+
+#### 症状
+
+整页读起来像"一块没分层的灰板"：卡片与页面底色分不出来，只能靠卡片里的
+文字位置猜边界。用户的原话是"UI 更好看一点"、截图里"列表挤在一个大卡片里"。
+
+#### 根因
+
+两个因素叠加：
+
+**① `CardTheme.color` 默认取 `colorScheme.surface`**，而本项目的
+`scaffoldBackgroundColor` 也是从 surface 来的 → 两者几乎同值：
+
+| 主题 | 页面底 | Card 默认底 | 差值 |
+|---|---|---|---|
+| 深色 | `#101418` | `#101510` | 约 0.4% |
+| 浅色 | `#F6FBF3` | `#F6FBF3` | **0** |
+
+**② `Card` 默认 `elevation: 1`**，M3 会按 **surfaceTint** 把 5% 的
+`colorScheme.primary` 混进卡片色。而本项目的 `primary` 是**深绿**
+（深色下 `#12512E`）—— 把它混进一个深色底，结果是**卡片比背景更暗**，
+与"卡片应该浮起来"的意图完全相反。
+
+> 这个 5% 很容易记错：M3 文档里 `surfaceTint` 在
+> Elevation 1 时是 **5%**，不是常被引用的 8%（8% 是更高 elevation 档）。
+
+#### 解决
+
+在 `FoaTheme._build` 里显式给 `cardTheme`：
+
+```dart
+cardTheme: CardThemeData(
+  // ① 用 M3 的层级令牌而非手调字面量：surfaceContainerLow 比 surface
+  //    高一层，由种子色派生，天然按亮度适配（与 _drawerItem 用
+  //    secondaryContainer 同一理由）。
+  color: scheme.surfaceContainerLow,   // 深 #181D18 / 浅 #F0F5ED
+  // ② 归零：避免 surfaceTint 把卡片压暗，层次改用"提亮底 + 描边"
+  elevation: 0,
+  // ③ 描边不可省：深色下 #181D18 与 #101418 只差约 5% 亮度，
+  //    肉眼分不出边界。outlineVariant 是 M3 专为"弱边界"设计的令牌。
+  shape: RoundedRectangleBorder(
+    borderRadius: BorderRadius.circular(14),
+    side: BorderSide(color: scheme.outlineVariant),
+  ),
+  // ④ 默认 margin(4) 会在页面自己给的 padding 之上再吃一层，
+  //    让"卡片净宽"永远比设计意图少 8dp。间距改由页面显式给。
+  margin: EdgeInsets.zero,
+),
+```
+
+顺带把 `dividerTheme.color` 也接到 `outlineVariant`（默认的 `outline`
+在深浅两边都太重）。
+
+#### 连带修掉的一处历史包袱
+
+`ui_polish_test.dart` 里原本有三条 alpha.69 的断言，写的是：
+
+```dart
+expect(home().contains('margin: const EdgeInsets.symmetric(horizontal: 2)'), isTrue);
+```
+
+那是"**逐处抵消 `Card` 默认 margin**"的痕迹 —— alpha.69 为了让工程卡片宽一点，
+在 ListView padding 上收到 12、又在 Card margin 上压到 2。
+alpha.92 把根因挪到主题层之后，这三个魔数全部删除，
+断言翻成**反向**（"那组旧魔数不该以任何形式复活"）。
+
+#### 验证
+
+`test/home_ui_alpha92_test.dart` 有 7 条：Card 底色 ≠ 页面底、
+= `surfaceContainerLow`、elevation 为 0、有非零描边且色为 `outlineVariant`、
+圆角为 14、margin 为 `EdgeInsets.zero`、分隔线色随主题。
+
+#### 教训
+
+**"默认值能用"是个陷阱。** M3 的 `Card` 默认值是在"用一个 M3 派生色做页面底"
+的假设下调的；本项目为了控制色温**手调了** `scaffoldBackgroundColor`
+（避开种子色带来的绿调），这个手调动作**正好破坏了默认值的前提**。
+
+凡是**手写过主题令牌**的项目，都要顺带检查那些"依赖该令牌的默认值"还成不成立。
+具体到 Card：手调了 `scaffoldBackgroundColor` 就必须显式给 `cardTheme.color`。
+
+**出现版本**：alpha.69 起（手调 `scaffoldBackgroundColor` 时埋下）
+**修复版本**：alpha.92
+
+---
+
+### Bug 630b · `Colors.grey.shade400` 漏在语义色迁移名单外 → 浅色主题下读不出来（2026-09-26，alpha.92）
+
+> ⚠️ 编号与上文的 **Bug 630**（反向方法名对不上）**不是同一件事**。
+
+#### 症状
+
+浅色主题下，配置页 "设备 / ABI / rootfs / proot" 的**键名**
+与安装日志**几乎看不见**（`#BDBDBD` 压在近白底上）。
+
+#### 根因
+
+Bug 464 做语义色迁移时，清理名单是**枚举式**的：
+
+```dart
+// bug464_theme_and_download_test.dart
+if (src.contains('Colors.grey.shade500') ||
+    src.contains('Colors.grey.shade600')) { offenders.add(f.path); }
+```
+
+只列了 `shade500` / `shade600`，**`shade400` 不在名单里**，
+于是它带着"深色主题专用"的取值活到了浅色主题上。
+
+同时 `bug457`/`bug464` 的断言都是**黑名单式**（"不许出现这些值"）
+而不是白名单式（"必须用语义位"），所以漏网的值不会有任何测试报警。
+
+#### 解决
+
+`lib/ui/home_page.dart` 两处改走语义位：
+
+```dart
+// _StatusCard._kv 的键
+Text(k, style: TextStyle(color: FoaColors.of(context).muted, ...)),
+
+// _ActionCard 的安装日志
+Text(env.installLog, style: TextStyle(color: FoaColors.of(context).muted, ...)),
+```
+
+#### 验证
+
+`test/home_ui_alpha92_test.dart` 加了一条白名单式断言：
+
+```dart
+expect(home().contains('Colors.grey.shade400'), isFalse,
+    reason: '应走 FoaColors.of(context).muted');
+```
+
+#### 教训
+
+**黑名单式断言只能拦住"已知的坏值"。**
+`bug464` 那两条测试守住了 `shade500/600` 不再出现，却让 `shade400`
+堂而皇之地留在代码里 —— 而且是以"我已经迁移完了"的名义。
+
+更稳的写法是**白名单**：与其枚举所有不该出现的灰，不如断言
+"`lib/ui/` 下不该有任何 `Colors.grey.shade*`"（除非有明确豁免，
+如 `code_editor.dart` 里 Bug 431 要求保留的 `shade300`）。
+迁移类任务留一条"扫描全目录"的兜底断言，比列具体值可靠得多。
+
+**出现版本**：Bug 464 迁移时（alpha.69）
+**修复版本**：alpha.92
+
+---
+
+## 十一、构建提速（2026-09-27，alpha.93）
+
+> 设备端（手机 proot 容器 + QEMU 转译）构建慢的定性与提速尝试。
+> 这一章**最有价值的是两条负面结论**——它们都是沙箱实测出来的，
+> 能挡掉后来者重复踩坑。别只看"做了什么"，要看**什么被证明无效**。
+
+### 定性：慢在哪
+
+构建分 8 段（`build_progress.dart`），与耗时相关的只有两段，同一个原因：
+
+| 阶段 | 进度 | 是否走 QEMU 转译 |
+|---|---|---|
+| 配置 Gradle | 14~26% | 否（JVM，arm64 原生） |
+| **编译 Dart 内核** | 26~40% | **是**（dart 是 x64） |
+| **AOT 编译（gen_snapshot）** | 40~58% | **是**（官方只发 x64，慢 10~50 倍） |
+| 编译资源（aapt2） | 58~72% | 否（已原生化） |
+| Kotlin / dex（R8） | 72~86% | 否（d8/R8 是 Java） |
+
+**结论：超过三分之一的时间花在 QEMU 翻译 dart 与 gen_snapshot。**
+用户真机反馈"卡在 AOT 那一档"，与定性一致。
+
+### ⚠️ 手册内一处自相矛盾（已核实，影响优化方向）
+
+- §七（07 号文档）表格写：`gradle / d8 / R8` 纯 JVM，天然原生；
+- §十一（07 号文档 proroot 段）写：`gen_snapshot / gradle / aapt2 都是 x64 二进制`。
+
+**后者不对**。Gradle 主体是 JVM（gradle launcher 是 shell + JVM 进程），
+把它算进"QEMU 翻译开销"会误导人去折腾"原生化 Gradle"——那是白费力气。
+（`aapt2` 那一项确实曾是 x64，但已被 Commit451 原生件替换。）
+
+同理，**proroot 对构建速度零改善**：它省的是 proot 的 ptrace 开销
+（10~30%，只对 I/O 密集操作有感），对 QEMU 指令翻译和 dart/gradle
+自身计算无能为力。别把它当提速方案卖。
+
+### 负面结论一：Gradle 配置缓存会让构建**直接失败**（不是慢一点）
+
+实测（沙箱，Flutter 3.47.4 / AGP 9.1 / Gradle 9.3.1）：
+
+```
+org.gradle.configuration-cache=true
+```
+
+→ `BUILD FAILED in 1m 1s`。报错：
+
+```
+Configuration cache state could not be cached: field `queue` of
+`java.util.WeakHashMap` ... `com.flutter.gradle.DependencyVersionChecker
+$configureMinSdkCheck$1$minSdkCheckTask$1$1` ... task `:app:ReleaseMinSdkCheck`
+  error writing value of type 'java.lang.ref.ReferenceQueue'
+- Task `:app:ReleaseMinSdkCheck`: cannot serialize object of type
+  'org.gradle.api.internal.project.DefaultProject' ...
+  'DefaultConfigurationContainer' ... 'DefaultDependencyHandler' ...
+  'org.jetbrains.kotlin.gradle.internal.properties.PropertiesBuildService'
+```
+
+**根因在 Flutter 官方插件**：`DependencyVersionChecker` 的 task action
+捕获了 `Project` / `ConfigurationContainer` / `DependencyHandler` /
+`BuildService` 这些配置缓存禁止序列化的对象。本项目改不了，只能等上游。
+
+护栏断言已加在 `test/build_flavor_test.dart`（扫描 `sdk_installer.dart`
+不含 `org.gradle.configuration-cache`）。
+
+### 负面结论二：Gradle build cache 对本场景**零收益**
+
+实测同一改动（touch 一个 dart 文件）：
+
+| 配置 | Gradle 阶段耗时 |
+|---|---|
+| 基线（无缓存） | 121.9s |
+| `org.gradle.caching=true` | 121.6s |
+
+**差值 0.3s，噪声范围内。** 原因：
+
+- 改了 dart 文件 → AOT 及下游所有 task 输入全变 → 缓存命中不了；
+- 没变的 task 本来就被 Gradle 增量机制的 `UP-TO-DATE` 跳过 → 缓存无处发挥。
+
+build cache 的收益场景是"换工作目录 / clean 后重建"，而 FOA 是同一工程
+反复增量构建——增量机制已经覆盖了它想做的事。
+
+### 真正有效的：debug 构建档（alpha.93 落地）
+
+无法绕开的事实：**AOT 的大头是翻译开销，唯一能显著提速的就是不跑 AOT。**
+
+| | release | debug |
+|---|---|---|
+| Dart 编译 | AOT（gen_snapshot） | kernel（JIT） |
+| gen_snapshot | 必需，x64 + 转译 | **不参与** |
+| 产物 | 可上架 | 仅自测 |
+
+实现要点（`BuildFlavor`）：
+
+1. `build_runner.dart`：`start(flavor:)`、`buildCommand(flavor:)`，
+   生成 `--release` / `--debug`；**两处** build 命令（含 heal 自愈重跑）
+   必须同档位，写死一处会让"自愈后的第二次构建"跑回 release；
+2. debug 档**跳过** `precache --android_gen_snapshot`（预取的是 AOT 工具链，
+   debug 用不到，跑了还会触发一轮构件下载）；
+3. `_locateApk` 按 `flavor.apkName` 挑产物——debug/release 的产物
+   **会同时留在** `build/app/outputs/flutter-apk/`（不互相覆盖），
+   写死 `app-release.apk` 会让用户装上上一次的旧包；
+4. 偏好持久化 `FlavorPrefs`，**默认 release**（debug 产物不能上架，
+   静默改默认值等于换掉用户的产物性质）；
+5. 进度条 `skipAot`：把 `[0.58, 1.0]` 拉伸到 `[0.40, 1.0]`，
+   消掉 AOT 段那 18% 的空档，否则进度会跳一下。
+
+### ⚠️ 加 debug 档时**实际漏掉**的一条 bug
+
+进度映射的 Gradle 阶段正则原来只写 Release 变体：
+
+```
+mergeReleaseResources / compileReleaseKotlin / packageRelease / assembleRelease
+```
+
+而 debug 构建产出的是 `mergeDebugResources` / `compileDebugKotlin` /
+`assembleDebug`——**一条都匹配不上**，进度会从 40% 一路卡死到构建结束
+才突然 100%，看起来完全像卡住。
+
+已改为 `(?:Release|Debug)` 双变体，并由 `build_flavor_test.dart` 的
+"同时匹配 Release 与 Debug 变体"断言守着。这类"加新档位时旧正则漏匹配"
+是必然复发的形状，新加任何构建变体都要回头查一遍 `_rules`。
+
+### 仍未解决（诚实边界）
+
+- **首次 debug 构建要额外下载一套 engine 构件**：`arm64_v8a_debug` +
+  `flutter_embedding_debug`，从 Maven 拉（不是本地 Flutter SDK 缓存）。
+  沙箱实测确认本地只缓存了 release 构件（`find` 无任何 `*arm64_v8a_debug*`）。
+  手机上走阿里云镜像能否拉到 `io.flutter:*` **未真机验证**。
+- **沙箱无法实测 debug 的完整提速幅度**（`dl.google.com` 在沙箱被 TLS 掐），
+  上面的收益是原理推断 + 用户卡点反馈，不是端到端实测数据。
+- **根治方案仍未落地**：dart + gen_snapshot 原生化（版本须严格匹配
+  engine 06a2e2a1，Termux 现货 3.13.2 对不上）。
+
+## 十二、四项补齐：图标替换 / 磁盘检查 / Git 面板 / 正式签名（2026-09-28，alpha.93）
+
+本轮的四项都是"以前只有提示、没有入口"的功能。共同的实现约束：
+
+- **FsBridge 只走文本**：PNG、keystore 这类二进制既读不进 Dart 也写不回容器，
+  所以二进制操作全部在容器里用现成工具做（imagemagick / keytool / apksigner），
+  Dart 只负责拼命令与解析输出；
+- **App 进程零三方依赖**（alpha.27 移除 Kadb 时定的原则）：不引 `image`、
+  不引 Dart 版 git、不引签名库；
+- **Kotlin 侧 `/root/projects` 白名单**：因此 keystore 放 `/root/keystores`，
+  不放工程目录（顺带避免被 `git add -A` 提交、被"导出源码工程"带走）。
+
+### 12.1 图标替换（`lib/project/icon_replacer.dart`）
+
+渐进增强：先探针查工具，有 imagemagick → `convert -resize`，有 Pillow →
+PIL `LANCZOS`，都没有 → 直接 `cp`（能用，但原图太小会在高密度屏发虚）。
+UI 上如实写出降级行为，不吹"一定能生成精确尺寸"。
+
+### 12.2 磁盘空间检查（`DiskSpace` + `ToolchainEnsure.diskSpace`）
+
+`<800MB` 直接挡住构建，`<2GB` 继续但给提示。探测不到（`df` 异常）返回 null
+不挡路——**检查失败不能变成"禁止构建"**。
+
+### 12.3 Git 面板（`lib/project/git_panel.dart`，工作台新增「版本」区）
+
+只做 init / status / add / commit / log。**刻意不做** push / pull / 远端，
+也不做「丢弃改动」（不可逆，误点一次就丢工作），能力边界写在 UI 上。
+
+命令脚本抽成 `statusScript` / `initScript` / `commitScript` 三个纯函数，
+输出用固定标记分段，`GitRepo.parse` 是纯函数——解析逻辑因此能被单测覆盖，
+真机验证时也能把脚本贴进终端跑。
+
+#### ⚠️ 真机（真 git）跑出来的两个坑
+
+1. **`git log --pretty=format:` 在最后一条之后不换行**。
+   实测末条日志与后面的 `--END--` 粘成一行，解析出来 subject 尾巴挂着
+   `--END--`。必须用 **`tformat`**（terminator format）。
+2. **`git config --global --add safe.directory` 每次刷新都重复追加一条**。
+   改成先 `git config --global --get-all safe.directory | grep -Fqx <dir>`
+   判存在再 `--add`，否则 `~/.gitconfig` 会随刷新次数线性膨胀。
+
+另外 `git status --porcelain` 默认把未跟踪目录压成一行 `?? lib/`，
+面板没法按文件勾选，要加 **`-uall`** 展开。
+
+### 12.4 正式签名（`lib/project/signing.dart`）
+
+用容器里已有的开源工具，**不引任何新依赖**：
+`keytool`（容器 JDK）生成 JKS；`apksigner` + `zipalign`（SDK build-tools，AOSP）
+签名与验签。
+
+两条路径并列，UI 上不混为一谈：
+
+| 路径 | 做法 | 适用 | 代价 |
+|---|---|---|---|
+| 构建时签名 | 写 `android/key.properties` + 给 `build.gradle(.kts)` 打补丁 | 常规 | 要改用户的构建脚本 |
+| 产物签名 | 对已产出的 APK 直接 `apksigner` | 补丁拒绝时 / 不想改源码 | 每次出包后要再点一次 |
+
+补丁是**保守的**：只认两个已知锚点（`android {` 与 `buildTypes {`）和
+release 变体那行 `signingConfig = signingConfigs.getByName("debug")` /
+`.debug`，任一条匹配不上就**拒绝改写**并指路"产物签名"，绝不硬改。
+支持 Groovy 与 Kotlin DSL 两种（容器 Flutter 3.47 默认生成 `.kts`）。
+
+#### ⚠️ 险些漏网的真 bug：`signingConfigs` 子串误判
+
+"是否已经接过签名"的判据最初写成 `src.contains('signingConfigs')`。
+但 Flutter 模板的 release 变体里**本来就有** `signingConfigs.getByName("debug")`，
+于是**每一个新工程都会被判成"已配置"**、补丁全部拒绝。
+
+改用正则判**声明块**：`^\s*signingConfigs\s*\{`。
+由 `signing_test.dart` 里"本机 Flutter 的 kts 模板能被补丁吃下"这条
+**真实模板回归**守着——沙箱里那份 Flutter 模板一变，测试立刻红。
+
+### 仍未解决（诚实边界）
+
+- **补丁后的构建只在真机能验**：沙箱没有容器 JDK/SDK，`patchGradle` 的输出
+  是逐行人工核对过（已导出到 /tmp 核对过 kts 与 groovy 两版），
+  但**没跑过一次真实 gradle 构建**。
+- **key.properties 是明文口令**，落在工程目录里。已自动加进
+  `android/.gitignore`，但历史提交里若已有则无解——这是 flutter 官方
+  方案本身的形态，不是本实现引入的。
+- **自签证书**：Google Play 与多数国内商店接受，但从商店后台导出的
+  "上传证书"场景不支持（那种情况请直接改 key.properties 指过去）。
+- 不支持 AAB（.aab 签名走 bundletool 另一套）、不做 v4 签名。
+
+## 十三、alpha.94：默认 debug 档 / 预取引擎构件 / Git 远端 / 签名库（2026-09-28）
+
+这一章的四项都来自同一条真机反馈：
+
+> debug 构建好像失败了，这个 debug 构建工具链可以提前下载吗？如果 debug
+> 确实可以跳过 aot 编译更快的话建议默认使用 debug 构建。图标替换似乎有 bug。
+> git 面板增加远端功能。正式签名可以自选使用签名（有多个签名或有正式签名
+> 但想使用 debug 签名）或导入自定义签名。
+
+四项的共同点：**都是"能编译通过但真机上是错的"那类功能**，所以每一项
+都在沙箱里用真工具（真 gradle、真 git、真 keytool）跑过一遍才敢写进文档。
+下面每一节的"实测"都是本轮跑出来的原始输出，不是推断。
+
+### 13.1 默认档位改成 debug（`FlavorPrefs.fallback`）
+
+alpha.93 加了 debug 档，但默认值是 release —— 等于"能选，但没人会选"。
+alpha.94 起 `FlavorPrefs.fallback = BuildFlavor.debug`。
+
+依据是设备端的耗时结构（见第十一章）：release 的 AOT 要跑 `gen_snapshot`，
+它是 x86_64 二进制，在手机容器里靠 QEMU 转译执行（慢 10~50 倍），是整条
+链路上唯一真正耗时的一档；日常"改代码看效果"根本不需要 AOT。
+
+代价必须在 UI 上如实写出（打包区档位切换器旁），不能靠默认值糊过去：
+
+- debug 包更大（带 JIT 与内核快照）；
+- **不能上架**；
+- **不能覆盖安装正式版**（签名不同，会 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`）。
+
+> ⚠️ `build_flavor_test.dart` 里那条"读不到就返回 release"的断言本轮
+> **被我改成了返回 debug**。这是**需求变更**，不是测试变松：
+> 断言改成钉 `FlavorPrefs.fallback` 这个真源，并另加一条
+> "release 仍然可选"，防止"默认 debug"被后人理解成"砍掉 release"。
+
+### 13.2 预取引擎构件（`lib/toolchain/artifact_prefetch.dart`）
+
+#### 两条官方路径都失效（实测，不是猜测）
+
+用户问"debug 工具链可以提前下载吗"，第一反应是官方就有：
+`flutter precache --android_maven` + 它配套的
+`packages/flutter_tools/gradle/resolve_dependencies.gradle.kts`。
+**两条都跑不通**：
+
+1. `flutter precache --android_maven` 在 Flutter 3.47.4 上是**空操作**——
+   `AndroidMavenArtifacts` 这个类确实存在
+   （`packages/flutter_tools/lib/src/flutter_cache.dart:415`），
+   但**从未被实例化**。实测：exit 0、零输出、缓存目录字节数不变。
+2. 上面那个 gradle 脚本文档里让用 `gradle -b <file> <task>`，
+   而 **`-b` 选项在 Gradle 9 已被删除**，实测：
+   `Unknown command-line option '-b'`。
+
+所以自建等价 groovy 脚本，用 `--project-cache-dir` 跑 `resolveDependencies`。
+测试里钉死了"脚本不得出现 `android_maven` / `precache` / `gradle -b`"
+——免得哪天有人"发现官方有现成的"又换回去。
+
+#### 关键参数（都是实测值）
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| `io.flutter:arm64_v8a_debug` | 180.6 MB | debug 大头 |
+| `io.flutter:flutter_embedding_debug` | 1.6 MB | |
+| `io.flutter:arm64_v8a_release` | 42.2 MB | |
+| `FLUTTER_STORAGE_BASE_URL` | `https://storage.flutter-io.cn` | **`storage.googleapis.com` 在本沙箱完全不可达**（SSL 握手直接断），必须显式给国内镜像 |
+| 仓库列表 | FOA 镜像 + 阿里云 `google` / `public` | `flutter_embedding_*` 会传递依赖 androidx（实测抓 `androidx.exifinterface:1.4.1`），沙箱直连 `dl.google.com` / `mavenCentral` 不通；且 **aliyun-public 对 androidx 是 404，aliyun-google 才是 200**，两个都要写 |
+
+**只拉 arm64 一个 ABI**：FOA 固定 `--target-platform=android-arm64`，
+官方脚本还拉 armeabi_v7a / x86 / x86_64。去掉后 debug 从 ~600MB 降到 **182MB**。
+
+#### ⚠️ Bug 635 · gradle 找不到 java 会直接退出，且 proot 的 sh 不读 profile
+
+`env -i PATH=/usr/bin:/bin HOME=/root sh prefetch.sh` 实测报：
+
+```
+ERROR: JAVA_HOME is not set and no 'java' command could be found
+```
+
+exit 1。原因是 **proot 执行的 sh 不读 `/etc/profile.d`**，脚本里必须自己
+`export JAVA_HOME=${JAVA_HOME:-/opt/jdk}` + `export PATH="$JAVA_HOME/bin:$PATH"`，
+并在开跑前 `[ -x "$JAVA_HOME/bin/java" ]` 判一次，给得出人话报错（exit 5）。
+
+端到端（真 gradle、真下载）已跑通：`BUILD SUCCESSFUL in 9s` → `PREFETCH_OK`，
+182MB 落进 `~/.gradle/caches/modules-2/files-2.1/io.flutter/`。
+
+### 13.3 Git 远端（`lib/project/git_remote.dart`）
+
+只做 **HTTPS + PAT**，不做 SSH（手机上没有 ssh-agent，也没法管 known_hosts）。
+能力：配置/删除远端、保存凭据、fetch、push、pull。
+
+#### 凭据安全的三条硬约束
+
+1. **落 `/root/.git-credentials`，绝不落在工程目录**——防 `git add -A` 提交，
+   也防"导出源码工程"顺手带走。走 `git credential.helper store`，`chmod 600`。
+2. **口令不出现在命令行**——否则会进进程参数、也会出现在 git 的报错原文里。
+3. **所有展示给用户的输出先过 `scrub()`**，抹掉 `https://user:pass@`。
+
+#### ⚠️ `GIT_TERMINAL_PROMPT=0` 是必须的，不是优化
+
+手机上没有终端。凭据不对时 git 想在终端问用户名 → 表现为**一直转圈到超时**，
+用户只看到"卡住了"。设了这个变量才会立刻失败并给出可诊断的报错。
+
+#### ⚠️ 领先/落后**只在 fetch 之后才准**（实测推翻了我的直觉）
+
+git 的远程跟踪引用（`origin/main`）只有 fetch 才更新。真 git 实测：
+
+```
+远端已有新提交，但不 fetch  →  AB=0 0   （UI 显示"与远端一致"）
+fetch 之后                  →  AB=1 0
+```
+
+所以做成**显式「检查远端更新」按钮**，没 fetch 过就在 UI 上标注「（上次记录）」，
+不假装这个数字是实时的。
+
+顺带记一下解析：`git rev-list --left-right --count $up...HEAD` 的输出是
+**「落后 领先」**（左=上游，右=HEAD），别写反。
+
+#### 只走 `--ff-only`
+
+分叉状态（实测 `AB=2 1`）下 `git pull --ff-only` 报
+`Not possible to fast-forward, aborting`（exit 128）。**不自动 merge/rebase**——
+手机上没有冲突解决界面，替用户 merge 只会把仓库搞成他看不懂的状态。
+报错翻译成"先在本地处理分叉"，指路而不是硬来。
+
+#### ⚠️ Bug 636 · `grep` 的 pattern 里不能留引号（真 bug，端到端跑出来的）
+
+凭据去重那行最初写成：
+
+```sh
+grep -v -F "@'github.com'" /root/.git-credentials > tmp
+```
+
+单引号被当成 **pattern 的一部分**，于是一条都匹配不到 → **每次保存凭据都
+追加一行**。实测存 github×2 + gitee×1 之后，`/root/.git-credentials` 里
+躺着两条相同的 github 凭据。
+
+修法：先把 host 存进变量 `H='github.com'`，pattern 写 `"@$H"`。
+测试里钉了两条：`expect(s.contains('@$H'), isTrue)` 与
+`expect(s.contains('"@\''), isFalse)`（后者直接禁止任何引号形态回来）。
+
+### 13.4 签名库（`lib/project/keystore_store.dart`）
+
+alpha.93 的签名是"一把钥匙 + 一个 `key.properties`"。用户要的是
+"**我有哪些钥匙**"：同一把钥匙可以给多个工程用，一个工程可以在正式/测试之间切。
+
+清单存 **`/root/keystores/registry.json`**（与 keystore 同目录，都在工程外）。
+为什么不复用 `key.properties`：它描述的是"这个工程当前用哪把钥匙"，
+语义不同，混在一起会丢信息。
+
+#### ⚠️ Bug 637 · `keytool -list` 不加 `-v` 根本没有 `Alias name:` 行
+
+这是本轮最隐蔽的一个。不加 `-v` 时 keytool 只打印一行摘要：
+
+```
+key0, Sep 29, 2026, PrivateKeyEntry,
+Certificate fingerprint (SHA-256): 6C:10:8F:...
+```
+
+**没有 `Alias name:` 行**，于是 `grep -E "^(Alias name|别名)[：:] *"`
+一条都匹配不到 → 别名列表永远为空 → 走"单别名直接用"分支 →
+写进 `key.properties` 的 `keyAlias` 是**空串** → 到 gradle 里才炸。
+
+而 `Owner:`（证书主体，给用户辨认"这把钥匙是谁的"）同样只在 `-v` 输出里有。
+
+端到端实测（真 keytool，JDK 20）：
+
+```
+不带 -v  →  ALIASES_END（一条别名都没有）
+带 -v    →  key0 / key1 / ALIASES_END
+```
+
+修法：`keytool -list -v`。测试里钉了
+`RegExp(r'keytool -list -v')` 与反向的 `r'keytool -list(?! -v)'`。
+
+同时给 `aliases()` 加了防线：**解析出空列表就直接判失败**，
+不要静默返回空——空别名到 gradle 才报错，用户在手机上看不懂。
+
+#### 顺带：keytool 报错要翻成中文
+
+`ERR=` 里直接塞英文原话，手机用户看不懂
+`Keystore was tampered with, or password was incorrect`。
+加 `friendlyError()` 映射成中文结论 + 保留原文尾巴（真排查时原文更有用）。
+
+提取错误行也踩了一下：直接 `tail -n 1` 抓到的是 `... 7 more`
+（JDK 的异常堆栈摘要），改成
+`grep -m1 -iE "password was incorrect|tampered|java.io.IOException|keystore"`。
+
+#### ⚠️ Bug 638 · shell 脚本里 `\\n` 拼接会把下一行的 `echo` 吃掉
+
+Dart 里写 `'...tail -n 1)\\\\n'` 生成的是**字面 `\\n`**，在 shell 里
+`\\` 被转义成一个 `\` 后紧跟 `necho` → 整条报错变成：
+
+```
+ERR=: not found
+```
+
+（shell 把 `ERR=` 当命令执行了，而 `$d` 是空的）。
+修法：那里必须用**真换行** `'\n'`。测试里钉 `expect(s.contains('necho'), isFalse)`
+和 `RegExp(r'tail -n 1\)\n')`。
+
+#### 「想用 debug 签名」的正确做法
+
+debug keystore 的参数是**公开且固定**的（AOSP/Gradle 约定）：
+alias `androiddebugkey`、口令 `android`、DN `CN=Android Debug,O=Android,C=US`、
+路径 `~/.android/debug.keystore`。容器里可以造一份等价的，用 apksigner 重签。
+
+但更要紧的一句话写在 UI 上：**debug 档构建本来就是 debug 签名**
+（`signingConfigs.release` 只作用于 release 变体）。所以"想要 debug 签名的包"
+最直接的办法是**切到 debug 档构建**，而不是给 release 包换 debug 签名——
+后者装不上正式版。产物重签是第二条路，不是第一条。
+
+#### 口令为什么明文存
+
+清单里的 storePass / keyPass 是明文，UI 上明说，不假装加密。
+原因：gradle 的 `key.properties` **本来就要求明文**（AGP 不支持交互式输入），
+加密等于换个地方存明文，还多一层"以为自己安全了"的错觉。
+真正的边界是**文件在 `/root` 下、chmod 600、不在工程目录里**。
+
+### 仍未解决（诚实边界）
+
+- **预取的构件只覆盖 arm64**：换 ABI（`--target-platform` 改）会重新下。
+- **预取依赖容器里已有一份 gradle**：三条路都找不到 gradle 时会现搭
+  （从腾讯镜像下 `gradle-9.3.1-all.zip`，约 200MB），这一步没有端到端跑过，
+  只跑通了"命中已有 wrapper 分发包"那条路。
+- **Git 只支持 HTTPS + PAT**：SSH 不做。SCP 形如 `git@host:path` 的 URL
+  会被识别出来并明确拒绝，不会静默当 HTTPS 处理。
+- **不做冲突解决**：分叉时只报错指路，不 merge、不 rebase。
+- **导入 keystore 只认 JKS/PKCS12 的 PrivateKeyEntry**：
+  "上传证书"（.pem/.cer，只有公钥）签不了 APK，不是本实现偷懒。
+- **keytool 的 `-q` 在本沙箱 JDK 20 上不存在**（实测 `Illegal option: -q`）。
+  业务代码不用它，但如果你写 e2e 造数据的脚本，别照抄网上带 `-q` 的例子。
+
+---
+
+## 第十四章 · alpha.96：修好生成器 ≠ 修好用户现场
+
+### 起因
+
+真机反馈：用户工程构建 debug 失败，反复报同一句：
+
+```text
+e: file:///root/projects/list/android/app/build.gradle.kts:10:31: Unresolved reference 'util'.
+e: file:///root/projects/list/android/app/build.gradle.kts:13:34: Unresolved reference 'io'.
+```
+
+而 alpha.94 已经修过这个 bug 了。
+
+### 根因：两层
+
+**第一层（代码写法）**：`plugins {}` 遮蔽 `java` 标识符。
+
+真 gradle 三组对照实测（Gradle 9.3.0）：
+
+| 写法 | 结果 |
+|---|---|
+| 无 `plugins {}` + `java.util.Properties()` | ✅ `BUILD SUCCESSFUL` |
+| **有** `plugins {}` + `java.util.Properties()` | ❌ `5:31 Unresolved reference 'util'` |
+| 有 `plugins {}` + `import` + `Properties()` | ✅ `BUILD SUCCESSFUL` |
+
+Flutter 模板第一行就是 `plugins {}`，所以老写法 100% 必挂。
+
+**第二层（流程缺口，这才是真正让人反复踩的原因）**：
+
+- 签名补丁是**写进用户工程文件**的，不是每次构建现生成的；
+- `patchGradle` 的守卫是「已有 `signingConfigs {}` 就不动」，
+  对老工程直接返回 `ok:false`；
+- 于是**老写法原封不动留在用户文件里**，而 FOA 这边看起来"早就修了"。
+
+> **教训**：修好生成器 ≠ 修好用户现场。
+> 凡是"由工具写入用户文件"的代码，都要配一条
+> **检测 + 升级**路径 —— 因为已生成的文件不会自己变新。
+
+### 修法
+
+三层，缺一不可：
+
+1. **生成器**（alpha.94 已做）：改用 `import` + 简单名。
+2. **检测**：`Signing.hasLegacyJavaFqn(src)` —— 只看**用法**，
+   排除 `import` 行本身（否则新写的补丁会被误判成老的）。
+3. **升级**：`Signing.upgradeLegacyJavaFqn(src)` —— 换简单名 + 补 import，幂等。
+4. **接线**：`patchBuildScript` 在「守卫拦住完整补丁」时，
+   **仍然把老写法修掉**再返回 —— 这是原实现漏掉的那一步。
+5. **UI**：清单页打开时检测，检测到就在签名卡顶部显示红色警告 +
+   「修复构建脚本」按钮。
+
+### 为什么修复要独立成按钮
+
+不能并进「生成并配置签名」—— 那个入口会**重新生成一把新 keystore**。
+用户的诉求只是"让构建别报错"，不该被迫换钥匙
+（换了钥匙，已上架的应用就发不了升级包）。
+
+按钮文案里明写「不会动你的密钥」，就是为了让用户敢点。
+
+### 端到端验证（真 gradle，非单元测试）
+
+```text
+老写法             → e: build.gradle.kts:5:31: Unresolved reference 'util'.  BUILD FAILED
+upgradeLegacyJavaFqn →
+    import java.io.FileInputStream
+    import java.util.Properties
+    plugins { id("java-library") }
+
+    val keystoreProperties = Properties()
+    val keystorePropertiesFile = rootProject.file("key.properties")
+    if (keystorePropertiesFile.exists()) {
+        keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+    }
+                   → BUILD SUCCESSFUL
+```
+
+### 附带教训：lint 会自相矛盾
+
+`Text('a' 'b' 'c')` 这种**相邻字面量拼接**会触发两条互斥的 lint：
+
+- `prefer_const_constructors` → 让你加 `const`
+- 加了之后 `unnecessary_const` → 让你删掉
+
+解法：把文案抽成 `static const String`，`Text(_kNote, style: ...)` 整体 const。
+
+### 仍未解决（诚实边界）
+
+- **检测只在清单页触发**。如果用户从不打开清单页、直接用打包区构建，
+  仍会撞上老写法。理想方案是在**构建前置检查**里也加一道，
+  但那要改 `build_runner`，本轮没做。
+- **不处理用户手写的其他全限定名**（如 `java.io.File(`）。
+  `upgradeLegacyJavaFqn` 覆盖了签名补丁会产出的那几种
+  （`Properties` / `FileInputStream` / `FileOutputStream` / `File`），
+  别的不管。
+
+---
+
+## 第十五章 · alpha.97：构建流程三段优化（含一个静默 bug）
+
+### 起因
+
+用户一句很朴素的反馈：
+
+> 目前的构建编译流程似乎还有可以优化的空间（例如最后的默认等待 90s）
+
+追问澄清了三件事：
+
+| 问题 | 回答 | 含义 |
+|---|---|---|
+| 「默认等待 90s」在真机上是哪种情况？ | **每次都干等满 90s** | 说明 flutter 进程**每次**都 hang，90s 是**每次的净损失**，不是偶发兜底 |
+| 想优化到什么程度？ | **全流程通盘优化** | 不只盯着 90s |
+| 改动时更偏向哪边？ | **宁可慢一点也别出错** | 判据必须有证据，不许为了快而误判 |
+
+第三点的分量最重：它直接决定了 ① 该怎么写——**不能**简单把
+`builtGraceSec` 从 90 调成 10 了事（那只是把误判风险调高）。
+
+### 优化点 ①：收尾宽限期 → 产物双证据确认
+
+**原实现的判据是纯计时**：
+
+```dart
+static const int builtGraceSec = 90;
+static bool builtGraceElapsed({required DateTime? builtAt, required DateTime now, ...}) {
+  if (builtAt == null) return false;
+  return now.difference(builtAt).inSeconds > graceSec;
+}
+```
+
+只要 `_builtAt` 非空、时间到了就收尾。**没有"产物到底好了没有"这一问** ——
+所以只要 flutter 进程 hang 不退出，就必然等满。
+
+**新判据**（`BuildRunner.builtSettled`，纯函数）：
+
+```dart
+static bool builtSettled({
+  required DateTime? builtAt, required DateTime now,
+  required int size, required int mtime,
+  required int prevSize, required int prevMtime,
+  required DateTime? lastProbeAt,
+  int probeGapSec = builtStableProbeSec,   // 2s
+  int graceSec = builtGraceSec,            // 20s
+}) {
+  if (builtAt == null) return false;
+  if (size <= 0 || mtime <= 0) return false;          // 产物得"看得见"
+  if (prevSize < 0 || prevMtime < 0) return false;    // 首次探测只记状态
+  if (size != prevSize || mtime != prevMtime) return false;  // 还在写
+  if (lastProbeAt == null ||
+      now.difference(lastProbeAt).inSeconds < probeGapSec) return false;
+  return true;
+}
+```
+
+三条同时成立才提前收尾：
+
+1. **产物看得见**：`size > 0` 且 `mtime > 0`。排除"目录项已建、内容未写"。
+2. **两次读数完全相等**：大小 **和** mtime 都不变。
+3. **两次探测间隔 ≥ 2s**：挨太近的"一致"没有信息量——0.5s 内没变不能
+   说明写完了，只能说这 0.5s 没动。
+
+> **为什么判据是"稳定性"而不是"够大"**：APK 大小本就波动（debug/release、
+> 依赖增减都会变），任何绝对阈值都会在某个项目上失效。稳定性是无量纲的，
+> 判据不随项目漂移。
+
+`_poll()` 里的两级结构：
+
+```dart
+if (status == BuildStatus.building && _builtAt != null) {
+  if (await _probeSettled()) {          // ① 证据成立 → 立刻收尾（1~3s）
+    await _finish(0); return;
+  }
+}
+if (status == BuildStatus.building &&
+    builtGraceElapsed(builtAt: _builtAt, now: DateTime.now())) {
+  await _finish(0); return;             // ② 证据凑不齐 → 等满 20s 兜底
+}
+```
+
+宽限期本身 **90 → 20**：它现在的语义是"确定不了时的上限"，不再是
+"每次要等的时间"。真机实测 flutter 收尾 <5s，90s 那个数字是当年判据
+只有计时时才需要的极宽余量。
+
+**取舍的落点**：① 的证据要求**严**（size 与 mtime 双双相等 + 间隔够），
+凑不齐就走 ②。**绝不允许"没看到产物也按成功收尾"** —— 那正是用户
+明确要求避免的误判方向。
+
+### 优化点 ②：前置检查合并进主 shell
+
+原实现在 Dart 侧单独发一次 exec 查 Flutter 是否存在：
+
+```dart
+if (!bare) {
+  final probe = await bridge.exec(
+    'test -x /opt/flutter/bin/flutter && echo __OK__ || echo __NO__',
+    timeoutSec: 30,
+  );
+  ...
+}
+```
+
+紧接着又要发一条大 shell 跑 stampFix/diag/heal。**两次容器往返**里，
+第一次只查一个文件——纯浪费。现在并入主 shell 最前段：
+
+```dart
+static const String prootFlutterProbe = r'''
+test -x /opt/flutter/bin/flutter || {
+  echo "FOA_PREFLIGHT_NOFLUTTER=1"
+  exit 65
+}
+''';
+```
+
+放在**最前面**是有意的：缺 SDK 时立刻退出，不浪费后面那段的诊断时间。
+`exit 65` 由 `_finish` 翻译回原本那句引导文案（挪进 shell 后要把它补回来，
+否则用户只看到一个裸的 `exit 65`）。
+
+### 优化点 ③：pub get 指数退避
+
+原来每源固定 `sleep 3`：3 源 × 2 次 = **最坏 18 秒纯等待**。
+
+```dart
+'b=1; '
+'for i in 1 2; do '
+'if PUB_HOSTED_URL=$src <flutter> pub get; then ok=1; break 2; fi; '
+'sleep $b; b=3; '
+'done; '
+```
+
+`b=1` 必须在 `for src` 循环体内、`for i` 之前 —— 换源时重置回 1s
+（换了一个源等于重新开始，第 2 源不该继承第 1 源用过的 3s）。
+
+**诚实说明**：正常网络下这条改动**几乎看不出差别**（顺利路径本来就是
+0s 等待，成功即 break）。它的价值只在弱网抖动时少等几秒。退避秒数也
+刻意偏保守（没上 0/1/2 那种激进序列）——弱网是这条链路的主要场景，
+退避太短会把"本来第二次就能成功"变成"两次都撞在同一个抖动窗口上"。
+
+### 顺带撞出的一个静默 bug（本节最值得记的部分）
+
+给 ③ 写"termux 不该出现容器路径"的断言时，**断言挂了 —— 而挂的是代码**。
+
+`diag` / `heal` / `reassert` / `stampFix` 四段脚本的路径原先**全部写死
+容器值**（`QemuCompat.flutterHome` = `/opt/flutter`、
+`QemuCompat.sdkHome` = `/opt/android-sdk`），而 **termux 后端的 Flutter
+与 SDK 装在 prefix 下**（`TermuxPaths.flutterHome/env`）。
+
+路径错的表现不是报错，而是**整段整段地静默短路**：
+
+| 段 | 短路点 | 静默后果 |
+|---|---|---|
+| `stampFix` | `mkdir -p "$C"` 写一个不存在的目录 | Bug 436 想省的 `git fetch --tags` 在 termux 下**从未省掉** |
+| `diag` | `[ -x @QEMU@ ] \|\| exit 0` 之后的路径判断 | 日志里连 `QEMU_CHAIN_*` 都没有 |
+| `heal` | `[ -d "$F/bin/cache" ]` 等判断全不成立 | `HEALED=0`，自愈是**空跑** |
+| `reassert` | 第一句就是 `[ -d "$E" ] \|\| exit 0` | 转发层重建是**空跑** |
+
+**为什么藏了这么久**：每一段都"有输出"。`REASSERT=0`、`HEALED=0` 都是
+**合法的正常输出**——从日志上完全看不出是"跑了但什么都没做"还是
+"本来就没事"。
+
+修法：把 `QemuCompat.fill` 的 `@FLUTTER@` / `@ENGINE@` / `@SDK@` 三个
+占位符参数化：
+
+```dart
+static String fill(String script, {
+  String sdk = sdkHome, String proj = '',
+  String? flutterHomeOverride,
+  String? engineDirOverride,
+  String? sdkHomeOverride,
+}) => script
+    .replaceAll('@ENGINE@', engineDirOverride ?? engineDir)
+    .replaceAll('@FLUTTER@', flutterHomeOverride ?? flutterHome)
+    .replaceAll('@SDK@', sdkHomeOverride ?? sdk);
+```
+
+`buildCommand` 按后端传入（默认值保持不变，proot 语义完全不受影响）：
+
+```dart
+flutterHome: bare ? TermuxPaths.flutterHome(env) : QemuCompat.flutterHome,
+engineDir: bare ? '${TermuxPaths.flutterHome(env)}/bin/cache/artifacts/engine'
+                : QemuCompat.engineDir,
+sdkHome: bare ? TermuxPaths.sdkHome(env) : QemuCompat.sdkHome,
+```
+
+### 元教训
+
+> **"有输出"不等于"做了事"。**
+>
+> 凡是「查一下、没有就跳过」的幂等脚本，都要能区分
+> 「检查通过」和「检查根本没跑到」两种情况。
+>
+> 这两者在日志上长得**一模一样**。项目里已经被这个形态坑过两次
+> （Bug 445 的 `REASSERT=0` 是"一个文件都没重建"，第十四章的
+> `Unresolved reference` 是"补丁没打上但守卫说没事"）。
+>
+> 可行的做法：**幂等脚本的"跳过"要说清楚跳过的是什么**。
+> 比如 `SKIP=路径不存在(/x/y)` 而不是静默 `n=0`。
+
+### 端到端验证
+
+| 验证项 | 方法 | 结果 |
+|---|---|---|
+| 生成的 shell 语法 | 导出 proot / termux 两个后端的完整命令，`bash -n` | 均通过 |
+| termux 路径后端感知 | 正则扫 `[CFES]=/opt/(flutter\|android-sdk)` | **无残留**（原先 4 处） |
+| proot 语义不变 | 默认参数下断言 `C=/opt/flutter/bin/cache` 等 4 条 | 全部保持 |
+| 判定逻辑 | `builtSettled` 8 条边界（首探/一致/变大/同大小重写/挨太近/size=0/无 Built） | 全过 |
+| 全量回归 | `flutter test --concurrency=1` | **1749 通过 / 0 失败** |
+
+### 仍未解决（诚实边界）
+
+- **改动全在真机链路，沙箱验不了实际耗时**。我能证明的是：生成的 shell
+  语法正确、判定逻辑的边界行为正确、termux 路径不再写死。**「90s 变成
+  几秒」这个数字需要用户真机对比** —— 我按判据推算典型路径 1~3s
+  （探测间隔 2s 是硬下限，500ms 轮询下两次采样要跨过 2s 需 5 个 tick），
+  但这是**推算不是实测**。
+- **②的收益是"少一次容器往返"**，具体多少毫秒取决于真机 proot 启动
+  开销，我没有这个数字。
+- **没有做"跳过没脏的 reassert"**（原计划的优化点②的另一半）。评估后
+  放弃：reassert 是 Bug 428/433/445 三道防护的落点，而它的"脏检查"
+  本身也要遍历同一批目录——**检查成本和执行成本同阶**，省不下什么，
+  却要承担"误判为干净而跳过"的风险。与用户的取舍不符，故不做。
+
+---
+
+## 第十六章 · alpha.97 出包时撞出的两个记账问题
+
+出包时六项验证报"五项未通过"（ABI 找不到、签名失败、图标缺失、文案没进包）。
+**这不是代码坏了，是两个工具侧的问题叠加**，差点让我重出一版包。
+
+### 16.1 `cp` 返回 ≠ 落盘完成（Bug 627 的同族）
+
+**现象**：
+
+```
+$ sha256sum dist/FOA-...-arm64.apk
+sha256sum: ...: Input/output error
+【1/5】ABI 架构   实际：（空）   ❌ 未找到 arm64-v8a
+【3/5】签名        ❌ 签名验证失败
+```
+
+**诊断**：先怀疑构建产物坏了。分别读两个文件：
+
+| 文件 | `dd` 全量读 | 结论 |
+|---|---|---|
+| `build/.../app-release.apk`（源） | 88.7 MB，5.2 GB/s，**无错** | 好的 |
+| `dist/FOA-...-arm64.apk`（`cp` 出来的） | 3.6 MB 处 `Input/output error` | **坏的** |
+
+源文件完好、只有拷贝坏了 → 问题在 `cp` 这一步。
+
+**根因**：`cp` 返回成功只代表**数据进了页缓存**，不代表**落到设备**。
+紧接着的 `sha256sum` 全量回读时撞上内核仍在回写的脏页 →
+这个文件系统（overlayfs，同 Bug 627 的环境）对"正在回写的页"的读取
+会直接返回 `EIO`。
+
+**验证**：等一会儿再 `dd` 同一个文件 → **完整读出**（86 MB/s，从盘上读的
+速度）。再 `sha256sum` → 与源文件**完全一致**。
+也就是说**文件从头到尾都是好的**，只是有那么一个窗口读不得。
+
+**修法**：`cp` 之后加 `sync` 再校验。已写进 `release.sh` 的建议：
+
+```bash
+cp "$BUILT" "$APK_OUT"
+sync                      # ← 必须：cp 返回 ≠ 落盘完成
+sha256sum "$APK_OUT"
+```
+
+> 判断"怎么区分？"——**看源文件**。如果源文件能完整读、只有拷贝读不了，
+> 那就是落盘时序问题，等一会儿/`sync` 一下即可，**不要重出包**。
+> 如果源文件本身也读不了，那才是构建真出了问题。
+
+### 16.2 AOT 里 ASCII 串与 CJK 串编码不同（验证脚本的假阴性）
+
+修好 16.1 后，第 6 项仍然报：
+
+```
+【6/6】本次改动的 UI 文案已编进 libapp.so
+  ❌ 以下文案没进包：FOA_PREFLIGHT_NOFLUTTER=1
+```
+
+**先做的一个关键动作：拿上一版已验证过的包做对照**（`alpha.96`）。
+结果对照包**同样"什么都没搜到"** —— 连当年六项全绿的 `修复构建脚本`
+都 MISS。
+
+> **这一步救了我**：如果只看新包，我会以为是自己这轮改动把文案弄丢了，
+> 然后去翻 `buildCommand` 的接线——方向完全错，而且大概率会"修"坏
+> 本来正确的东西。**对照一个已知良好的样本，能立刻把"代码问题"和
+> "测量问题"分开。**
+
+**根因**：`verify_apk.sh` 第 6 项一律按 **UTF-16LE** 搜字节
+（`s.encode("utf-16-le")`）。这个约定对**中文串**是对的——Dart AOT
+把含 CJK 的字符串升成 UTF-16LE。
+
+**但纯 ASCII 串走 Latin-1 快路径，一个字符一个字节**（即 UTF-8/ASCII
+形态）。所以：
+
+| 串 | UTF-8 | UTF-16LE |
+|---|---|---|
+| `产物落盘确认` | MISS | **IN** |
+| `FOA_PREFLIGHT_NOFLUTTER=1` | **IN** | MISS |
+
+纯 ASCII 的 needle 用 UTF-16LE 搜**永远搜不到**，哪怕它明明在包里。
+
+**修法**：两种编码都试，命中任一即算在。
+
+```python
+def present(s, d):
+    return s.encode("utf-16-le") in d or s.encode("utf-8") in d
+```
+
+这不是放宽标准——**两种都找不到才是真的不在包里**。
+
+**教训**：`needles` 列表过去**全是中文**，所以这个编码缺口一直没暴露。
+本轮我挑了一条 ASCII 串（因为它在 Dart 里是没有插值的字面量，
+"唯一且稳定"），正好撞上。**测试用例的输入分布变了，才会暴露
+原本就存在的判据缺口。**
+
+### 元教训（两条）
+
+> **① 出包验证失败时，先分清"产物坏了"还是"测量坏了"。**
+> 最快的分法：**拿一个已知良好的样本跑同一套测量**。
+> 对照样本也挂 → 测量有问题；对照样本正常 → 才是产物有问题。
+>
+> **② `sync` 是"我刚才写的东西能不能被下一个人读到"的问题，
+> 不是"保险措施"。** 凡是"写完立刻全量回读校验"的流程
+> （出包归档、校验和、打包），`cp`/写入之后都要 `sync`。
+
+---
+
+## 第十七章 · Bug 636：`Removing unused resources requires unused code shrinking`
+
+### 17.1 用户报障的原话与真实处境
+
+用户贴出 debug 构建日志后说：
+
+> `怎么又出现这个bug了，一直反复是为什么`
+
+**报错原文**：
+
+```
+Build file '/root/projects/my_demo/android/build.gradle.kts' line: 19
+A problem occurred configuring project ':app'.
+> Removing unused resources requires unused code shrinking to be turned on.
+  See http://d.android.com/r/tools/shrink-resources.html for more information.
+```
+
+"又"和"反复"是本轮最需要先拆掉的认知陷阱。**从技术上看，这和之前的
+`Unresolved reference 'util'/'io'` 完全是两个 bug**：
+
+| # | 出问题的地方 | 我们的代码在哪一层 | 用户感知 |
+|---|---|---|---|
+| ① | `scripts/` 里老写法的构建脚本 | **就是我们自己写的**，alpha.94/96 改的是这里 | "又报错了" |
+| ② | 生成器修了 ≠ 用户现场修了 | 我们改了模板，但用户工程里是**旧脚本** | "修了怎么还报" |
+| ③ | **本次**：AGP 配置期校验 | **我们连碰都没碰到** —— 是 Gradle/AGP 在读 `build.gradle.kts` | "又报错了" |
+
+**三者是独立的**。用户看到的是"错误提示又出现了"，所以主观上是"同一个
+bug 反复"；但从链路看，这是**第三个不同的坑**。诊断的第一步永远是
+**把报错原文和上一次的报错原文并排看**，而不是凭主观印象。
+
+### 17.2 根因：三层叠加
+
+#### 第一层 — AGP 的硬校验（字节码实证，不是推测）
+
+反编译 `gradle-8.13.1.jar` 里的
+`com/android/build/api/component/impl/features/AndroidResourcesCreationConfigImpl`：
+
+```java
+public boolean getUseResourceShrinker() {
+    if (!getResourcesShrink()) return false;          // 资源缩减没开 → 无所谓
+    if (componentType.isForTesting()) return false;   // ← 注意这条
+    if (!getMinifiedEnabled()) {
+        issueReporter.reportError(
+            "Removing unused resources requires unused code shrinking ...");
+        return false;                                 // ← 是 error，不是 warning
+    }
+    ...
+}
+```
+
+判据一句话：
+
+> **`shrinkResources = true` 且 `minifyEnabled = false` → 配置期致命错误。**
+
+`reportError` 不是 `reportWarning`——它会直接让 configuration 阶段失败，
+**构建根本进不到编译**。这就解释了为什么日志里连一条编译错误都没有。
+
+#### 第二层 — Flutter Gradle 插件**无条件**设值
+
+`/opt/flutter/packages/flutter_tools/gradle/src/main/kotlin/FlutterPlugin.kt:216-219`：
+
+```kotlin
+release {
+    isMinifyEnabled = true
+    isShrinkResources = isBuiltAsApp()
+}
+```
+
+注意 **没有 if**。Flutter 插件对 `release` buildType 无条件设这两个值。
+
+`FlutterPluginUtils.kt:39, 226-231`：
+
+```kotlin
+const val PROP_SHOULD_SHRINK_RESOURCES = "shrink"
+fun shouldShrinkResources(project: Project): Boolean =
+    project.findProperty(PROP_SHOULD_SHRINK_RESOURCES)?.let { ... } ?: true
+```
+
+默认 `true`。
+
+**所以任何 Flutter 工程，`release` 块的这两个值天生就是
+`minify=true, shrink=true`。** 一旦有谁把 `minifyEnabled` 改成 `false`
+却没同步改 `shrinkResources`，就踩中第一层的硬校验。
+
+#### 第三层 — 为什么 **debug** 也炸
+
+用户跑的是 `--debug`，报错却在 `configuring project ':app'`。
+原因：debug buildType 的属性通过 `initWith(debugBuildType)` / 变体
+继承链**拿到了 `buildTypes.release` 的属性**。
+
+> **在 `release` 块里手动关 minify，会把 debug 的配置**一起**搞挂。**
+
+Gradle 在 configuration 阶段就整体失败了，所以"我明明只改过 release"
+并不成立——**buildTypes 的属性是会被继承的**。
+
+### 17.3 为什么我们之前的修复"漏了"
+
+我们的 `ManifestCodec._syncShrinkResources` 有个设计前提：
+**只在"文件里已经有 `shrinkResources` 这一行"时才改**。
+
+而用户现场是：那一行**是别的机制写进去的**（插件默认 / 模板 / 继承），
+我们的 UI 读 `minify` 时通过 `parseGradle` 拿到的是 **`true`**——
+但那个 `true` 是 **AGP 的 release 默认值**，不是用户写的。
+
+结果：开关显示"开"，用户看不出问题，**我们什么都不会改**。
+
+> **这里有一个必须说清的判据原则**：`parseGradle` 读到的
+> `minify=true` 可能是 AGP 的默认值（`minifyExplicit=false` 时）。
+> **拿默认值当判据去改用户的文件 = 误改**。所以检测必须要求
+> **两个值都显式写了**。
+
+### 17.4 修法：只改 shrink，绝不碰 minify
+
+新增三个方法（`app/lib/project/manifest_codec.dart`）：
+
+```dart
+/// 检测**显式**字面值。返回 null = 文件里没有这一行（不是"值为 false"）。
+static bool? explicitShrinkResources(String text) {
+  final m = RegExp(r'(?:isShrinkResources|shrinkResources)\s*=?\s*(true|false)')
+      .firstMatch(text);
+  if (m == null) return null;
+  return m.group(1) == 'true';
+}
+
+static bool? explicitMinify(String text) { /* 同上，匹配 isMinifyEnabled/minifyEnabled */ }
+
+/// Bug 636 检测：构建脚本是否处在 AGP 会拒绝配置的非法组合上。
+static bool hasIllegalShrinkCombo(String text) {
+  final shrink = explicitShrinkResources(text);
+  final minify = explicitMinify(text);
+  return shrink == true && minify == false;
+}
+
+/// Bug 636 修复：选的是**改 `shrinkResources` 而不是 `minifyEnabled`**。
+static ({String code, bool changed}) fixIllegalShrinkCombo(String text) {
+  if (!hasIllegalShrinkCombo(text)) return (code: text, changed: false);
+  final sync = _syncShrinkResources(text, false);
+  return (code: sync.code, changed: sync.code != text);
+}
+```
+
+**为什么改 shrink 而不改 minify**：
+
+- `minifyEnabled = false` 是用户**刚刚手动设的**，是他明确的意图 → **不能推翻**；
+- `shrinkResources = true` 多半来自 Flutter 插件的默认 → 关掉它代价最小
+  （只是包大一点，不影响功能）。
+
+**接线**（`app/lib/toolchain/build_runner.dart`，插在磁盘空间检查之后、
+真正启动构建之前）：
+
+```dart
+if (!bare) {
+  final fixed = await _fixIllegalShrinkCombo(name);
+  if (fixed != null) { lines.add('⚠ $fixed'); lines.add(''); _ui(); }
+}
+```
+
+**为什么必须放在构建前而不只在清单页**：用户可能**从不打开清单页**——
+他就直接点打包。前置检查是唯一能救到他的地方。
+
+### 17.5 `--no-shrink` 是空 flag（流传很广的误解）
+
+用户日志里那条命令带 `--no-shrink`，很多人以为它能解决这个问题。
+**它不能。** `flutter_command.dart:986` 的 help 原文：
+
+```
+'This flag has no effect. Code shrinking is always enabled in release builds.'
+```
+
+而且它**不映射**到 `-Pshrink=false`——全仓库只有 deferred components
+那条分支会设该属性（`gradle.dart:613`）。所以：
+
+> 构建命令里的 `--no-shrink` 是**装饰性的**，它既不关代码缩减，
+> 也不关资源缩减，更不会让 AGP 的配置期校验放过你。
+
+`-Pshrink` 属性确实存在（`FlutterPluginUtils.kt:39`），但那是
+**给 deferred components 用的**内部通道。
+
+### 17.6 端到端验证
+
+| 项 | 结果 |
+|---|---|
+| `flutter analyze lib/` | `No issues found!` |
+| `flutter test test/manifest_codec_test.dart` | **66 条全过**（原 53 + 新增 13） |
+| 全量门禁 `flutter test` | **1762 全过**（1749 + 13） |
+
+新增 13 条里有 **4 条专门测"不误报"**：
+
+| 输入形态 | 期望 | 理由 |
+|---|---|---|
+| 只有 `shrink=true`，minify 没写 | **不报** | minify 走插件默认 = true，合法 |
+| `shrink=true` + `minify=true` | **不报** | 这正是 Flutter 插件默认形态 |
+| shrink 没写 | **不报** | 官方模板形态 |
+| `shrink=false` + `minify=false` | **不报** | 合法组合 |
+
+以及一条**接线护栏**（防止将来有人把前置检查挪到构建启动之后）：
+
+```dart
+final fixAt = src.indexOf('await _fixIllegalShrinkCombo(');
+final buildAt = src.indexOf('execStream(cmd');
+expect(fixAt > 0 && buildAt > 0 && fixAt < buildAt, isTrue,
+    reason: '修 shrink 组合必须在启动构建之前 —— 晚了 AGP 已经拒绝了');
+```
+
+### 元教训（三条）
+
+> **① 用户说"又是这个 bug"时，先把两次报错原文并排贴出来。**
+> 主观的"又"和客观的"同一个"经常不符。本轮三个坑分别位于
+> scripts 层、流程层、AGP 配置层——**同名感受，不同链路**。
+>
+> **② 判据要取"显式值"，不要取"读到的值"。**
+> `true` 可能是默认值。拿默认值当判据去改用户文件，
+> 会把"本来没问题的工程"改坏。**只有用户明确写了，才能当意图。**
+>
+> **③ 兜底要放在"用户一定会经过"的地方。**
+> 清单页的修复只有打开清单页才生效。构建前置检查
+> 才是所有路径的交汇点。
+
+### 诚实边界
+
+- **只覆盖 Kotlin DSL / Groovy 两种 `build.gradle` 形态**（`android/app/`），
+  没有处理 `buildSrc` 或根工程里定义的 `buildTypes` 变体。
+- 检测用**正则**而非解析器。若 `shrinkResources` 出现在注释里，
+  正则也会命中。代价可接受（修复是改成 `false`，方向安全），
+  但如果将来要做"精确语义分析"，这里需要换成真正的 Gradle 解析。
+- **debug 变体继承 release 属性**这一条是从报错现象 + Gradle 继承语义
+  反推的，没有单独写一个最小复现工程验证。若要 100% 闭合，需要
+  在真机上建一个只有 `release { isMinifyEnabled = false }` 的最小工程跑
+  debug 构建。**本轮没做这一步**。
+
+---
+
+## 第十八章 · alpha.98 出包时撞到的两件事（都是**测量**问题）
+
+出包流程本身跑通了（门禁 1762 全过、release 构建 201.9s 出 88.7MB 包），
+但归档与验证两步各挂了一次。**两次挂的都不是代码，是测量。**
+
+### 18.1 `cp` 的脏页窗口又来了（Bug 627 / 16.1 的第三次复发）
+
+```
+3/5  归档到 dist/
+sha256sum: .../dist/FOA-v0.1.0-alpha.98-arm64.apk: Input/output error
+❌ 归档文件校验和回读不一致（ vs ）——多半是落盘问题，重跑本步即可
+```
+
+注意这次的**报错形状变了**：上一版（16.1）是校验和算出来了但**对不上**；
+这次 `sha256sum` 直接 `EIO`，两个变量都是空串，所以才打印出 `（ vs ）`
+这种空对空。**同一个根因，两种表现**。
+
+**用 16.1 立下的判断法复核**：
+
+| 文件 | `dd` 全量读 | 结论 |
+|---|---|---|
+| `app/build/.../app-release.apk`（源） | 88748892 bytes，**22.8 GB/s，无错** | 好的 |
+| `dist/FOA-...-arm64.apk`（`cp` 出来的） | **0 bytes copied**（一个字节都读不出） | 坏的 |
+
+源能读、拷贝读 0 字节 → **落盘时序**，不是构建坏了。**不要重出包。**
+
+**处置**：重跑归档步骤，`cp` 前后各 `sync` 一次 + 隔 2s 再 `sync`，然后
+`sha256sum` 回读比对 → **两文件哈希完全一致**（`ea511e0d...c5b5`）。
+
+> **为什么 `release.sh` 里明明已经加了 `sync` 还会中招**：
+> `sync` 与 `cp` 之间仍有窗口 —— `sync` 返回后内核可能刚开始回写新拷的
+> 页。**`sync` 降低概率，不等于消除。** 真正的判据只能是**回读复核**，
+> 也就是 `release.sh` 里那段 `[[ "$ACTUAL" == "$EXPECT" ]] || die`。
+> **它这次正确地拦住了我** —— 这就是它存在的意义。
+
+**这一条现在是第八次同族**（627 → 16.1 → 18.1）。**结论应该升级为环境常识**：
+这个 overlayfs 上"写完立刻全量回读"是不可靠操作，凡此类流程一律
+**写入 → sync → 回读复核**，三者缺一不可，且**回读复核是唯一有效的那一步**。
+
+### 18.2 我把**注释**当成了 needle（验证脚本的第二次假阴性）
+
+修好归档后，六项验证报：
+
+```
+【6/6】本次改动的 UI 文案已编进 libapp.so
+  ❌ 以下文案没进包：Removing unused resources
+```
+
+当时的判断路径很关键，记下来：
+
+1. **先看别的三条** —— `isShrinkResources`、`已自动修复`、
+   `FOA_PREFLIGHT_NOFLUTTER=1` **都命中了**。这说明：
+   - AOT 里确实有我这几轮改的东西；
+   - 双编码比对（17.2 那个修正）也工作正常。
+2. 于是问题被压缩成一句话："为什么**只有这一条**不在？"
+3. `grep` 一下这条串在源码里的位置：
+
+```
+app/lib/toolchain/build_runner.dart:508:    //   > Removing unused resources requires unused code shrinking
+```
+
+**行首是 `//` —— 它在注释里。** 注释被编译器剥掉，AOT 里当然没有。
+
+> **我犯的错**：挑 needle 时想的是"这是报错原文，最稳定最唯一"，
+> 但**我根本没有回到源码去确认它是不是一个运行期字符串**。
+> 这是纯粹的选样错误 —— 测量选错了对象。
+
+**修法**：换成真正在字符串字面量里的三条，并且把"选 needle 前先 grep
+确认行首不是 `//`"写进脚本注释当规程：
+
+```python
+"检测到 ",                        # 检测命中的告警（修复/未修复两条共用前缀）
+"已自动修复",                      # 前置检查真的改写了文件的日志
+"isShrinkResources → false",     # 修复说明里的箭头（含中文 →，走 UTF-16LE）
+"FOA_PREFLIGHT_NOFLUTTER=1",     # 反向护栏
+```
+
+重跑 → **六项全部通过**。
+
+**中间还踩了一个自己挖的坑**：第一版修法里我写了
+`"检测到 $rel 里 isShrinkResources=true 而 ".replace("$rel ", "")` ——
+想用 Python 消掉插值占位符。结果 `replace` 把 `$rel ` 真删了，needle 变成
+`"检测到 里 isShrinkResources=true 而 "`（中间一个空格），照样 MISS。
+
+> **教训**：**别用"运行期字符串变形"去构造 needle。** 你以为在"清理"，
+> 实际是在把 needle 改成另一个（更不可能存在的）串。needle 应该是
+> **源码里逐字出现的、肉眼可核对的那一段**。想省略就直接截短，
+> 不要在脚本里做替换运算。
+
+### 元教训
+
+> **① `sync` 降低概率，回读复核才是判据。**
+> 任何"写入后立刻全量读"的流程都必须有一步**独立的回读比对**，
+> 且它必须能**真的失败**（这次它就失败了，正确拦下了我）。
+>
+> **② 一条 needle 挂了、其他三条过了 → 先怀疑 needle，别怀疑代码。**
+> `grep` 一下它在源码里是**注释**还是**字符串**，一行就能定性。
+> 不要因为一条测量失败就去翻接线 —— 那是最容易把正确代码"修"坏的方向。
+>
+> **③ needle 必须是"只有那段逻辑才会产生"的串。**
+> 属性名（如 `isShrinkResources`）在注释和代码里都出现，命中它
+> 证明不了任何事。宁可挑带上下文的整句。
