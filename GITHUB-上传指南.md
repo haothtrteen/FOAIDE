@@ -17,9 +17,9 @@ git count-objects -vH | grep size-pack   # 实际会推上去的体积
 
 | 项 | 值 |
 |---|---|
-| 提交数 | 134 |
-| 跟踪文件数 | 409 |
-| `.git` 体积 | ~4.2 MB（`size-pack`） |
+| 提交数 | 136 |
+| 跟踪文件数 | 401 |
+| `.git` 体积 | 4.27 MiB（`size-pack`） |
 | 分支 | `main` |
 | 门禁 | `flutter analyze lib/` 0 issue；`flutter test` **1691** 全过 |
 | 出包验证 | `flutter build apk --debug` 成功，136 MB，APK 内 proroot 0 处 |
@@ -273,10 +273,12 @@ debootstrap 自建配方然后 `exit 1`。
 
 | 包 | 体积 | 用途 |
 |---|---|---|
-| `FOA-github-ready-20260930.tar.gz` | 84 MB | **主交付**。含 rootfs/proot，解包即可构建；`git push` 仍只推 4.2MB |
-| `FOA-github-slim-20260930.tar.gz` | 8.7 MB | 纯 git 镜像（不含未跟踪资产）。适合存档，但解包后**不能直接构建** |
+| `FOA-github-ready-20260930.tar.gz` | 84 MB | **主交付**。含 rootfs/proot，解包即可构建；`git push` 仍只推 4.27 MiB |
+| `FOA-github-ready-slim-20260930.tar.gz` | 8.8 MB | 纯 git 镜像（不含未跟踪资产）。适合存档，但解包后**不能直接构建** |
 
-两个包都含完整 `.git`（解包即可 `git remote set-url` 后推送，无需重新 init）。
+两个包都含完整 `.git`（解包即可 `git remote set-url` 后推送，无需重新 init），
+且打包脚本会**把包里的 `.git` 解出来跑一遍** `git fsck` + 提交数/文件数比对，
+确认与打包前一致后才算通过（见下条）。
 
 ### 安全扫描结论
 

@@ -11741,3 +11741,41 @@ for art in arm64_v8a_release flutter_embedding_release; do ... done
 注意 debug 的 engine jar 是 **180MB**（release 只有 42MB），
 该目录被 `.gitignore` 和打包排除清单双向排除，**不会进仓库也不会进交付包**。
 摊完后 `flutter build apk --debug --target-platform=android-arm64` 一次通过。
+
+### 19.8 门禁自己也会过期：`.git 不完整（只有 53 项）`的假红（2026-09-30）
+
+`tools/make_release_tarball.sh` 原本用**条目数**判断 `.git` 是否完整：
+
+```bash
+if [ "$GIT_ENTRIES" -lt 100 ]; then ... exit 1; fi
+```
+
+用 `git filter-repo` 清完 `.trae` 后，这条**把好包判成坏包**（53 < 100）。
+
+**根因：条目数跟"完不完整"没有因果关系。**
+它数的是 `.git` 下的**路径个数**，而路径个数取决于
+"有多少 loose object" —— `filter-repo` 会把历史重打成**单个 pack**，
+loose object 清零，条目从 100+ 掉到 53。包本身是完整的：
+`config` / `HEAD` / `packed-refs` / `objects/pack/*` 一个不少。
+
+**改法：判据换成"行为"而不是"计数量"。**
+
+```bash
+tar xzf "$OUT" -C "$TMPG" ./.git
+C2="$(git -C "$TMPG" rev-list --count HEAD)"   # 与打包前的 C1 比
+F2="$(git -C "$TMPG" ls-files | wc -l)"        # 与打包前的 F1 比
+FSCK="$(git -C "$TMPG" fsck --no-progress)"    # 必须干净
+```
+
+三条都对上才算过。实测输出：
+
+```
+解包验证: 提交 136/136 · 文件 401/401 · fsck: clean
+```
+
+**并且验证过它真的会失败**：解包后手动 `rm .git/objects/pack/*.pack` →
+提交数变成 `-1`、fsck 报 `invalid sha1 pointer`，两条判据都会红。
+（旧判据在这个 case 上也会红 —— 但它连好包一起红，等于没有门禁。）
+
+> **元教训：给"完整性"定判据时，问"它坏了会怎样表现"，
+> 别问"它好的时候有多少个文件"。** 后者会随无关的内部实现变化而漂移。

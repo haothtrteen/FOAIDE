@@ -35,6 +35,15 @@ cd "$REPO_ROOT"
 EXCL="$REPO_ROOT/tools/package-excludes.txt"
 STAMP="$(date +%Y%m%d)"
 
+# 统一的退出清理（下面两处会各建一个临时物：slim 的排除清单、解包验证目录）
+EXCL_TMP=""
+TMPG=""
+cleanup() {
+  [ -n "$EXCL_TMP" ] && rm -f "$EXCL_TMP"
+  [ -n "$TMPG" ] && rm -rf "$TMPG"
+}
+trap cleanup EXIT
+
 SLIM=0
 OUT=""
 for a in "$@"; do
@@ -53,7 +62,7 @@ OUT="${OUT:-$(cd "$REPO_ROOT/.." && pwd)/FOA-github-ready-${STAMP}.tar.gz}"
 EXCL_EFFECTIVE="$EXCL"
 if [ "$SLIM" -eq 1 ]; then
   EXCL_EFFECTIVE="$(mktemp)"
-  trap 'rm -f "$EXCL_EFFECTIVE"' EXIT
+  EXCL_TMP="$EXCL_EFFECTIVE"
   grep -v '^#' "$EXCL" > "$EXCL_EFFECTIVE"
   cat >> "$EXCL_EFFECTIVE" <<'EOF'
 ./app/assets/rootfs/debian-minbase-arm64.tar.gz
@@ -110,10 +119,36 @@ printf '条目    : %s\n' "$ENTRIES"
 printf '.git 项 : %s\n' "$GIT_ENTRIES"
 printf 'SHA256  : %s\n' "$SHA"
 
-if [ "$GIT_ENTRIES" -lt 100 ]; then
-  echo "❌ .git 不完整（只有 $GIT_ENTRIES 项），这个包不能用来推远端！" >&2
+# ⚠️ 别用「.git 条目数 ≥ N」当判据 —— 这是 alpha.98 踩到的**假红**：
+#    用 `git filter-repo` 重写历史后，.git 被重新打成**单个 pack**，
+#    条目从 100+ 掉到 53；包是完整的（config / HEAD / packed-refs /
+#    objects/pack/* 全在），门禁却报".git 不完整"。
+#    条目数取决于"有多少 loose object"，跟"仓库完不完整"**没有因果关系**。
+#
+#    正确的判据是**行为**：把包里的 .git 解出来，看它能不能 fsck、
+#    提交数与文件数是否和打包前一致。这才真回答了"解包后能不能推远端"。
+TMPG="$(mktemp -d)"
+tar xzf "$OUT" -C "$TMPG" ./.git
+
+C1="$(git rev-list --count HEAD)"
+F1="$(git ls-files | wc -l | tr -d ' ')"
+C2="$(git -C "$TMPG" rev-list --count HEAD 2>/dev/null || echo -1)"
+F2="$(git -C "$TMPG" ls-files 2>/dev/null | wc -l | tr -d ' ')"
+FSCK="$(git -C "$TMPG" fsck --no-progress 2>&1 | grep -v '^[[:space:]]*$' | head -3 || true)"
+
+printf '解包验证: 提交 %s/%s · 文件 %s/%s · fsck: %s\n' \
+  "$C2" "$C1" "$F2" "$F1" "${FSCK:-clean}"
+
+if [ "$C2" != "$C1" ] || [ "$F2" != "$F1" ]; then
+  echo "❌ 解出来的 .git 与打包前不一致 —— 这个包不能用来推远端！" >&2
   exit 1
 fi
+if [ -n "$FSCK" ]; then
+  echo "❌ 解出来的 .git 不健康（git fsck 有输出）" >&2
+  echo "$FSCK" >&2
+  exit 1
+fi
+echo "✅ 解包后 .git 可用（提交数/文件数与打包前一致，fsck 干净）"
 
 # ⚠️ 校验循环必须用 `done < file` 重定向，**不能**写成 `cat file | while ...`。
 #    管道里的 while 跑在子 shell 中，BAD=1 的赋值出了管道就丢了，
