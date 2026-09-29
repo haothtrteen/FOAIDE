@@ -17,7 +17,7 @@ git count-objects -vH | grep size-pack   # 实际会推上去的体积
 
 | 项 | 值 |
 |---|---|
-| 提交数 | 136 |
+| 提交数 | 解包后 `git rev-list --count HEAD` 自己数（**不写死**：补文档会让它 +1） |
 | 跟踪文件数 | 401 |
 | `.git` 体积 | 4.27 MiB（`size-pack`） |
 | 分支 | `main` |
@@ -274,7 +274,7 @@ debootstrap 自建配方然后 `exit 1`。
 | 包 | 体积 | 用途 |
 |---|---|---|
 | `FOA-github-ready-20260930.tar.gz` | 84 MB | **主交付**。含 rootfs/proot，解包即可构建；`git push` 仍只推 4.27 MiB |
-| `FOA-github-ready-slim-20260930.tar.gz` | 8.8 MB | 纯 git 镜像（不含未跟踪资产）。适合存档，但解包后**不能直接构建** |
+| `FOA-github-ready-slim-20260930.tar.gz` | 9.1 MB | 纯 git 镜像（不含未跟踪资产）。适合存档，但解包后**不能直接构建** |
 
 两个包都含完整 `.git`（解包即可 `git remote set-url` 后推送，无需重新 init），
 且打包脚本会**把包里的 `.git` 解出来跑一遍** `git fsck` + 提交数/文件数比对，
