@@ -1,0 +1,90 @@
+# ===========================================================================
+# FOA · .gitignore
+#
+# 原则：**仓库只放源码和文档，不放产物、不放未跟踪资产、不放本机状态**。
+#
+# 有一类文件容易被误加进来，单独说明：
+#   - `app/assets/rootfs/`、`app/assets/tools/` 下的二进制
+#     → 它们是**未跟踪资产**，靠 `bash tools/fetch_assets.sh` 下载。
+#       源码包里会另外附带（见 tools/pack_source.sh），但 git 仓库不该有：
+#       二进制进 git 会让仓库无限膨胀，且无法 diff/审查。
+#   - `dist/` 下的 APK 与源码包
+#     → 出包产物，走 GitHub Releases，不进仓库（单个 88MB）。
+# ===========================================================================
+
+# ---------------- 构建产物 ----------------
+app/build/
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.packages
+app/.pub-cache/
+app/.pub/
+**/.gradle/
+**/build/
+!app/build.gradle*
+!app/android/build.gradle*
+*.iml
+
+# ---------------- 出包产物（走 Releases，不进仓库）----------------
+dist/
+*.apk
+*.aab
+*.apk.sha256
+*.ipa
+*.app
+
+# ---------------- 未跟踪资产（用 tools/fetch_assets.sh 获取）----------------
+# 保留 .gitkeep 占位，其余全忽略
+app/assets/rootfs/*.tar.gz
+app/assets/rootfs/*.tar
+app/assets/rootfs/*.tar.xz
+app/assets/tools/foa_pty
+app/assets/tools/proot-arm64
+app/assets/tools/proot-loader
+app/assets/tools/*.so
+app/assets/tools/*.so.*
+
+# 构建沙箱的离线兜底仓库（42MB 的 Flutter engine aar，非项目组成）
+# 自带 README.md 说明重建方式，README 本身要保留
+app/android/local-maven/io/
+
+# jniLibs 里的 libproot.so 是 assets/tools/proot-arm64 的**副本**
+# （SHA256 相同），由 tools/setup_android.sh 第 4 步拷入。
+# 两者都是 fetch_assets.sh 从 Termux apt 仓库下载的**未跟踪资产**
+# （GPL-2.0，在 THIRD-PARTY-NOTICES.md 登记），不是源码。
+app/android/app/src/main/jniLibs/
+
+# ---------------- 本机/编辑器状态 ----------------
+# ⚠️ `.trae/skills/` **要进仓库**（有意为之）—— 那是 1900+ 行的项目
+#    构建流程知识，对贡献者有用，且不含任何凭据。只忽略编辑器自身状态。
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---------------- 凭据与签名（绝不入库）----------------
+# 签名密钥与口令：一旦进了 git 就永远在历史里，即使后续删除也没用
+**/key.properties
+**/*.jks
+**/*.keystore
+.git-credentials
+**/local.properties
+
+# ---------------- 运行期数据 ----------------
+# FOA 运行时生成，属"本机状态"不是"源码"
+*.foa-bak
+*.dart.bak
+/root/
+
+# 补丁/迁移过程留下的备份（`.orig`/`.rej` 是 patch 工具的产物）
+*.orig
+*.rej
+
+# ---------------- 日志与临时文件 ----------------
+*.log
+*.tmp
+*.out
+.tmp/
