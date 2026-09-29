@@ -1,0 +1,32 @@
+# 打包 tar.gz 时的排除规则（供 tools/make_release_tarball.sh 使用）
+#
+# ⚠️ 本文件**不支持注释**（tar 的 --exclude-from 没有 `#` 语义）。
+#    这些 `#` 行之所以安全，是因为脚本里显式 `case "$p" in \#*) continue` 跳过；
+#    **别在脚本里去掉那行判断**，否则 tar 会把 `#` 当字面路径去匹配（静默失效）。
+#
+# 收录原则：**只排除"可再生 / 可重新下载"的产物**。
+#   - dist/            → 出包产物，tools/release.sh 可再生
+#   - app/build/       → Dart 构建产物，可再生
+#   - app/.dart_tool/  → pub 缓存，可再生
+#   - local-maven/io/  → 离线兜底仓库（42MB），setup_android.sh 可再生
+#   - jniLibs/ java/   → 分别从 assets/tools 拷入、由 Flutter 生成，可再生
+#   - *.iml / .flutter-plugins-dependencies / local.properties → 本机状态
+#
+# **刻意不含** app/assets/ 下的两项（rootfs + proot）：
+#   它们的确被 .gitignore 排除，但**丢了就再也拿不回来** ——
+#   `fetch_assets.sh` 的 rootfs 没有默认下载源（ROOTFS_URL 未配置 → 脚本 exit 1），
+#   只能靠 debootstrap 自建（需 x86_64 Linux + 约 20 分钟）。
+#   所以**默认包必须带上它们**；带上的代价只是包变大，
+#   而它们不会进 GitHub（git push 只推已跟踪文件），纯属"解包即可构建"的便利。
+#   想要"与 git 仓库逐字节一致"的瘦包，用 `--slim`。
+./dist
+./app/build
+./app/.dart_tool
+./app/android/build
+./app/android/local-maven/io
+./app/android/app/src/main/java
+./app/android/app/src/main/jniLibs
+./app/android/local.properties
+./app/.flutter-plugins-dependencies
+./app/flutter_on_android.iml
+./app/android/flutter_on_android_android.iml

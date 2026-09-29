@@ -51,12 +51,22 @@ FOA 是一个原生运行在 Android 上的 Flutter IDE：设备内自带 Flutte
 ```bash
 git clone <本仓库>
 cd FOA/app
-bash tools/fetch_assets.sh all      # 下载未跟踪资产（rootfs 等，约 76MB）
+bash tools/fetch_assets.sh          # 下载未跟踪资产：proot + rootfs（见下方说明）
 flutter pub get
 flutter run --release               # 装到设备上
 ```
 
 装机后的完整使用流程见 **[构建流程.md](构建流程.md)**。
+
+> **⚠️ rootfs 需要你自己准备一次。**
+> 仓库里**不含** 75MB 的 Debian rootfs（`.gitignore` 明确排除，
+> 见「关键约束 · 什么不进仓库」）。`fetch_assets.sh` 能自动下载 proot，
+> 但 rootfs **没有公共下载源** —— 脚本会直接提示 `ROOTFS_URL 未配置`
+> 并给出 `debootstrap` 自建配方（约 20 分钟，需 x86_64 Linux）。
+> 也可以让维护者单独给你 `debian-minbase-arm64.tar.gz`，
+> 放到 `app/assets/rootfs/` 即可（脚本检测到已存在会跳过）。
+> 完整说明见 **[app/SETUP_ANDROID.md](app/SETUP_ANDROID.md)** 的「资产获取」与
+> 「rootfs 的构建」两节。
 
 ### 想从源码出包
 

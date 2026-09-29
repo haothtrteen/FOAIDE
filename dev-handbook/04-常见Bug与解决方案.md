@@ -11507,3 +11507,154 @@ app/lib/toolchain/build_runner.dart:508:    //   > Removing unused resources req
 > **③ needle 必须是"只有那段逻辑才会产生"的串。**
 > 属性名（如 `isShrinkResources`）在注释和代码里都出现，命中它
 > 证明不了任何事。宁可挑带上下文的整句。
+
+---
+
+## 第十九章 · Bug 638 / Bug 639 + 开源化打包（alpha.98 收尾）
+
+这一章记的是"把项目整理成能上传 GitHub 的正式仓库"这一轮撞到的事。
+前半是两条 bug 的收尾（638 / 639），后半是**打包本身**踩的三个坑 ——
+后一半更值得看，因为那三个坑都表现为"**没报错，但结果是错的**"。
+
+### 19.1 Bug 638：老写法签名脚本的检测要进构建前置检查
+
+**症状**（真机构建）：
+
+```
+e: build.gradle.kts:5:31 Unresolved reference 'util'
+e: build.gradle.kts:5:31 Unresolved reference 'io'
+```
+
+**真因**：Flutter 模板的第一行是 `plugins {}`，而 Kotlin 的 `plugins` 块是
+**隐式 receiver 作用域**，会遮蔽 `java` 这个**顶层包标识符** —— 于是
+`java.util.Properties()` 里的 `java` 被解析成"某个对象的属性"，找不到。
+补 `import java.util.Properties` 再用**简单名** `Properties()` 就没这事。
+
+**为什么这 bug 会"修好了还复发"**：alpha.94 修的是**生成器**（新工程不再
+产出老写法），但**已经打过旧补丁的工程不会自动回写**。用户反复构建、反复
+报错，我们这边看日志觉得"早就修了" —— **生成器修了 ≠ 用户现场修了**。
+
+**落地**：在 `build_runner.dart` 的前置段（与 Bug 636 的 shrink 检查同一处、
+都在 `execStream(cmd` 之前）接上 `Signing.repairLegacyPatch`：
+
+```dart
+if (!bare) {
+  final r = await Signing.repairLegacyPatch(FsBridge(), projectName: name);
+  if (r.changed) { lines.add('⚠ ${r.msg}'); lines.add(''); _ui(); }
+}
+```
+
+`repairLegacyPatch` 内部已挡掉两种情况：Groovy DSL（没有这个遮蔽问题）、
+以及"根本没有老写法"。**按 `r.changed` 判定才打日志**，否则每次构建都刷
+无意义警告。
+
+回归测试 5 条（`app/test/signing_test.dart`）：接线存在 / 顺序在构建之前 /
+与 636 同处前置段 / 按 `changed` 判定 / Groovy 工程不被改。
+
+> **诚实边界**：`settings.gradle.kts` 不受影响，实测确认过 —— 它的
+> `pluginManagement {}`（含 `java.util.Properties()`）与 `plugins {}` 是
+> **两个独立的顶层 receiver**，不互相遮蔽。所以修复范围只覆盖
+> `android/app/build.gradle*`，正确，无需扩大。
+
+### 19.2 Bug 639：`platform/` 模板与 `android/` 实际文件的漂移门禁
+
+背景是手册 Bug 440：`platform/android/MainActivity.kt`（新工程模板）比
+`android/` 里的实际副本落后一个月，而新工程是从 `platform/` 生成的。
+
+**做了两样东西**：
+
+| 工具 | 作用 |
+|---|---|
+| `tools/sync_platform.sh` | 检查（不一致退出码 1）/ `--fix` 写回 |
+| `app/test/platform_drift_test.dart` | 4 条：逐字节相同、非空、映射表与脚本一致、模板目录没被误删 |
+
+**只做逐字节比对，不做语义分析** —— 语义分析正是当初漏掉它的原因。
+
+**映射表只列"两份都该存在的副本"**。`platform/android/pty/foa_pty.c`
+**不在表里**：它是 C 源码，编译产物是 `assets/tools/foa_pty`，单向派生，
+不是副本。
+
+**门禁自己也被验证过**：人工注入漂移 → 测试报"首个差异在第 64 行"、
+脚本 exit 1；`--fix` 能同步回；退出码正确（漂移 1 / 一致 0）。验证后还原。
+
+### 19.3 打包：三个"静默错误"的坑
+
+#### 坑一：`--exclude` 的前缀写错 → 静默失效
+
+```bash
+# ❌ 早期写法：cwd 在 /workspace，却写了相对 -C 之后的完整路径
+tar czf out.tar.gz -C /workspace --exclude='FOA/FOA/app/build' FOA
+```
+
+排除路径是**相对于 `-C` 的目录**的。前缀写错不报错，只是不生效 ——
+包从 87MB 涨到 **590MB**，且自检时才发现。
+
+**修法**：cwd 进到仓库根、用 `.` 打包、路径统一 `./xxx`，
+并且用 `--exclude-from=FILE`。**清单固化到 `tools/package-excludes.txt`**。
+
+#### 坑二：`grep -F` 是子串匹配 → 假阳性
+
+校验"排除是否生效"时用了 `grep -qF "$p"`，结果报了两个**不存在的失败**：
+
+```
+❌ 排除失效: ./app/build 仍在包里
+❌ 排除失效: ./app/android/build 仍在包里
+```
+
+因为 `./app/build` 命中 `./app/build_progress_preview.html`、
+`./app/android/build` 命中 `./app/android/build.gradle.kts` ——
+两个都是**必须入库**的源码文件。
+
+**正确判据**：条目 == 规则本身，**或**以 `规则 + "/"` 开头。
+不变量固化成测试：**任何排除规则都不许命中 git 跟踪的文件**
+（`app/test/package_excludes_test.dart`，7 条）。
+
+#### 坑三：`sha256sum -c` 按 cwd 找文件
+
+校验文件里写的是 basename，`sha256sum -c` 会**按当前 cwd** 去解析，
+而脚本的 cwd 是仓库根、不是包所在目录 → 永远 `No such file`。
+必须 `cd "$(dirname "$OUT")"` 再校验。
+
+### 19.4 rootfs：**没有公共下载源**（这条影响你敢不敢删它）
+
+整理时差点把 `app/assets/rootfs/debian-minbase-arm64.tar.gz`（75MB）当成
+"可以从网上重新下载的资产"给排除掉。**不能。**
+
+`app/tools/fetch_assets.sh` 里：
+
+```bash
+if [[ -n "${ROOTFS_URL:-}" ]]; then ... else
+  # 打印 debootstrap 自建配方，然后 exit 1
+```
+
+`ROOTFS_URL` **没有默认值**。也就是说：
+
+- proot / libtalloc / libandroid-shmem → 有 Termux apt 直链，**可再生**
+- rootfs → **没有下载源**，丢了只能 `debootstrap` 自建（需 x86_64 Linux，
+  约 20 分钟，还要 qemu-user-static 跑 second-stage）
+
+所以 `tools/make_release_tarball.sh` **默认带上它**，只提供 `--slim` 才排除。
+它仍然被 `.gitignore` 排除 → **不会进 GitHub**（`git push` 只推已跟踪文件），
+带上它纯粹是"解包即可构建"的便利。
+
+> **顺带纠正我自己的一个错**：整理时我曾说"rootfs 是 git 跟踪的、会推进
+> GitHub"。**这是错的**。依据是 `.gitignore:39` 明确排除了它、
+> `git ls-files app/assets/rootfs/` 只返回 `.gitkeep`、
+> `git cat-file HEAD:app/assets/...` 报 `exists on disk, but not in HEAD`。
+> 我当时把"87MB 的包体积"当成了"git 仓库体积"，两者不是一回事：
+> git 仓库本身只有 **4.7MB / 406 文件**，最大单个文件 0.55MB。
+
+### 19.5 元教训
+
+> **① "没报错"不等于"对了"。**
+> 这一轮三个打包坑全是静默错误：`--exclude` 前缀错（590MB）、
+> `grep -F` 子串（假阳性）、`sha256sum -c` 的 cwd（假失败）。
+> **凡是"校验"步骤，都要先证明它能真的失败。**
+>
+> **② 排除清单这类"规则文件"必须配一条不变量测试。**
+> 光有清单不够 —— 有人加一条规则就可能把源码文件排掉。
+> 钉死"不许命中 git 跟踪文件"这一条，比列一百条具体路径都有效。
+>
+> **③ 区分"可再生"和"丢了就没了"。**
+> 打包时这是唯一的分类标准。产物 2.8GB 全可删；
+> 75MB 的 rootfs 反而是最不该删的那个。
